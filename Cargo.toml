@@ -1,0 +1,42 @@
+[package]
+name = "voxdrop"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tao = "0.34"
+wry = "0.53"
+tray-icon = "0.21"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+arboard = "3"
+cpal = "0.15"
+regex = "1"
+global-hotkey = "0.7"
+rodio = { version = "0.20", default-features = false, features = ["wav"] }
+nnnoiseless = "0.5"
+flate2 = "1"
+
+[dependencies.windows]
+version = "0.61"
+features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinHttp",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+

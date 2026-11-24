@@ -1,0 +1,25 @@
+# Build outputs & packed standalone EXEs (distributed via GitHub Releases)
+/target/
+*.exe
+*.dll
+*.pdb
+
+# Downloaded AI models & runtimes (bundled into Release EXE, not committed to Git)
+/bin/
+/models/
+*.onnx
+*.ort
+*.bin
+*.tar.bz2
+*.zip
+*.nupkg
+
+# Local / user config & temporary benchmark files
+voxdrop.config.json
+*.WebView2/
+.tmp_*
+*.log
+*.wav
+!assets/sounds/*.wav
+.DS_Store
+Thumbs.db

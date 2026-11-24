@@ -1,0 +1,657 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>VoxDrop</title>
+    <style>
+      /*__STYLE_CSS__*/
+    </style>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-logo" id="brandDot">V</div>
+          <div>
+            <div class="brand-title">VoxDrop</div>
+            <div class="brand-sub">Voice to Chat</div>
+          </div>
+        </div>
+
+        <nav class="nav">
+          <button class="nav-btn active" data-tab="dashboard">ダッシュボード</button>
+          <div class="nav-section">Discord 宛先</div>
+          <button class="nav-btn" data-tab="channels">サーバー・チャンネル</button>
+          <button class="nav-btn" data-tab="friends">フレンド・DM</button>
+          <button class="nav-btn" data-tab="discord-link">Discord 連携・リモコン</button>
+          <div class="nav-section">カスタマイズ</div>
+          <button class="nav-btn" data-tab="commands">合言葉・音声コマンド</button>
+          <button class="nav-btn" data-tab="dictionary">辞書・整形</button>
+          <button class="nav-btn" data-tab="guard">安全ガード・自動化</button>
+          <button class="nav-btn" data-tab="settings">詳細設定</button>
+        </nav>
+
+        <div class="sidebar-footer">
+          <button id="btnToggleListen" class="btn-listen off">
+            <span class="dot"></span>
+            <span id="listenLabel">録音 OFF</span>
+          </button>
+          <div class="mini-status">
+            <span>宛先:</span>
+            <strong id="sidebarDiscordTarget">現在の画面</strong>
+          </div>
+          <div class="mini-status">
+            <span>最前面:</span>
+            <strong id="sidebarTarget">未検出</strong>
+          </div>
+        </div>
+      </aside>
+
+      <main class="content">
+        <header class="topbar">
+          <div class="status-pills">
+            <span class="pill" id="pillListen">停止中</span>
+            <span class="pill" id="pillRnnoise">RNNoise: ON</span>
+            <span class="pill" id="pillDiscordTarget">宛先: 現在の画面</span>
+            <span class="pill" id="pillTarget">ガード: 待機</span>
+            <span class="pill" id="pillStt">STT: 読み込み中...</span>
+          </div>
+          <div class="topbar-actions">
+            <button class="btn-secondary btn-sm" id="btnToggleOverlay">ミニHUD切替</button>
+            <button class="btn-primary btn-sm" id="btnSaveAll">設定を保存</button>
+          </div>
+        </header>
+
+        <!-- Dashboard Tab -->
+        <section class="tab-panel active" id="tab-dashboard">
+          <div id="urlDetectBanner" class="url-banner" style="display: none">
+            <div class="confirm-text">
+              <strong id="urlDetectTitle">Discord リンクを検出しました</strong>
+              <span id="urlDetectSub"></span>
+            </div>
+            <div class="row gap-sm">
+              <button class="btn-primary btn-sm" id="btnUrlApply">登録フォームへ反映</button>
+              <button class="btn-secondary btn-sm" id="btnUrlDismiss">閉じる</button>
+            </div>
+          </div>
+
+          <div id="confirmBanner" class="confirm-banner" style="display: none">
+            <div class="confirm-text">
+              <strong id="confirmTitle">確認中...</strong>
+              <span id="confirmSub"></span>
+            </div>
+            <div class="row gap-sm">
+              <button class="btn-success btn-sm" id="btnConfirmYes">はい（この人）</button>
+              <button class="btn-primary btn-sm" id="btnConfirmNext">違う（次の人）</button>
+              <button class="btn-danger btn-sm" id="btnConfirmCancel">キャンセル</button>
+            </div>
+          </div>
+
+          <div class="grid-2">
+            <div class="card">
+              <h3>入力モード &amp; 送信先（喋る相手）</h3>
+              <div class="segmented" id="modeSegmented">
+                <button type="button" class="seg-btn active" data-mode="draft">
+                  ドラフトバッファ（推奨）
+                </button>
+                <button type="button" class="seg-btn" data-mode="direct">
+                  ダイレクト入力
+                </button>
+              </div>
+              <p class="hint" id="modeHint">
+                認識テキストを下書きに溜め、「送信して」の発話で一括ペースト＆送信します。
+              </p>
+
+              <div class="quick-dest-section">
+                <div class="row space-between">
+                  <span class="small-label">送信先を選択（フレンド / チャンネル）</span>
+                  <div class="row gap-xs">
+                    <button type="button" class="link-btn" data-jump-tab="friends">+ フレンド管理</button>
+                    <span class="sep">|</span>
+                    <button type="button" class="link-btn" data-jump-tab="channels">+ チャンネル管理</button>
+                  </div>
+                </div>
+                <div class="row gap-sm" style="margin-top: 6px">
+                  <select id="quickTargetSelect" class="input grow">
+                    <option value="">現在の画面（宛先未指定）</option>
+                  </select>
+                  <button class="btn-secondary btn-sm" id="btnQuickNavTarget">開く</button>
+                </div>
+                <div id="quickTargetChips" class="quick-chips"></div>
+              </div>
+            </div>
+
+            <div class="card">
+              <h3>マイク入力 &amp; VAD</h3>
+              <div class="row">
+                <select id="audioDeviceSelect" class="input grow">
+                  <option value="">デフォルトマイク</option>
+                </select>
+                <button class="btn-secondary btn-sm" id="btnRefreshDevices">更新</button>
+              </div>
+              <div class="meter-wrap">
+                <div class="meter-bar" id="meterBar"></div>
+                <div class="meter-threshold" id="meterThreshold"></div>
+              </div>
+              <div class="row space-between">
+                <label class="small-label">VAD しきい値: <strong id="vadThresholdVal">0.025</strong> <span id="vadNoiseFloorHint" class="hint-inline"></span></label>
+                <span class="speaking-badge" id="speakingBadge">無音</span>
+              </div>
+              <input type="range" id="vadThreshold" min="0.002" max="0.20" step="0.001" value="0.025" />
+              <div class="row space-between" style="margin-top: 6px; margin-bottom: 4px">
+                <label class="checkbox-row small-check">
+                  <input type="checkbox" id="chkVadAutoAdjust" />
+                  <span>自動調整（声とノイズを自動判別）</span>
+                </label>
+                <button type="button" class="btn-secondary btn-sm" id="btnCalibrateVad">ノイズ2秒測定</button>
+              </div>
+
+              <div class="nc-box">
+                <div class="row space-between">
+                  <label class="checkbox-row">
+                    <input type="checkbox" id="chkNcEnabled" />
+                    <span>高性能ノイズ抑制 (RNNoise)</span>
+                  </label>
+                  <span class="pill" id="ncLiveBadge">待機</span>
+                </div>
+                <div class="row space-between" style="margin-top: 6px">
+                  <span class="small-label">AI発話確率: <strong id="vadProbVal">0%</strong></span>
+                  <span class="small-label">抑制強度: <strong id="ncStrengthVal">100%</strong></span>
+                </div>
+                <div class="meter-wrap slim">
+                  <div class="meter-bar ai-bar" id="vadProbBar"></div>
+                </div>
+                <input type="range" id="ncStrength" min="0" max="1" step="0.05" value="1" />
+                <div class="row gap-sm" style="margin-top: 6px; flex-wrap: wrap">
+                  <label class="checkbox-row small-check">
+                    <input type="checkbox" id="chkNcRadioClarity" />
+                    <span>小音量・無線補正（スマートAGC音声強調）</span>
+                  </label>
+                  <label class="checkbox-row small-check">
+                    <input type="checkbox" id="chkNcHighpass" />
+                    <span>85Hzハイパス</span>
+                  </label>
+                  <label class="checkbox-row small-check">
+                    <input type="checkbox" id="chkNcGate" />
+                    <span>AIノイズゲート（通常OFF推奨）</span>
+                  </label>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="row space-between">
+              <h3>ドラフト（下書き）バッファ</h3>
+              <div class="row gap-sm">
+                <button class="btn-secondary btn-sm" id="btnClearDraft">クリア</button>
+                <button class="btn-success btn-sm" id="btnForceSend">今すぐ送信</button>
+              </div>
+            </div>
+            <textarea
+              id="draftBox"
+              class="draft-area"
+              rows="3"
+              placeholder="ここに認識テキストが溜まります（直接編集も可能）..."
+            ></textarea>
+
+            <div class="row gap-sm" style="margin-top: 10px">
+              <input
+                type="text"
+                id="simInput"
+                class="input grow"
+                placeholder="認識テスト入力（例: たろうにDM / 合言葉 雑談、こんにちは送信して）"
+              />
+              <button class="btn-secondary btn-sm" id="btnSimulate">認識シミュレート</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="row space-between">
+              <h3>認識履歴ログ <span class="hint-inline">（クリックでコピー）</span></h3>
+              <button class="btn-secondary btn-sm" id="btnClearHistory">履歴クリア</button>
+            </div>
+            <div id="historyList" class="history-list">
+              <div class="empty-state">まだ認識履歴はありません</div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Server & Channels Tab -->
+        <section class="tab-panel" id="tab-channels">
+          <div class="card">
+            <div class="row space-between">
+              <h3 id="chFormTitle">サーバー・チャンネルを追加</h3>
+              <button type="button" class="btn-secondary btn-sm" id="btnChCancelEdit" style="display: none">編集キャンセル</button>
+            </div>
+            <div class="url-bar">
+              <input
+                type="text"
+                id="chUrlPaste"
+                class="input grow"
+                placeholder="Discord のチャンネルURLを貼り付けるとサーバーID・チャンネルIDを自動入力します"
+              />
+              <button type="button" class="btn-secondary btn-sm" id="btnChParseUrl">URLから入力</button>
+            </div>
+            <div class="form-grid-3">
+              <label>サーバー名（グループ分け用）
+                <input type="text" id="chServerName" class="input" placeholder="例: メイン鯖 / ゲーム鯖" />
+              </label>
+              <label>チャンネル名 *
+                <input type="text" id="chName" class="input" placeholder="例: 雑談 / レイド連絡" />
+              </label>
+              <label>合言葉（声で切替・カンマ区切り）
+                <input type="text" id="chPass" class="input" placeholder="例: ざつだん, 雑談" />
+              </label>
+              <label>サーバーID
+                <input type="text" id="chGuildId" class="input" placeholder="例: 123456789012345678" />
+              </label>
+              <label>チャンネルID *
+                <input type="text" id="chChannelId" class="input" placeholder="例: 987654321098765432" />
+              </label>
+              <label>Webhook URL（任意・裏から直接送信）
+                <input type="text" id="chWebhook" class="input" placeholder="https://discord.com/api/webhooks/..." />
+              </label>
+            </div>
+            <div class="row space-between" style="margin-top: 12px">
+              <span class="hint" style="margin: 0">
+                登録すると自動で保存され、ダッシュボードの送信先リストにもすぐ反映されます。
+              </span>
+              <button type="button" class="btn-primary" id="btnChSave">+ チャンネルを登録</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="row space-between">
+              <h3>登録済みサーバー＆チャンネル一覧</h3>
+              <span class="hint-inline" id="chCountBadge">0件</span>
+            </div>
+            <div id="channelGroups" class="server-groups"></div>
+          </div>
+        </section>
+
+        <!-- Friends & DM Tab -->
+        <section class="tab-panel" id="tab-friends">
+          <div class="card">
+            <div class="row space-between">
+              <h3 id="frFormTitle">フレンド（DM / メンション）を追加</h3>
+              <button type="button" class="btn-secondary btn-sm" id="btnFrCancelEdit" style="display: none">編集キャンセル</button>
+            </div>
+            <div class="url-bar">
+              <input
+                type="text"
+                id="frUrlPaste"
+                class="input grow"
+                placeholder="DM画面のURL（https://discord.com/channels/@me/...）を貼るとDMチャンネルIDを自動入力します"
+              />
+              <button type="button" class="btn-secondary btn-sm" id="btnFrParseUrl">URLから入力</button>
+            </div>
+            <div class="form-grid-3">
+              <label>フレンド名 *
+                <input type="text" id="frName" class="input" placeholder="例: たろう / フレンドA" />
+              </label>
+              <label>呼び名・合言葉（カンマ区切り）
+                <input type="text" id="frPass" class="input" placeholder="例: たろう, たなか" />
+              </label>
+              <label>種類
+                <select id="frKind" class="input">
+                  <option value="dm">DM（ダイレクトメッセージ）</option>
+                  <option value="mention">メンション（&lt;@ユーザーID&gt; 付与）</option>
+                </select>
+              </label>
+              <label>DMチャンネルID（DM直行用）
+                <input type="text" id="frChannelId" class="input" placeholder="例: 987654321098765432" />
+              </label>
+              <label>ユーザーID（メンション / 識別用）
+                <input type="text" id="frUserId" class="input" placeholder="例: 112233445566778899" />
+              </label>
+              <label style="justify-content: flex-end">
+                <span class="checkbox-row small-check" style="padding-bottom: 6px">
+                  <input type="checkbox" id="frPrependMention" />
+                  <span>送信時に &lt;@ユーザーID&gt; を自動付与</span>
+                </span>
+              </label>
+            </div>
+            <div class="row space-between" style="margin-top: 12px">
+              <span class="hint" style="margin: 0">
+                ヒント: リスト未登録のフレンドでも「〇〇にDM」「〇〇を開いて」と呼べば Discord 検索から確認して開けます。
+              </span>
+              <button type="button" class="btn-primary" id="btnFrSave">+ フレンドを登録</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="row space-between">
+              <h3>フレンドリスト</h3>
+              <span class="hint-inline" id="frCountBadge">0人</span>
+            </div>
+            <div id="friendsList" class="friends-list"></div>
+          </div>
+        </section>
+
+        <!-- Discord Link & Remote Control Tab -->
+        <section class="tab-panel" id="tab-discord-link">
+          <div class="card">
+            <div class="row space-between">
+              <h3>Discord 画面スキャン（UI Automation・Bot不要・安全）</h3>
+              <button type="button" class="btn-primary btn-sm" id="btnScanDiscord">Discord 画面をスキャン</button>
+            </div>
+            <p class="hint">
+              Windows標準のアクセシビリティAPIで、現在 Discord に表示されているサーバー・テキストチャンネル・DMフレンド名を読み取ります（改造・インジェクション一切なし）。
+            </p>
+            <label class="checkbox-row" style="margin-top: 10px">
+              <input type="checkbox" id="chkClipboardWatch" />
+              <span>リンクコピー自動キャッチ（Discordで「リンクをコピー」すると自動で登録バナーを表示）</span>
+            </label>
+            <div id="scanResultBox" class="scan-box" style="display: none">
+              <div class="row space-between">
+                <strong id="scanSummary"></strong>
+                <button type="button" class="btn-success btn-sm" id="btnImportScan">検出した相手を一括追加</button>
+              </div>
+              <div id="scanDetails" class="scan-details"></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="row space-between">
+              <h3>声で操作する Discord リモコン（キーボード / マウス連携）</h3>
+              <label class="small-label">テスト遅延(秒):
+                <input type="number" id="remoteDelaySec" class="input" style="width: 64px" value="2" min="0" max="5" />
+              </label>
+            </div>
+            <p class="hint">
+              Discord が最前面のとき、ボタンまたは下のカッコ内の音声コマンドを喋るだけでハンズフリー操作できます。
+            </p>
+            <div class="remote-grid">
+              <button type="button" class="remote-btn" data-remote="mute_mic"><b>通話ミュート</b><span>「通話ミュート」 (Ctrl+Shift+M)</span></button>
+              <button type="button" class="remote-btn" data-remote="deafen"><b>スピーカーミュート</b><span>「スピーカーミュート」 (Ctrl+Shift+D)</span></button>
+              <button type="button" class="remote-btn" data-remote="prev_channel"><b>前のチャンネル</b><span>「前のチャンネル」 (Alt+↑)</span></button>
+              <button type="button" class="remote-btn" data-remote="next_channel"><b>次のチャンネル</b><span>「次のチャンネル」 (Alt+↓)</span></button>
+              <button type="button" class="remote-btn" data-remote="next_unread"><b>未読チャンネルへ</b><span>「未読へ」 (Alt+Shift+↓)</span></button>
+              <button type="button" class="remote-btn" data-remote="prev_server"><b>前のサーバー</b><span>「前のサーバー」 (Ctrl+Alt+↑)</span></button>
+              <button type="button" class="remote-btn" data-remote="next_server"><b>次のサーバー</b><span>「次のサーバー」 (Ctrl+Alt+↓)</span></button>
+              <button type="button" class="remote-btn" data-remote="scroll_up"><b>上にスクロール</b><span>「上にスクロール」 (PageUp+Wheel)</span></button>
+              <button type="button" class="remote-btn" data-remote="scroll_down"><b>下にスクロール</b><span>「下にスクロール」 (PageDown+Wheel)</span></button>
+              <button type="button" class="remote-btn" data-remote="edit_last"><b>直前の発言を編集</b><span>「直前を編集」 (↑)</span></button>
+              <button type="button" class="remote-btn" data-remote="mark_read"><b>サーバー既読</b><span>「既読にして」 (Shift+Esc)</span></button>
+              <button type="button" class="remote-btn" data-remote="toggle_members"><b>メンバー表示切替</b><span>「メンバー表示」 (Ctrl+U)</span></button>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3>公式 Discord Bot 連携（任意・自分の管理サーバー一括同期）</h3>
+            <p class="hint">
+              Discord Developer Portal で作成した自分用の公式 Bot をサーバーに招待し、Bot Token を入力すると全サーバーのテキストチャンネル＆メンバーを一括取得できます（個人トークンは不要・使用しません）。
+            </p>
+            <div class="row gap-sm" style="margin-top: 10px">
+              <input
+                type="password"
+                id="botTokenInput"
+                class="input grow"
+                placeholder="公式 Discord Bot Token を入力..."
+              />
+              <button type="button" class="btn-primary btn-sm" id="btnSyncBot">サーバー・チャンネルを一括同期</button>
+            </div>
+            <label class="checkbox-row" style="margin-top: 10px">
+              <input type="checkbox" id="chkBotSend" />
+              <span>チャンネル送信時に Bot API で裏から直接送信する（OFF＝自分のアカウントで安全に自動入力）</span>
+            </label>
+          </div>
+        </section>
+
+        <!-- Commands & Passphrase Rules Tab -->
+        <section class="tab-panel" id="tab-commands">
+          <div class="card">
+            <h3>合言葉・フレンド呼び出しルール</h3>
+            <p class="hint">
+              例: <b>「合言葉 雑談」</b> / <b>「たろうにDM」</b> / <b>「たなかを開いて」</b>。似た名前の候補が複数ある場合は自動で「この人で合っていますか？」と確認します（<b>「はい」</b>で確定、<b>「違う・次」</b>で別の候補へ）。
+            </p>
+            <div class="form-grid">
+              <label>合言葉プレフィックス（カンマ区切り）
+                <input type="text" id="targetPrefixes" class="input" />
+              </label>
+              <label>合言葉サフィックス（カンマ区切り）
+                <input type="text" id="targetSuffixes" class="input" />
+              </label>
+              <label>宛先解除コマンド（カンマ区切り）
+                <input type="text" id="targetResets" class="input" />
+              </label>
+              <label>チャンネル移動後の待機時間 (ms)
+                <input type="number" id="targetNavDelay" class="input" min="120" max="3000" />
+              </label>
+            </div>
+            <div class="toggle-grid" style="margin-top: 10px">
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkTargetAutoNavSwitch" />
+                <span>声で宛先を切り替えた瞬間に Discord で該当チャンネル/DM を開く（discord://）</span>
+              </label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkTargetAutoNavSend" />
+                <span>送信時に該当チャンネル/DM へ自動フォーカスしてから貼り付け送信する</span>
+              </label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkTargetQuickSwitcher" />
+                <span>未登録のフレンド名を呼んだとき Discord クイックスイッチャー(Ctrl+K)で候補を開いて確認する</span>
+              </label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkTargetStandalone" />
+                <span>プレフィックスなしでも合言葉単独発話だけで切り替えを許可（上級者向け）</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3>基本音声コマンド設定（カンマ区切りで複数登録可能）</h3>
+            <p class="hint">
+              認識テキストの末尾、または単独発話でコマンドを判定し、コマンド語句自体は自動除去します。
+            </p>
+            <div class="form-grid">
+              <label>送信 (ペースト + Enter)
+                <input type="text" id="cmdSend" class="input" />
+              </label>
+              <label>全文削除 (ドラフト消去 / Ctrl+A→BS)
+                <input type="text" id="cmdClearAll" class="input" />
+              </label>
+              <label>直前取り消し (Undo)
+                <input type="text" id="cmdUndo" class="input" />
+              </label>
+              <label>改行 (Shift+Enter)
+                <input type="text" id="cmdNewline" class="input" />
+              </label>
+              <label>認識一時停止 (スリープ)
+                <input type="text" id="cmdMute" class="input" />
+              </label>
+              <label>認識再開
+                <input type="text" id="cmdResume" class="input" />
+              </label>
+            </div>
+          </div>
+        </section>
+
+        <!-- Dictionary & Filter Tab -->
+        <section class="tab-panel" id="tab-dictionary">
+          <div class="card">
+            <h3>フィラー除去・テキスト整形</h3>
+            <div class="toggle-grid">
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkRemoveFillers" />
+                <span>フィラー（「えーと」「あのー」等）を自動除去</span>
+              </label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkAutoSpace" />
+                <span>連続発話の間に半角スペースを挿入</span>
+              </label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkStripPunct" />
+                <span>句読点（「。」「、」）を削除</span>
+              </label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkAppendPeriod" />
+                <span>末尾に句点「。」を自動付与</span>
+              </label>
+            </div>
+            <label style="margin-top: 12px; display: block">
+              フィラー語句リスト（カンマ区切り）
+              <input type="text" id="fillersInput" class="input" />
+            </label>
+          </div>
+
+          <div class="card">
+            <div class="row space-between">
+              <h3>カスタム置換辞書</h3>
+              <button class="btn-primary btn-sm" id="btnAddDict">+ 追加</button>
+            </div>
+            <div id="dictRows" class="dict-rows"></div>
+          </div>
+        </section>
+
+        <!-- Guard & Automation Tab -->
+        <section class="tab-panel" id="tab-guard">
+          <div class="card">
+            <h3>対象プロセス限定ガード &amp; 非アクティブ時自動フォーカス</h3>
+            <div class="toggle-grid">
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkGuardAutoFocus" />
+                <span>Discord が非アクティブ（裏にある・ゲーム中・VoxDrop画面表示中）でも、自動で Discord を前面にして送信する（推奨・ON）</span>
+              </label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkGuardRestoreWindow" />
+                <span>自動フォーカスで送信したあと、元のウィンドウ（ゲーム等）へ自動で戻す</span>
+              </label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkGuardEnabled" />
+                <span>ホワイトリスト以外のアプリへの誤送信をブロックする（安全ガード）</span>
+              </label>
+            </div>
+            <div class="form-grid" style="margin-top: 12px">
+              <label>許可プロセス名（カンマ区切り）
+                <input type="text" id="allowedProcesses" class="input" />
+              </label>
+              <label>クリップボード復元待機 (ms)
+                <input type="number" id="clipboardDelay" class="input" min="20" max="500" />
+              </label>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3>Windows自動化 動作確認ツール</h3>
+            <p class="hint">
+              ボタンを押してから指定秒数後に最前面ウィンドウ（または選択中の宛先）へ入力テストを行います。
+            </p>
+            <div class="row gap-sm">
+              <input type="text" id="testPasteText" class="input grow" value="VoxDrop テスト入力" />
+              <label class="small-label">遅延(秒):
+                <input type="number" id="testDelaySec" class="input" style="width: 72px" value="3" min="0" max="10" />
+              </label>
+            </div>
+            <div class="row gap-sm" style="margin-top: 10px; flex-wrap: wrap">
+              <button class="btn-secondary btn-sm" id="btnCheckActive">現在の最前面プロセス取得</button>
+              <button class="btn-primary btn-sm" id="btnTestPaste">ペーストのみテスト</button>
+              <button class="btn-success btn-sm" id="btnTestPasteSend">ペースト + Enter テスト</button>
+              <button class="btn-secondary btn-sm" id="btnTestNewline">Shift+Enter テスト</button>
+              <button class="btn-secondary btn-sm" id="btnTestUndo">Ctrl+Z テスト</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- Settings Tab -->
+        <section class="tab-panel" id="tab-settings">
+          <div class="grid-2">
+            <div class="card">
+              <h3>グローバルホットキー</h3>
+              <div class="form-grid">
+                <label>録音 ON/OFF トグル
+                  <input type="text" id="hkToggle" class="input" placeholder="F8 / Ctrl+Shift+M" />
+                </label>
+                <label>Push-to-Talk（任意）
+                  <input type="text" id="hkPtt" class="input" placeholder="例: F9（空欄で無効）" />
+                </label>
+                <label>緊急ドラフトクリア
+                  <input type="text" id="hkClear" class="input" placeholder="Ctrl+Shift+X" />
+                </label>
+                <label>ミニHUD表示切替
+                  <input type="text" id="hkOverlay" class="input" placeholder="Ctrl+Shift+O" />
+                </label>
+              </div>
+            </div>
+
+            <div class="card">
+              <h3>起動・ミニHUDオーバーレイ &amp; 効果音</h3>
+              <div class="toggle-grid">
+                <label class="checkbox-row">
+                  <input type="checkbox" id="chkAutoStart" />
+                  <span>Windows 起動時に VoxDrop を自動で起動する（デフォルト: OFF）</span>
+                </label>
+                <label class="checkbox-row">
+                  <input type="checkbox" id="chkStartMinimized" />
+                  <span>起動時はウィンドウを隠してトレイ常駐で開始する</span>
+                </label>
+                <label class="checkbox-row">
+                  <input type="checkbox" id="chkOverlayEnabled" />
+                  <span>ミニHUDオーバーレイを表示</span>
+                </label>
+                <label class="checkbox-row">
+                  <input type="checkbox" id="chkOverlayClickThrough" />
+                  <span>クリックスルー（背面クリック透過）</span>
+                </label>
+                <label class="checkbox-row">
+                  <input type="checkbox" id="chkSoundEnabled" />
+                  <span>操作フィードバック効果音を再生</span>
+                </label>
+              </div>
+              <label style="margin-top: 10px; display: block">
+                効果音ボリューム: <strong id="soundVolVal">45%</strong>
+                <input type="range" id="soundVolume" min="0" max="1" step="0.05" value="0.45" />
+              </label>
+              <div class="row gap-sm" style="margin-top: 8px">
+                <button class="btn-secondary btn-sm" data-sound="send">送信音テスト</button>
+                <button class="btn-secondary btn-sm" data-sound="cancel">キャンセル音テスト</button>
+                <button class="btn-secondary btn-sm" data-sound="toggle">トグル音テスト</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3>ローカルSTTエンジン &amp; VAD / RNNoise 詳細</h3>
+            <div class="form-grid">
+              <label>STT エンジン
+                <select id="sttEngine" class="input">
+                  <option value="auto">自動検出 (常駐 sherpa-onnx / whisper-cli / mock)</option>
+                  <option value="sherpa-onnx">sherpa-onnx (SenseVoice / Zipformer)</option>
+                  <option value="whisper-cli">whisper-cli (ローカルバイナリ)</option>
+                  <option value="mock">モック（テスト用）</option>
+                </select>
+              </label>
+              <label>モデルディレクトリ
+                <input type="text" id="sttModelDir" class="input" />
+              </label>
+              <label>外部CLI実行ファイルパス（任意）
+                <input type="text" id="sttCliPath" class="input" placeholder="例: C:\tools\sherpa-onnx-offline.exe" />
+              </label>
+              <label>認識言語
+                <input type="text" id="sttLanguage" class="input" value="ja" />
+              </label>
+              <label>VAD 無音確定時間 (ms)
+                <input type="number" id="vadSilenceMs" class="input" min="150" max="3000" />
+              </label>
+              <label>VAD 最小発話時間 (ms)
+                <input type="number" id="vadMinSpeechMs" class="input" min="50" max="2000" />
+              </label>
+              <label>RNNoise ゲート発話確率しきい値 (0.05〜0.95)
+                <input type="number" id="ncVadProbThreshold" class="input" min="0.05" max="0.95" step="0.05" />
+              </label>
+            </div>
+            <p class="hint" id="configPathHint" style="margin-top: 10px">設定ファイル: 読み込み中...</p>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div id="toastContainer" class="toast-container"></div>
+
+    <script>
+      /*__APP_JS__*/
+    </script>
+  </body>
+</html>
