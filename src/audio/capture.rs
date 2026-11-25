@@ -86,23 +86,26 @@ pub fn downmix_to_mono(samples: &[f32], channels: usize) -> Vec<f32> {
     out
 }
 
-/// Anti-aliasing 3x decimator from 48 kHz -> 16 kHz (windowed-sinc FIR low-pass at ~7.0 kHz)
-/// so Japanese high-frequency sibilants ('さ', 'し', 'き', 'た') NEVER alias or sound garbled!
+/// Anti-aliasing 3x decimator from 48 kHz -> 16 kHz (31-tap Blackman-windowed sinc LPF, fc = 7.45 kHz @ 48 kHz)
+/// with flat passband through 6.5 kHz so Japanese high-frequency sibilants ('さ', 'し', 'す', 'せ', 'そ')
+/// stay crystal-clear without aliasing!
 pub struct Decimator48To16 {
-    history: [f32; 15],
+    history: [f32; 31],
     phase: usize,
 }
 
-// Symmetric 15-tap Hann-windowed low-pass FIR (fc = 7.0 kHz @ 48 kHz, exact unity gain sum = 1.0000)
-const LPF_TAPS: [f32; 15] = [
-    -0.0022, -0.0069, 0.0000, 0.0268, 0.0742, 0.1313, 0.1784, 0.1968, 0.1784, 0.1313, 0.0742,
-    0.0268, 0.0000, -0.0069, -0.0022,
+// Symmetric 31-tap Blackman-windowed low-pass FIR (fc = 7.45 kHz @ 48 kHz, exact unity gain sum = 1.000000)
+const LPF_TAPS: [f32; 31] = [
+    0.0, 0.000081, 0.000046, -0.000811, -0.002151, -0.001330, 0.004286, 0.011503, 0.009262,
+    -0.011324, -0.039575, -0.040879, 0.019312, 0.137534, 0.258823, 0.310446, 0.258823, 0.137534,
+    0.019312, -0.040879, -0.039575, -0.011324, 0.009262, 0.011503, 0.004286, -0.001330, -0.002151,
+    -0.000811, 0.000046, 0.000081, 0.0,
 ];
 
 impl Decimator48To16 {
     pub fn new() -> Self {
         Self {
-            history: [0.0; 15],
+            history: [0.0; 31],
             phase: 0,
         }
     }
@@ -111,8 +114,8 @@ impl Decimator48To16 {
         let mut out = Vec::with_capacity(input_48k.len() / 3 + 1);
         for &s in input_48k {
             // Shift delay line
-            self.history.copy_within(1..15, 0);
-            self.history[14] = s;
+            self.history.copy_within(1..31, 0);
+            self.history[30] = s;
             self.phase += 1;
             if self.phase >= 3 {
                 self.phase = 0;

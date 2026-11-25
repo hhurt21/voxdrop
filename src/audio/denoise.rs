@@ -18,6 +18,7 @@ pub struct AudioDenoiser {
     gate_gain: f32,
     hangover_frames: usize,
     last_vad_prob: f32,
+    hf_noise_floor: f32,
 }
 
 impl AudioDenoiser {
@@ -31,6 +32,7 @@ impl AudioDenoiser {
             gate_gain: 1.0,
             hangover_frames: 0,
             last_vad_prob: 0.0,
+            hf_noise_floor: 0.002,
         }
     }
 
@@ -49,6 +51,7 @@ impl AudioDenoiser {
         self.gate_gain = 1.0;
         self.hangover_frames = 0;
         self.last_vad_prob = 0.0;
+        self.hf_noise_floor = 0.002;
         self.rnnoise = DenoiseState::new();
     }
 
@@ -87,19 +90,41 @@ impl AudioDenoiser {
         let mut out_frame = [0.0f32; FRAME_SIZE];
 
         while self.input_buf.len() >= FRAME_SIZE {
-            for (dst, &src) in in_frame
+            let mut sum_sq = 0.0f32;
+            let mut zero_crossings = 0usize;
+            let mut prev_s = self.input_buf[0];
+            for (idx, (dst, &src)) in in_frame
                 .iter_mut()
                 .zip(self.input_buf.iter().take(FRAME_SIZE))
+                .enumerate()
             {
                 *dst = (src * PCM16_SCALE).clamp(-PCM16_SCALE, PCM16_SCALE);
+                sum_sq += src * src;
+                if idx > 0 && ((prev_s >= 0.0) != (src >= 0.0)) {
+                    zero_crossings += 1;
+                }
+                prev_s = src;
             }
+            let frame_rms = (sum_sq / FRAME_SIZE as f32).sqrt();
+            let zcr = zero_crossings as f32 / (FRAME_SIZE - 1) as f32;
 
             let vad_prob = self.rnnoise.process_frame(&mut out_frame, &in_frame);
             self.last_vad_prob = vad_prob;
 
+            if vad_prob < 0.18 && self.hangover_frames == 0 {
+                self.hf_noise_floor = (self.hf_noise_floor * 0.90 + frame_rms * 0.10).clamp(0.0005, 0.08);
+            }
+
+            // Protect Japanese unvoiced sibilants ('さ・し・す・せ・そ', /ts/, /k/):
+            // Real sibilants have high 48kHz zero-crossing rate (ZCR >= 0.14) AND appear as a burst
+            // above the room noise floor or right next to active voiced speech (hangover_frames > 0).
+            let is_sibilant_consonant = zcr >= 0.14
+                && frame_rms >= 0.0045
+                && (frame_rms >= self.hf_noise_floor * 2.0 || self.hangover_frames > 0);
+
             // Gentle noise gate with 250ms (25 frames) hangover & safe floor (0.30)
-            // so initial Japanese consonants ('き', 'そ', 'た') are NEVER chopped!
-            if vad_prob >= vad_th {
+            // so initial & trailing Japanese consonants ('き', 'さ', 'し', 'す') are NEVER chopped!
+            if vad_prob >= vad_th || is_sibilant_consonant {
                 self.hangover_frames = 25;
             } else if self.hangover_frames > 0 {
                 self.hangover_frames -= 1;
@@ -117,10 +142,16 @@ impl AudioDenoiser {
             };
             self.gate_gain += (target_gain - self.gate_gain) * coeff;
 
+            let eff_strength = if is_sibilant_consonant {
+                strength * 0.30
+            } else {
+                strength
+            };
+
             for i in 0..FRAME_SIZE {
                 let dry = self.input_buf[i];
                 let wet = (out_frame[i] / PCM16_SCALE).clamp(-1.0, 1.0);
-                let mixed = dry * (1.0 - strength) + wet * strength;
+                let mixed = dry * (1.0 - eff_strength) + wet * eff_strength;
                 output.push((mixed * self.gate_gain).clamp(-1.0, 1.0));
             }
 
@@ -184,6 +215,36 @@ mod tests {
             "expected RNNoise to suppress stationary noise (in_rms={:.4}, out_rms={:.4})",
             in_rms,
             out_rms
+        );
+    }
+
+    #[test]
+    fn preserves_high_frequency_sibilant_consonant_bursts() {
+        let cfg = NoiseCancelConfig {
+            enabled: true,
+            strength: 0.85,
+            highpass_enabled: true,
+            noise_gate_enabled: true,
+            vad_prob_threshold: 0.35,
+            ..Default::default()
+        };
+        let mut denoiser = AudioDenoiser::new(cfg);
+
+        // 200ms quiet room lead-in followed by 60ms 5.5kHz sibilant burst ('さ/し/す/せ/そ')
+        let mut sig = vec![0.0005f32; 9600];
+        let mut burst: Vec<f32> = (0..2880)
+            .map(|i| (2.0 * std::f32::consts::PI * 5500.0 * (i as f32 / 48_000.0)).sin() * 0.08)
+            .collect();
+        sig.append(&mut burst);
+
+        let (out, _, _) = denoiser.process(&sig);
+        let in_burst_rms = (sig[10_080..12_000].iter().map(|x| x * x).sum::<f32>() / 1920.0).sqrt();
+        let out_burst_rms = (out[10_080..12_000].iter().map(|x| x * x).sum::<f32>() / 1920.0).sqrt();
+        assert!(
+            out_burst_rms > in_burst_rms * 0.65,
+            "expected sibilant burst preservation (in={:.4}, out={:.4})",
+            in_burst_rms,
+            out_burst_rms
         );
     }
 }

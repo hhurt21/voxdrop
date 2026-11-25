@@ -106,21 +106,58 @@ fn is_toast_chrome_noise(s: &str) -> bool {
     )
 }
 
+fn has_server_paren_pair(t: &str) -> bool {
+    for (open, close) in [('(', ')'), ('（', '）')] {
+        if let Some(rest) = t.strip_suffix(close) {
+            if let Some(pos) = rest.rfind(open) {
+                let inside = &rest[pos + open.len_utf8()..];
+                if let Some((ch, srv)) = inside.split_once(',').or_else(|| inside.split_once('、')) {
+                    if !ch.trim().is_empty() && !srv.trim().is_empty() {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Checks if a Discord notification title represents a server channel rather than a DM.
-/// Typical Discord server toast title: `"Taro (#general, MyServer)"` or `"Taro - #general"`.
+/// Handles classic `"Taro (#general, MyServer)"`, threads/voice `"Taro (一般, 鯖名)"`,
+/// `"#general (MyServer)"`, `"Taro | #general"`, `"Taro • #general"`, `"Taro in #general"`, etc.
 pub fn is_server_channel_title(title: &str) -> bool {
     let t = title.trim();
-    t.contains("(#") || t.contains("( #") || t.contains("（#") || t.contains(" - #") || t.starts_with('#')
+    if t.starts_with('#') {
+        return true;
+    }
+    for marker in [
+        "(#", "( #", "（#", "（ #", " - #", " | #", " • #", " ・ #", "・#", " / #", " in #",
+    ] {
+        if t.contains(marker) {
+            return true;
+        }
+    }
+    has_server_paren_pair(t)
 }
 
 /// Extracts clean sender name from title (e.g. `"Taro (#general, MyServer)"` -> `"Taro"`).
 pub fn extract_sender_name(title: &str) -> String {
     let t = title.trim();
-    for sep in ["(#", "( #", "（#", " - #"] {
+    for sep in [
+        "(#", "( #", "（#", "（ #", " - #", " | #", " • #", " ・ #", "・#", " in #",
+    ] {
         if let Some((left, _)) = t.split_once(sep) {
             let trimmed = left.trim();
             if !trimmed.is_empty() {
                 return trimmed.to_string();
+            }
+        }
+    }
+    if has_server_paren_pair(t) {
+        if let Some(pos) = t.rfind(['(', '（']) {
+            let left = t[..pos].trim();
+            if !left.is_empty() {
+                return left.to_string();
             }
         }
     }
@@ -259,8 +296,24 @@ pub fn filter_and_format_toast_at(
 
     // 2. Split into title (sender / channel header) and body lines
     let title = &content_lines[0];
-    let raw_body = content_lines[1..].join(" ");
-    let is_server = is_server_channel_title(title);
+    let second_is_channel_header = content_lines.len() >= 3
+        && content_lines[1].chars().count() <= 56
+        && is_server_channel_title(&content_lines[1]);
+
+    let hint_lower = raw.app_name_hint.to_ascii_lowercase();
+    let is_server = if hint_lower.contains("[server]") {
+        true
+    } else if hint_lower.contains("[dm]") {
+        false
+    } else {
+        is_server_channel_title(title) || second_is_channel_header
+    };
+
+    let raw_body = if second_is_channel_header {
+        content_lines[2..].join(" ")
+    } else {
+        content_lines[1..].join(" ")
+    };
 
     if cfg.dm_only && is_server {
         return None;
@@ -343,6 +396,19 @@ mod tests {
 
         let srv = toast(&["Discord", "Taro (#general, MyServer)", "雑談メッセージ"]);
         assert!(filter_and_format_toast_at(&srv, &cfg, &mut dedup, now).is_none());
+
+        // Voice text / thread channel without '#' (Author (channel, Server)) must be rejected when dm_only
+        let voice_txt = toast(&["Discord", "Taro (一般, MyServer)", "これみて"]);
+        assert!(filter_and_format_toast_at(&voice_txt, &cfg, &mut dedup, now).is_none());
+
+        // Multi-line header [Server, #channel, body] must be rejected when dm_only
+        let multiline_srv = toast(&["Discord", "MyServer", "#general", "Taro: msg"]);
+        assert!(filter_and_format_toast_at(&multiline_srv, &cfg, &mut dedup, now).is_none());
+
+        // Explicit [server] / [dm] hint from WPN XML launch URL
+        let mut wpn_srv = toast(&["Taro", "サーバーの何か"]);
+        wpn_srv.app_name_hint = "Discord [server]".into();
+        assert!(filter_and_format_toast_at(&wpn_srv, &cfg, &mut dedup, now).is_none());
 
         // Non-Discord toast must be ignored
         let other = toast(&["Slack", "Taro", "会議です"]);

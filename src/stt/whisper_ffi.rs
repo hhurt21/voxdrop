@@ -276,12 +276,21 @@ impl ResidentWhisperRecognizer {
     }
 
     pub fn transcribe(&self, samples_16k: &[f32]) -> Result<String, String> {
+        self.transcribe_with_clarity(samples_16k, true)
+    }
+
+    pub fn transcribe_with_clarity(
+        &self,
+        samples_16k: &[f32],
+        clarity_boost: bool,
+    ) -> Result<String, String> {
         if samples_16k.len() < 1600 {
             return Ok(String::new());
         }
 
-        // Apply Smart Quiet-Mic AGC + 80Hz High-Pass (NO spectral tilt EQ so Whisper's Mel spectrum stays exact!)
-        let conditioned = crate::audio::enhance::enhance_utterance_16k(samples_16k, false, true);
+        // Apply Smart Quiet-Mic + Syllabic Consonant AGC, gated 3-7.5kHz sibilant clarity & 80Hz High-Pass
+        let conditioned =
+            crate::audio::enhance::enhance_utterance_16k(samples_16k, clarity_boost, true);
 
         let guard = self
             .inner
@@ -333,9 +342,10 @@ impl ResidentWhisperRecognizer {
             wparams.suppress_nst = true;
             wparams.temperature = 0.0;
             wparams.temperature_inc = 0.2;
-            // Relax entropy_thold slightly (2.2 -> 2.6) so fast casual Japanese never triggers noisy temperature>0 fallback
+            // Relax entropy_thold & logprob_thold so fast / slurred Japanese stays in deterministic beam search
             wparams.entropy_thold = 2.6;
-            wparams.no_speech_thold = 0.60;
+            wparams.logprob_thold = -1.35;
+            wparams.no_speech_thold = 0.68;
             // Do not cap at 96 tokens so dense fast speech (80-150+ Japanese chars) never truncates
             wparams.max_tokens = 0;
             if self.using_gpu {
@@ -357,9 +367,9 @@ impl ResidentWhisperRecognizer {
             let n_seg = (guard.fns.full_n_segments)(guard.ctx);
             let mut out = String::new();
             for i in 0..n_seg {
-                // Skip segments Whisper itself believes are non-speech / background noise
+                // Skip segments Whisper itself believes are pure non-speech / background noise
                 if let Some(nsp_fn) = guard.fns.full_get_segment_no_speech_prob {
-                    if nsp_fn(guard.ctx, i) >= 0.62 {
+                    if nsp_fn(guard.ctx, i) >= 0.78 {
                         continue;
                     }
                 }

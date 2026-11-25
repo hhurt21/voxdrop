@@ -49,7 +49,7 @@ pub struct VadSegmenter {
 
 impl VadSegmenter {
     pub fn new(config: VadConfig) -> Self {
-        let pre_roll_cap = ms_to_samples(config.pre_roll_ms.max(350));
+        let pre_roll_cap = ms_to_samples(config.pre_roll_ms.max(420));
         Self {
             config,
             in_speech: false,
@@ -171,7 +171,7 @@ impl VadSegmenter {
         let silence_limit = ms_to_samples(self.config.silence_ms.clamp(150, 2000));
         let min_speech = ms_to_samples(self.config.min_speech_ms.max(40));
         let max_utterance = ms_to_samples(self.config.max_utterance_ms.max(1500));
-        let max_pre_roll = ms_to_samples(self.config.pre_roll_ms.max(350));
+        let max_pre_roll = ms_to_samples(self.config.pre_roll_ms.max(420));
 
         // Voice start decision:
         // Either clearly above SNR threshold (and not rejected by neural VAD when strong hum),
@@ -215,9 +215,9 @@ impl VadSegmenter {
             }
 
             // Peak-Drop End-of-Speech Detector:
-            // Compare current frame against BOTH ambient keep_th AND the speaker's recent voice peak!
-            // Using 0.16x peak preserves softer trailing syllables in fast speech while still closing promptly.
-            let dynamic_drop_th = keep_th.max(self.speech_peak_rms * 0.16);
+            // Using 0.105x peak preserves soft trailing sibilants ('す', 'し', 'そ', 'さ') & unvoiced consonants
+            // in fast/slurred speech while still closing promptly.
+            let dynamic_drop_th = keep_th.max(self.speech_peak_rms * 0.105);
             let energy_active = rms >= dynamic_drop_th;
             let neural_still_talking = rnnoise_active
                 && neural_vad_prob >= 0.45
@@ -258,8 +258,8 @@ impl VadSegmenter {
                 }
 
                 if enough_speech && looks_like_voice && !buf.is_empty() {
-                    // Keep 160ms tail margin so trailing Japanese unvoiced consonants (す/く/つ/た) never clip
-                    let keep_tail = ms_to_samples(160);
+                    // Keep 220ms tail margin so trailing Japanese unvoiced consonants (す/し/く/つ/た) never clip
+                    let keep_tail = ms_to_samples(220);
                     if trailing_sil > keep_tail && buf.len() > trailing_sil {
                         let trim = trailing_sil - keep_tail;
                         buf.truncate(buf.len() - trim);
@@ -347,8 +347,8 @@ mod tests {
         assert_eq!(evs.len(), 1);
         match &evs[0] {
             VadEvent::SpeechEnd(samples) => {
-                // 100ms pre-roll + 250ms speech + 160ms trimmed tail = 510ms
-                assert_eq!(samples.len(), ms_to_samples(510));
+                // 100ms pre-roll + 250ms speech + 220ms trimmed tail = 570ms
+                assert_eq!(samples.len(), ms_to_samples(570));
             }
             _ => panic!("expected SpeechEnd"),
         }

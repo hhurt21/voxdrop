@@ -1,6 +1,7 @@
 pub mod discord_filter;
 pub mod discord_uia_watcher;
 pub mod toast_watcher;
+pub mod wpn_watcher;
 
 use crate::config::DiscordTtsConfig;
 use discord_filter::{
@@ -10,6 +11,7 @@ use discord_uia_watcher::{DiscordUiaWatcher, UiaDmEvent};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use toast_watcher::{RawToastNotification, ToastWatcher};
+use wpn_watcher::WpnWatcher;
 
 #[derive(Debug, Clone)]
 pub enum NotificationEvent {
@@ -21,10 +23,14 @@ pub enum NotificationEvent {
     DebugToast(String),
 }
 
-/// Manages lifecycle of BOTH the Windows UIA toast watcher AND the Discord UIA DM watcher
-/// (which works even when Windows notifications are turned off), sharing one deduplicator.
+/// Manages lifecycle of:
+/// 1. Windows UIA Toast Watcher (live popups),
+/// 2. Windows Push Notification (`wpndatabase.db`) Watcher (works during Do Not Disturb / minimized / hidden),
+/// 3. Discord UIA DM Watcher (works even when Windows notifications for Discord are OFF).
+/// All three share one deduplicator.
 pub struct NotificationController {
     watcher: ToastWatcher,
+    wpn_watcher: WpnWatcher,
     uia_watcher: DiscordUiaWatcher,
     config: Arc<Mutex<DiscordTtsConfig>>,
 }
@@ -35,6 +41,7 @@ impl NotificationController {
         F: Fn(NotificationEvent) + Send + Sync + 'static,
     {
         let toast_enabled = initial_cfg.enabled || initial_cfg.debug_log_toasts;
+        let wpn_enabled = initial_cfg.enabled;
         let uia_enabled = initial_cfg.enabled && initial_cfg.read_without_windows_notifications;
         let config = Arc::new(Mutex::new(initial_cfg));
         let dedup = Arc::new(Mutex::new(NotificationDeduplicator::new(24)));
@@ -65,6 +72,37 @@ impl NotificationController {
             };
             if let Some(parsed) = filter_and_format_toast(&raw, &cfg, &mut dedup_guard) {
                 cb_toast(NotificationEvent::SpeakText {
+                    sender: parsed.sender,
+                    body: parsed.sanitized_body,
+                    speech_text: parsed.speech_text,
+                });
+            }
+        });
+
+        let cfg_wpn = config.clone();
+        let dedup_wpn = dedup.clone();
+        let cb_wpn = cb.clone();
+        let wpn_watcher = WpnWatcher::spawn(wpn_enabled, move |raw: RawToastNotification| {
+            let cfg = match cfg_wpn.lock() {
+                Ok(g) => g.clone(),
+                Err(_) => return,
+            };
+            if cfg.debug_log_toasts {
+                let debug_line = format!(
+                    "[WPN] hint='{}' id='{}' texts={:?}",
+                    raw.app_name_hint, raw.automation_id, raw.texts
+                );
+                eprintln!("{}", debug_line);
+                cb_wpn(NotificationEvent::DebugToast(debug_line));
+            }
+            if !cfg.enabled {
+                return;
+            }
+            let Ok(mut dedup_guard) = dedup_wpn.lock() else {
+                return;
+            };
+            if let Some(parsed) = filter_and_format_toast(&raw, &cfg, &mut dedup_guard) {
+                cb_wpn(NotificationEvent::SpeakText {
                     sender: parsed.sender,
                     body: parsed.sanitized_body,
                     speech_text: parsed.speech_text,
@@ -116,7 +154,7 @@ impl NotificationController {
                     if !discord_filter::sender_permitted(&sender, &cfg) {
                         return;
                     }
-                    // If a toast for this sender was just processed in the last 5 seconds, skip duplicate
+                    // If a toast/WPN for this sender was just processed in the last 5 seconds, skip duplicate
                     if dedup_guard.seen_sender_recently(&sender, 5000, Instant::now()) {
                         return;
                     }
@@ -150,6 +188,7 @@ impl NotificationController {
 
         Self {
             watcher,
+            wpn_watcher,
             uia_watcher,
             config,
         }
@@ -157,6 +196,7 @@ impl NotificationController {
 
     pub fn update_config(&self, cfg: DiscordTtsConfig) {
         self.watcher.set_enabled(cfg.enabled || cfg.debug_log_toasts);
+        self.wpn_watcher.set_enabled(cfg.enabled);
         self.uia_watcher
             .set_enabled(cfg.enabled && cfg.read_without_windows_notifications);
         if let Ok(mut guard) = self.config.lock() {
@@ -166,6 +206,7 @@ impl NotificationController {
 
     pub fn shutdown(&self) {
         self.watcher.shutdown();
+        self.wpn_watcher.shutdown();
         self.uia_watcher.shutdown();
     }
 }

@@ -23,8 +23,12 @@ use windows::Win32::UI::Accessibility::{
     UIA_ListItemControlTypeId,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowTextW, GetWindowThreadProcessId,
+    EnumWindows, GetClassNameW, GetWindowTextW, GetWindowThreadProcessId, SendMessageTimeoutW,
+    SMTO_ABORTIFHUNG,
 };
+
+const WM_GETOBJECT_MSG: u32 = 0x003D;
+const OBJID_CLIENT_LPARAM: isize = -4;
 
 #[derive(Debug, Clone)]
 pub enum UiaDmEvent {
@@ -38,6 +42,7 @@ pub enum UiaDmEvent {
 enum ScanRegion {
     Unknown,
     ServersOrDmRail,
+    ServersContainer,
     DirectMessagesList,
     MessagesArea,
 }
@@ -78,6 +83,13 @@ unsafe extern "system" fn find_any_discord_cb(hwnd: HWND, lparam: LPARAM) -> BOO
                     || exe.eq_ignore_ascii_case("DiscordPTB.exe")
                     || exe.eq_ignore_ascii_case("DiscordCanary.exe")
                 {
+                    let mut cls_buf = vec![0u16; 128];
+                    let clen = GetClassNameW(hwnd, &mut cls_buf);
+                    let cls = if clen > 0 {
+                        String::from_utf16_lossy(&cls_buf[..clen as usize])
+                    } else {
+                        String::new()
+                    };
                     let mut title_buf = vec![0u16; 256];
                     let tlen = GetWindowTextW(hwnd, &mut title_buf);
                     let title = if tlen > 0 {
@@ -87,7 +99,7 @@ unsafe extern "system" fn find_any_discord_cb(hwnd: HWND, lparam: LPARAM) -> BOO
                     } else {
                         String::new()
                     };
-                    if title.to_ascii_lowercase().contains("discord") {
+                    if cls == "Chrome_WidgetWin_1" && title.to_ascii_lowercase().contains("discord") {
                         ctx.found = Some((hwnd, title));
                         return BOOL(0);
                     }
@@ -121,22 +133,40 @@ pub fn parse_unread_dm_badge(label: &str, in_dm_list: bool) -> Option<(String, u
     }
     let lower = trimmed.to_ascii_lowercase();
 
-    // Must explicitly indicate unread / mention status
+    let has_dm_marker =
+        trimmed.contains("ダイレクトメッセージ") || lower.contains("direct message");
+
+    // Must explicitly indicate unread / mention status.
+    // Outside DirectMessagesList, require explicit "ダイレクトメッセージ" / "unread message" / "件の未読メッセージ"
+    // so server icons ("サーバー名, 1件のメンション") are NEVER mistaken for DMs!
     let has_dm_unread_marker = trimmed.contains("件の未読メッセージ")
         || lower.contains("unread message")
         || (in_dm_list && (trimmed.contains("未読") || lower.contains("unread")))
-        || (trimmed.contains("ダイレクトメッセージ") && (trimmed.contains("未読") || trimmed.contains("件のメンション")))
-        || (lower.contains("direct message") && (lower.contains("unread") || lower.contains("mention")));
+        || (has_dm_marker
+            && (trimmed.contains("未読")
+                || lower.contains("unread")
+                || trimmed.contains("件のメンション")
+                || lower.contains("mention")));
 
     if !has_dm_unread_marker {
         return None;
     }
 
-    // Ignore server channels or voice channels
+    // Ignore server channels, voice channels, threads, forums, or unread divider banners
     if trimmed.contains("テキストチャンネル")
         || trimmed.contains("ボイスチャンネル")
+        || trimmed.contains("アナウンスチャンネル")
+        || trimmed.contains("フォーラム")
+        || trimmed.contains("スレッド")
+        || trimmed.contains("ステージ")
+        || trimmed.contains("カテゴリー")
+        || trimmed.contains("新しい未読")
         || lower.contains("text channel")
         || lower.contains("voice channel")
+        || lower.contains("thread")
+        || lower.contains("forum")
+        || lower.contains("stage")
+        || lower.contains("category")
         || trimmed.starts_with('#')
     {
         return None;
@@ -146,7 +176,11 @@ pub fn parse_unread_dm_badge(label: &str, in_dm_list: bool) -> Option<(String, u
     let mut count = 1u32;
     for part in trimmed.split([',', '、']) {
         let digits: String = part.chars().filter(|c| c.is_ascii_digit()).collect();
-        if !digits.is_empty() && (part.contains("件") || part.to_ascii_lowercase().contains("unread") || part.to_ascii_lowercase().contains("mention")) {
+        if !digits.is_empty()
+            && (part.contains("件")
+                || part.to_ascii_lowercase().contains("unread")
+                || part.to_ascii_lowercase().contains("mention"))
+        {
             if let Ok(n) = digits.parse::<u32>() {
                 if n > 0 && n < 10000 {
                     count = n;
@@ -157,13 +191,32 @@ pub fn parse_unread_dm_badge(label: &str, in_dm_list: bool) -> Option<(String, u
     }
 
     let sender = clean_friend_label(trimmed)?;
-    if sender.is_empty() {
+    let s_lower = sender.to_ascii_lowercase();
+    if sender.is_empty()
+        || sender.chars().all(|c| c.is_ascii_digit())
+        || sender.contains("未読")
+        || sender.contains("件の")
+        || s_lower.contains("unread")
+        || s_lower.contains("mention")
+    {
         return None;
     }
     Some((sender, count))
 }
 
 unsafe fn scan_discord_snapshot(hwnd: HWND, title: &str) -> Option<UiaScanSnapshot> {
+    // Gently ping Chromium's accessibility tree even when Discord is behind another window / minimized
+    let mut _msg_res: usize = 0;
+    let _ = SendMessageTimeoutW(
+        hwnd,
+        WM_GETOBJECT_MSG,
+        windows::Win32::Foundation::WPARAM(0),
+        LPARAM(OBJID_CLIENT_LPARAM),
+        SMTO_ABORTIFHUNG,
+        80,
+        Some(&mut _msg_res),
+    );
+
     let uia: IUIAutomation =
         CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()?;
     let root = uia.ElementFromHandle(hwnd).ok()?;
@@ -193,7 +246,7 @@ unsafe fn walk_snapshot(
     visited: &mut usize,
     snap: &mut UiaScanSnapshot,
 ) {
-    if depth > 13 || *visited > 1300 {
+    if depth > 26 || *visited > 5500 {
         return;
     }
     *visited += 1;
@@ -207,8 +260,21 @@ unsafe fn walk_snapshot(
 
     if !trimmed.is_empty() {
         let lower = trimmed.to_ascii_lowercase();
-        if trimmed == "サーバー" || lower == "servers" || lower.contains("servers sidebar") {
+        // Skip server channel lists and member lists completely (faster + prevents false DM badges)
+        if trimmed == "チャンネル"
+            || lower == "channels"
+            || (trimmed.ends_with("チャンネル") && trimmed.chars().count() <= 24)
+            || trimmed == "メンバー"
+            || lower == "members"
+            || lower.starts_with("members list")
+        {
+            return;
+        }
+        if lower.contains("servers sidebar") || trimmed == "ホーム" || lower == "home" {
             next_region = ScanRegion::ServersOrDmRail;
+        } else if trimmed == "サーバー" || lower == "servers" {
+            // Inside the Servers icon tree, items are servers rather than DMs
+            next_region = ScanRegion::ServersContainer;
         } else if trimmed == "ダイレクトメッセージ"
             || lower == "direct messages"
             || lower == "private channels"
@@ -226,6 +292,15 @@ unsafe fn walk_snapshot(
                         *entry = (*entry).max(cnt);
                     }
                 }
+                ScanRegion::ServersContainer => {
+                    // Only treat an item here as DM if Discord explicitly tags it "ダイレクトメッセージ"
+                    if trimmed.contains("ダイレクトメッセージ") || lower.contains("direct message") {
+                        if let Some((sender, cnt)) = parse_unread_dm_badge(trimmed, false) {
+                            let entry = snap.unread_badges.entry(sender).or_insert(0);
+                            *entry = (*entry).max(cnt);
+                        }
+                    }
+                }
                 ScanRegion::DirectMessagesList => {
                     if let Some((sender, cnt)) = parse_unread_dm_badge(trimmed, true) {
                         let entry = snap.unread_badges.entry(sender).or_insert(0);
@@ -233,16 +308,20 @@ unsafe fn walk_snapshot(
                     }
                 }
                 ScanRegion::MessagesArea => {
-                    if let Ok(ct) = node.CurrentControlType() {
-                        if ct == UIA_ListItemControlTypeId && trimmed.chars().count() >= 2 {
-                            snap.last_message_text = Some(trimmed.to_string());
+                    if snap.open_dm_friend.is_some() {
+                        if let Ok(ct) = node.CurrentControlType() {
+                            if ct == UIA_ListItemControlTypeId && trimmed.chars().count() >= 2 {
+                                snap.last_message_text = Some(trimmed.to_string());
+                            }
                         }
                     }
                 }
                 ScanRegion::Unknown => {
-                    if let Some((sender, cnt)) = parse_unread_dm_badge(trimmed, false) {
-                        let entry = snap.unread_badges.entry(sender).or_insert(0);
-                        *entry = (*entry).max(cnt);
+                    if trimmed.contains("ダイレクトメッセージ") || lower.contains("direct message") {
+                        if let Some((sender, cnt)) = parse_unread_dm_badge(trimmed, false) {
+                            let entry = snap.unread_badges.entry(sender).or_insert(0);
+                            *entry = (*entry).max(cnt);
+                        }
                     }
                 }
             }
@@ -251,7 +330,7 @@ unsafe fn walk_snapshot(
 
     if let Ok(mut child) = walker.GetFirstChildElement(node) {
         let mut siblings = 0usize;
-        while siblings < 120 && *visited <= 1300 {
+        while siblings < 160 && *visited <= 5500 {
             walk_snapshot(walker, &child, next_region, depth + 1, visited, snap);
             siblings += 1;
             match walker.GetNextSiblingElement(&child) {
@@ -392,9 +471,13 @@ mod tests {
             parse_unread_dm_badge("Hanako, 未読, ダイレクトメッセージ", true),
             Some(("Hanako".into(), 1))
         );
-        // Server channels must be ignored
+        // Server channels & unread divider banners must be ignored
         assert_eq!(
             parse_unread_dm_badge("雑談（テキストチャンネル）, 2件の未読メッセージ", false),
+            None
+        );
+        assert_eq!(
+            parse_unread_dm_badge("3件の未読メッセージ", false),
             None
         );
         // Online friend without unread status must be ignored

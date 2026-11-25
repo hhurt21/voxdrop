@@ -167,9 +167,10 @@ impl SttEngine for WhisperResidentEngine {
     fn transcribe_enhanced(
         &self,
         samples_16k: &[f32],
-        _radio_clarity: bool,
+        radio_clarity: bool,
     ) -> Result<String, String> {
-        self.recognizer.transcribe(samples_16k)
+        self.recognizer
+            .transcribe_with_clarity(samples_16k, radio_clarity)
     }
 }
 
