@@ -48,7 +48,14 @@ fn prepare_foreground(guard: &GuardConfig) -> Result<(Option<isize>, String), St
 fn maybe_restore(restore_hwnd: Option<isize>) {
     if let Some(prev) = restore_hwnd {
         thread::sleep(Duration::from_millis(80));
-        window::restore_hwnd_raw(prev);
+        window::restore_hwnd_raw_ex(prev, true);
+    }
+}
+
+fn maybe_restore_ex(restore_hwnd: Option<isize>, allow_send_input: bool) {
+    if let Some(prev) = restore_hwnd {
+        thread::sleep(Duration::from_millis(80));
+        window::restore_hwnd_raw_ex(prev, allow_send_input);
     }
 }
 
@@ -63,6 +70,26 @@ pub fn paste_text_guarded(
         return Ok("送信テキストが空のためスキップしました".into());
     }
     let (already_allowed, _) = check_target(guard);
+    if guard.send_method == SendMethod::WindowMessage {
+        if text.is_empty() {
+            return Ok("WindowMessage モード: 空テキストをスキップしました".into());
+        }
+        if let Some((top_hwnd, render_hwnd)) =
+            window::find_discord_render_hwnd(&guard.allowed_processes)
+        {
+            let prev = window::get_foreground_hwnd_raw();
+            let _ = window::focus_hwnd_ex(top_hwnd, false);
+            let _ = uia::focus_discord_chat_input_no_mouse(&guard.allowed_processes, 300);
+            if input::post_text_window_message(render_hwnd, text, press_enter).is_ok() {
+                if !already_allowed && guard.restore_previous_window && prev != 0 {
+                    maybe_restore_ex(Some(prev), false);
+                }
+                return Ok("PostMessage送信完了（SendInput不使用）".into());
+            }
+        }
+        input::copy_text_to_clipboard_only(text)?;
+        return Ok("SendInput不使用モード: クリップボードへコピーしました".into());
+    }
     if guard.should_avoid_send_input(already_allowed) {
         if text.is_empty() {
             return Ok("セーフモード中のため Enter 送信をスキップしました".into());
@@ -129,6 +156,18 @@ pub fn navigate_and_focus_discord_target(
     }
 
     let (already_allowed, _) = check_target(guard);
+    if guard.send_method == SendMethod::WindowMessage {
+        if let Some(link) = discord::build_deep_link(target) {
+            let _ = discord::open_deep_link(&link);
+            thread::sleep(Duration::from_millis(navigate_delay_ms.clamp(120, 1000)));
+        }
+        let _ = window::ensure_allowed_foreground_ex(allowed, 700, false);
+        let _ = uia::focus_discord_chat_input_no_mouse(allowed, 500);
+        return Ok(format!(
+            "{}（ウィンドウメッセージ送信: SendInput不使用）",
+            discord::target_display_label(Some(target))
+        ));
+    }
     if guard.send_method == SendMethod::NoSendInput
         || (guard.send_method == SendMethod::SafeWhenGameActive && !already_allowed)
     {
@@ -254,6 +293,47 @@ pub fn send_to_discord_target(
     // Remember user's current foreground window BEFORE focusing/navigating Discord!
     let prev_hwnd = window::get_foreground_hwnd_raw();
     let (already_allowed, _) = check_target(guard);
+
+    if guard.send_method == SendMethod::WindowMessage {
+        if formatted.is_empty() && !press_enter {
+            return Ok("送信テキストが空のためスキップしました".into());
+        }
+        if let Some(t) = target {
+            if auto_navigate {
+                let _ = navigate_and_focus_discord_target(t, guard, navigate_delay_ms, true);
+            }
+        }
+        let focused = if already_allowed {
+            true
+        } else {
+            window::ensure_allowed_foreground_ex(&guard.allowed_processes, 900, false).is_ok()
+        };
+        let _ = uia::focus_discord_chat_input_no_mouse(&guard.allowed_processes, 350);
+
+        if focused {
+            if let Some((_, render_hwnd)) =
+                window::find_discord_render_hwnd(&guard.allowed_processes)
+            {
+                let res = input::post_text_window_message(render_hwnd, &formatted, press_enter);
+                if !already_allowed && guard.restore_previous_window && prev_hwnd != 0 {
+                    maybe_restore_ex(Some(prev_hwnd), false);
+                }
+                if res.is_ok() {
+                    let label = discord::target_display_label(target);
+                    return Ok(format!(
+                        "{} → PostMessage送信完了（SendInput不使用）",
+                        label
+                    ));
+                }
+            }
+        }
+
+        // Graceful anti-cheat-safe fallback: never touch SendInput
+        if !formatted.is_empty() {
+            input::copy_text_to_clipboard_only(&formatted)?;
+        }
+        return Ok("SendInput不使用モード: フォーカスできなかったためクリップボードへコピーしました".into());
+    }
 
     if guard.should_avoid_send_input(already_allowed) {
         if formatted.is_empty() {

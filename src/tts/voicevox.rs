@@ -54,9 +54,19 @@ fn parse_base_url(raw: &str) -> Result<ParsedBaseUrl, String> {
         let parsed_port = p_str
             .parse::<u16>()
             .map_err(|_| format!("VOICEVOX ポート番号が不正です: {}", p_str))?;
-        (h.to_string(), parsed_port)
+        let norm_h = if h.eq_ignore_ascii_case("localhost") {
+            "127.0.0.1".to_string()
+        } else {
+            h.to_string()
+        };
+        (norm_h, parsed_port)
     } else {
-        (authority.to_string(), default_port)
+        let norm_h = if authority.eq_ignore_ascii_case("localhost") {
+            "127.0.0.1".to_string()
+        } else {
+            authority.to_string()
+        };
+        (norm_h, default_port)
     };
 
     let base_path = if path_part == "/" {
@@ -340,7 +350,7 @@ impl VoicevoxClient {
         let query_path = format!("/audio_query?text={}&speaker={}", encoded, cfg.speaker_id);
 
         let (q_status, q_bytes) =
-            winhttp_bytes_request(&base, "POST", &query_path, None, Some(b""), 5000)?;
+            winhttp_bytes_request(&base, "POST", &query_path, None, Some(b""), 15_000)?;
         if !(200..300).contains(&q_status) {
             return Err(format!(
                 "VOICEVOX /audio_query が HTTP {} を返しました（話者ID {} を確認してください）",
@@ -361,7 +371,7 @@ impl VoicevoxClient {
             &synth_path,
             Some("application/json; charset=utf-8"),
             Some(&synth_body),
-            10_000,
+            30_000,
         )?;
         if !(200..300).contains(&s_status) {
             return Err(format!(

@@ -23,7 +23,7 @@ pub struct ParsedDiscordNotification {
 /// within `dedup_window_ms`.
 pub struct NotificationDeduplicator {
     cap: usize,
-    entries: VecDeque<(u64, Instant)>,
+    entries: VecDeque<(u64, String, Instant)>,
 }
 
 impl NotificationDeduplicator {
@@ -46,15 +46,24 @@ impl NotificationDeduplicator {
         if self
             .entries
             .iter()
-            .any(|&(h, ts)| h == key && now.saturating_duration_since(ts) <= window)
+            .any(|(h, _, ts)| *h == key && now.saturating_duration_since(*ts) <= window)
         {
             return true;
         }
         while self.entries.len() >= self.cap {
             self.entries.pop_front();
         }
-        self.entries.push_back((key, now));
+        self.entries
+            .push_back((key, sender.trim().to_ascii_lowercase(), now));
         false
+    }
+
+    pub fn seen_sender_recently(&self, sender: &str, window_ms: u64, now: Instant) -> bool {
+        let s = sender.trim().to_ascii_lowercase();
+        let window = Duration::from_millis(window_ms);
+        self.entries
+            .iter()
+            .any(|(_, prev_s, ts)| *prev_s == s && now.saturating_duration_since(*ts) <= window)
     }
 }
 
@@ -167,6 +176,30 @@ pub fn sanitize_message_for_tts(raw: &str, url_replacement: &str, max_chars: usi
         format!("{}以下略", truncated.trim_end())
     } else {
         text
+    }
+}
+
+pub fn sender_permitted(sender: &str, cfg: &DiscordTtsConfig) -> bool {
+    if !cfg.allow_senders.is_empty() && !sender_matches_list(sender, &cfg.allow_senders) {
+        return false;
+    }
+    if sender_matches_list(sender, &cfg.block_senders) {
+        return false;
+    }
+    true
+}
+
+pub fn format_speech_text(sender: &str, sanitized_body: &str, cfg: &DiscordTtsConfig) -> String {
+    if cfg.read_sender_name {
+        let tpl = if cfg.template.trim().is_empty() {
+            "{sender}さんから。{message}"
+        } else {
+            cfg.template.as_str()
+        };
+        tpl.replace("{sender}", sender)
+            .replace("{message}", sanitized_body)
+    } else {
+        sanitized_body.to_string()
     }
 }
 

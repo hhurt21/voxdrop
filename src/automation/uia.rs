@@ -539,6 +539,55 @@ pub fn click_profile_message_button(allowed_processes: &[String], timeout_ms: u6
     false
 }
 
+/// Focuses Discord's bottom message composer via UIA `SetFocus()` ONLY (no `SetCursorPos` or mouse click).
+pub fn focus_discord_chat_input_no_mouse(allowed_processes: &[String], timeout_ms: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(150));
+    while Instant::now() < deadline {
+        if let Some((hwnd, _)) = find_discord_window(allowed_processes) {
+            let mut focused = false;
+            unsafe {
+                let com_inited = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
+                if let Ok(uia) =
+                    CoCreateInstance::<_, IUIAutomation>(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
+                {
+                    if let Ok(root) = uia.ElementFromHandle(hwnd) {
+                        if let Ok(edit_cond) = uia.CreatePropertyCondition(
+                            UIA_ControlTypePropertyId,
+                            &VARIANT::from(UIA_EditControlTypeId.0),
+                        ) {
+                            if let Ok(edits) = root.FindAll(TreeScope_Descendants, &edit_cond) {
+                                let len = edits.Length().unwrap_or(0);
+                                for i in 0..len {
+                                    if let Ok(elem) = edits.GetElement(i) {
+                                        let name = elem
+                                            .CurrentName()
+                                            .map(|b| b.to_string())
+                                            .unwrap_or_default();
+                                        if is_discord_chat_composer_label(&name) {
+                                            if elem.SetFocus().is_ok() {
+                                                focused = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if com_inited {
+                    CoUninitialize();
+                }
+            }
+            if focused {
+                return true;
+            }
+        }
+        thread::sleep(Duration::from_millis(60));
+    }
+    false
+}
+
 /// Fast native UIA `FindAll(Edit)` lookup for Discord's bottom message input box
 /// (e.g. `"@alice へメッセージを送信"` / `"#雑談 へメッセージを送信"`) (~30–80ms!),
 /// focuses it via `SetFocus()` and clicks inside so the text caret is guaranteed ready.

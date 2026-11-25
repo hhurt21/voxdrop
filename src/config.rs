@@ -338,9 +338,11 @@ impl DiscordTargetsConfig {
 pub enum SendMethod {
     /// 標準: Discord へ自動フォーカスし SendInput (Ctrl+V / Enter) で自動送信
     AutoPaste,
+    /// SendInput 不使用: Win32 PostMessage (WM_CHAR / VK_RETURN) ＋ UIA SetFocus で送信（Webhook/Bot優先）
+    WindowMessage,
     /// ゲーム中セーフ: Discord 以外が最前面のときは SendInput を使わず Webhook/Bot またはクリップボードコピーのみ
     SafeWhenGameActive,
-    /// 完全セーフ: SendInput / SetCursorPos を一切使わず、Webhook/Bot 送信＋クリップボードコピーのみ
+    /// 完全セーフ: SendInput / PostMessage / マウス移動を一切使わず、Webhook/Bot 送信＋クリップボードコピーのみ
     NoSendInput,
 }
 
@@ -368,7 +370,7 @@ impl GuardConfig {
     pub fn should_avoid_send_input(&self, target_already_foreground: bool) -> bool {
         match self.send_method {
             SendMethod::AutoPaste => false,
-            SendMethod::NoSendInput => true,
+            SendMethod::WindowMessage | SendMethod::NoSendInput => true,
             SendMethod::SafeWhenGameActive => !target_already_foreground,
         }
     }
@@ -542,6 +544,8 @@ pub struct DiscordTtsConfig {
     pub allow_senders: Vec<String>,
     pub block_senders: Vec<String>,
     pub debug_log_toasts: bool,
+    /// Windows の Discord 通知を切っていても、UIA で未読・新着 DM を検知して読み上げる（デフォルト: true）
+    pub read_without_windows_notifications: bool,
     pub voicevox: VoicevoxConfig,
 }
 
@@ -561,6 +565,7 @@ impl Default for DiscordTtsConfig {
             allow_senders: Vec::new(),
             block_senders: Vec::new(),
             debug_log_toasts: false,
+            read_without_windows_notifications: true,
             voicevox: VoicevoxConfig::default(),
         }
     }
@@ -700,6 +705,7 @@ mod tests {
         assert!(!parsed.commands.send.is_empty());
         assert!(!parsed.discord_tts.enabled);
         assert!(parsed.discord_tts.dm_only);
+        assert!(parsed.discord_tts.read_without_windows_notifications);
         assert!(parsed.discord_tts.pause_stt_while_speaking);
         assert_eq!(parsed.discord_tts.voicevox.base_url, "http://127.0.0.1:50021");
         assert_eq!(parsed.discord_tts.voicevox.speaker_id, 3);
@@ -707,6 +713,10 @@ mod tests {
         assert!(!parsed.guard.should_avoid_send_input(false));
 
         let mut g = GuardConfig::default();
+        g.send_method = SendMethod::WindowMessage;
+        assert!(g.should_avoid_send_input(false));
+        assert!(g.should_avoid_send_input(true));
+
         g.send_method = SendMethod::SafeWhenGameActive;
         assert!(g.should_avoid_send_input(false));
         assert!(!g.should_avoid_send_input(true));

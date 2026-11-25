@@ -11,8 +11,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_MENU,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, EnumWindows, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId,
-    IsIconic, IsWindow, IsWindowVisible, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
+    BringWindowToTop, EnumChildWindows, EnumWindows, GetClassNameW, GetForegroundWindow,
+    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
+    SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
 };
 
 /// Returns the raw `HWND` handle of the current foreground window as `isize` (0 if none).
@@ -110,8 +111,9 @@ pub fn find_allowed_window(allowed_processes: &[String]) -> Option<HWND> {
     ctx.found
 }
 
-/// Reliably brings `target_hwnd` to the foreground on Windows (handles foreground lock cleanly).
-pub fn focus_hwnd(target_hwnd: HWND) -> bool {
+/// Reliably brings `target_hwnd` to the foreground on Windows.
+/// When `allow_send_input` is false, avoids calling `SendInput` (no `LLKHF_INJECTED` Alt tap).
+pub fn focus_hwnd_ex(target_hwnd: HWND, allow_send_input: bool) -> bool {
     unsafe {
         if target_hwnd.0.is_null() || !IsWindow(Some(target_hwnd)).as_bool() {
             return false;
@@ -135,34 +137,36 @@ pub fn focus_hwnd(target_hwnd: HWND) -> bool {
         };
         let target_tid = GetWindowThreadProcessId(target_hwnd, None);
 
-        // Tap Alt key lightly so Windows allows SetForegroundWindow from background helper app
-        let alt_tap = [
-            INPUT {
-                r#type: INPUT_KEYBOARD,
-                Anonymous: INPUT_0 {
-                    ki: KEYBDINPUT {
-                        wVk: VK_MENU,
-                        wScan: 0,
-                        dwFlags: Default::default(),
-                        time: 0,
-                        dwExtraInfo: 0,
+        if allow_send_input {
+            // Tap Alt key lightly so Windows allows SetForegroundWindow from background helper app
+            let alt_tap = [
+                INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: INPUT_0 {
+                        ki: KEYBDINPUT {
+                            wVk: VK_MENU,
+                            wScan: 0,
+                            dwFlags: Default::default(),
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
                     },
                 },
-            },
-            INPUT {
-                r#type: INPUT_KEYBOARD,
-                Anonymous: INPUT_0 {
-                    ki: KEYBDINPUT {
-                        wVk: VK_MENU,
-                        wScan: 0,
-                        dwFlags: KEYEVENTF_KEYUP,
-                        time: 0,
-                        dwExtraInfo: 0,
+                INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: INPUT_0 {
+                        ki: KEYBDINPUT {
+                            wVk: VK_MENU,
+                            wScan: 0,
+                            dwFlags: KEYEVENTF_KEYUP,
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
                     },
                 },
-            },
-        ];
-        let _ = SendInput(&alt_tap, std::mem::size_of::<INPUT>() as i32);
+            ];
+            let _ = SendInput(&alt_tap, std::mem::size_of::<INPUT>() as i32);
+        }
 
         let attached_fg = fg_tid != 0 && fg_tid != cur_tid
             && AttachThreadInput(cur_tid, fg_tid, true).as_bool();
@@ -182,19 +186,61 @@ pub fn focus_hwnd(target_hwnd: HWND) -> bool {
     }
 }
 
-pub fn restore_hwnd_raw(raw_hwnd: isize) {
+pub fn focus_hwnd(target_hwnd: HWND) -> bool {
+    focus_hwnd_ex(target_hwnd, true)
+}
+
+struct RenderChildCtx {
+    found: Option<HWND>,
+}
+
+unsafe extern "system" fn find_render_child_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let ctx = &mut *(lparam.0 as *mut RenderChildCtx);
+    let mut buf = vec![0u16; 128];
+    let len = GetClassNameW(hwnd, &mut buf);
+    if len > 0 {
+        let cls = String::from_utf16_lossy(&buf[..len as usize]);
+        if cls == "Chrome_RenderWidgetHostHWND" {
+            ctx.found = Some(hwnd);
+            return BOOL(0);
+        }
+    }
+    BOOL(1)
+}
+
+/// Finds Chromium/Electron's `Chrome_RenderWidgetHostHWND` inside the allowed Discord window
+/// so `PostMessageW` (`WM_CHAR` / `VK_RETURN`) can target Discord without `SendInput`.
+pub fn find_discord_render_hwnd(allowed_processes: &[String]) -> Option<(HWND, HWND)> {
+    let top = find_allowed_window(allowed_processes)?;
+    let mut ctx = RenderChildCtx { found: None };
+    unsafe {
+        let _ = EnumChildWindows(
+            Some(top),
+            Some(find_render_child_cb),
+            LPARAM(&mut ctx as *mut RenderChildCtx as isize),
+        );
+    }
+    Some((top, ctx.found.unwrap_or(top)))
+}
+
+pub fn restore_hwnd_raw_ex(raw_hwnd: isize, allow_send_input: bool) {
     if raw_hwnd == 0 {
         return;
     }
     let hwnd = HWND(raw_hwnd as *mut core::ffi::c_void);
-    let _ = focus_hwnd(hwnd);
+    let _ = focus_hwnd_ex(hwnd, allow_send_input);
+}
+
+pub fn restore_hwnd_raw(raw_hwnd: isize) {
+    restore_hwnd_raw_ex(raw_hwnd, true);
 }
 
 /// Ensures an allowed Discord window is in the foreground, polling up to `timeout_ms`.
 /// Returns `Ok((was_already_foreground, previous_hwnd_raw, active_process_name))`.
-pub fn ensure_allowed_foreground(
+pub fn ensure_allowed_foreground_ex(
     allowed_processes: &[String],
     timeout_ms: u64,
+    allow_send_input: bool,
 ) -> Result<(bool, isize, String), String> {
     let prev_hwnd = get_foreground_hwnd_raw();
     let cur_proc = get_foreground_process_name().unwrap_or_default();
@@ -206,7 +252,7 @@ pub fn ensure_allowed_foreground(
         return Err("Discord ウィンドウが見つかりません（Discord を起動した状態でお試しください）".into());
     };
 
-    let _ = focus_hwnd(discord_hwnd);
+    let _ = focus_hwnd_ex(discord_hwnd, allow_send_input);
     let deadline = Instant::now() + Duration::from_millis(timeout_ms.clamp(200, 3000));
     while Instant::now() < deadline {
         let p = get_foreground_process_name().unwrap_or_default();
@@ -227,6 +273,13 @@ pub fn ensure_allowed_foreground(
             if final_proc.is_empty() { "不明" } else { &final_proc }
         ))
     }
+}
+
+pub fn ensure_allowed_foreground(
+    allowed_processes: &[String],
+    timeout_ms: u64,
+) -> Result<(bool, isize, String), String> {
+    ensure_allowed_foreground_ex(allowed_processes, timeout_ms, true)
 }
 
 pub fn extract_exe_name(full_path: &str) -> Option<String> {

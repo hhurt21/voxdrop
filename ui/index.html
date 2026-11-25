@@ -491,6 +491,10 @@
                 <span>DM のみ読み上げる（サーバーチャンネル通知を除外）</span>
               </label>
               <label class="checkbox-row">
+                <input type="checkbox" id="chkTtsReadWithoutWinNotif" />
+                <span>Windows の Discord 通知を切っていても、Discord 画面の未読・新着 DM を自動検知して読み上げる</span>
+              </label>
+              <label class="checkbox-row">
                 <input type="checkbox" id="chkTtsReadSender" />
                 <span>送信者名を読み上げる（例: 「たろうさんから。こんにちは」）</span>
               </label>
@@ -665,12 +669,13 @@
               送信方式
               <select id="guardSendMethod" class="input" style="margin-top: 6px">
                 <option value="auto_paste">標準: 自動貼り付け＋送信（SendInput で完全ハンズフリー）</option>
+                <option value="window_message">SendInput不使用（PostMessage送信）: SendInputを使わず Win32 PostMessage＋UIAフォーカスで直接送信（アンチチート推奨）</option>
                 <option value="safe_when_game_active">ゲーム中セーフ: ゲーム最前面時は SendInput を止め Webhook/Bot またはクリップボードコピーに切替</option>
                 <option value="no_send_input">完全セーフ: SendInput・マウス移動を一切使わない（Webhook/Bot裏送信 ＋ DM等はクリップボードコピーのみ）</option>
               </select>
             </label>
             <p class="hint">
-              アンチチート搭載ゲームと同時に使う場合は「ゲーム中セーフ」または「完全セーフ」を選択してください。グローバルホットキーも無効にする場合は「詳細設定」タブのホットキー欄を空欄にしてください。
+              アンチチート搭載ゲームと同時に使いながらハンズフリー送信したい場合は「SendInput不使用（PostMessage送信）」、ゲーム中だけ止めたい場合は「ゲーム中セーフ」を選択してください。グローバルホットキーも無効にする場合は「詳細設定」タブのホットキー欄を空欄にしてください。
             </p>
           </div>
 

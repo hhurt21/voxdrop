@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 static ENGINE_PROC: Mutex<Option<Child>> = Mutex::new(None);
+static LAUNCH_LOCK: Mutex<()> = Mutex::new(());
 
 /// Finds a VOICEVOX executable. Returns `(path, is_headless_engine)`.
 pub fn detect_voicevox_path() -> Option<(PathBuf, bool)> {
@@ -65,16 +66,28 @@ fn host_port(base_url: &str) -> (String, u16) {
         .trim_start_matches("http://")
         .trim_start_matches("https://");
     let authority = rest.split('/').next().unwrap_or("127.0.0.1:50021");
-    match authority.rsplit_once(':') {
+    let (h, p) = match authority.rsplit_once(':') {
         Some((h, p)) => (h.to_string(), p.parse().unwrap_or(50021)),
         None => (authority.to_string(), 50021),
-    }
+    };
+    let host = if h.eq_ignore_ascii_case("localhost") {
+        "127.0.0.1".to_string()
+    } else {
+        h
+    };
+    (host, p)
 }
 
 /// Ensures VOICEVOX ENGINE is responding at `base_url`; launches it headlessly if not.
-/// Blocks up to ~30s waiting for the engine to come up. Returns a status message.
+/// Serialized via `LAUNCH_LOCK` so concurrent calls never spawn duplicate engines.
 pub fn ensure_running(base_url: &str, configured_path: &str) -> Result<String, String> {
     let client = VoicevoxClient::new();
+    if client.check_health(base_url).is_ok() {
+        return Ok("VOICEVOX は既に起動しています".into());
+    }
+    let _launch_guard = LAUNCH_LOCK
+        .lock()
+        .map_err(|_| "VOICEVOX 起動ロックの取得に失敗しました".to_string())?;
     if client.check_health(base_url).is_ok() {
         return Ok("VOICEVOX は既に起動しています".into());
     }
@@ -154,7 +167,7 @@ mod tests {
     #[test]
     fn parses_host_and_port_from_base_url() {
         assert_eq!(host_port("http://127.0.0.1:50021"), ("127.0.0.1".into(), 50021));
-        assert_eq!(host_port("http://localhost:50121/"), ("localhost".into(), 50121));
+        assert_eq!(host_port("http://localhost:50121/"), ("127.0.0.1".into(), 50121));
         assert_eq!(host_port("127.0.0.1"), ("127.0.0.1".into(), 50021));
     }
 }

@@ -4,14 +4,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use windows::Win32::Foundation::POINT;
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
     KEYEVENTF_KEYUP, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT,
     VIRTUAL_KEY, VK_A, VK_BACK, VK_CONTROL, VK_D, VK_DOWN, VK_ESCAPE, VK_F, VK_K, VK_M, VK_MENU,
     VK_NEXT, VK_PRIOR, VK_RETURN, VK_SHIFT, VK_U, VK_UP, VK_V, VK_Z,
 };
-use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetCursorPos, PostMessageW, SetCursorPos, WM_CHAR, WM_KEYDOWN, WM_KEYUP,
+};
 
 /// Serializes clipboard & SendInput operations so concurrent triggers never clobber clipboard backup.
 static INPUT_MUTEX: Mutex<()> = Mutex::new(());
@@ -264,6 +266,55 @@ pub fn copy_text_to_clipboard_only(text: &str) -> Result<(), String> {
         .set_text(text.to_string())
         .map_err(|e| format!("クリップボードへの書き込みに失敗しました: {}", e))?;
     LAST_OWN_CLIPBOARD_MS.store(now_ms(), Ordering::Relaxed);
+    Ok(())
+}
+
+/// Sends text directly to a target window handle using Win32 `PostMessageW(WM_CHAR / VK_RETURN)`
+/// without calling `SendInput`, `SetCursorPos`, or modifying the global input stream (`LLKHF_INJECTED`).
+pub fn post_text_window_message(
+    target_hwnd: HWND,
+    text: &str,
+    press_enter: bool,
+) -> Result<(), String> {
+    let _guard = INPUT_MUTEX
+        .lock()
+        .map_err(|_| "入力ロックの取得に失敗しました".to_string())?;
+    if target_hwnd.0.is_null() {
+        return Err("送信先ウィンドウハンドルが無効です".into());
+    }
+
+    // Flatten embedded newlines to spaces in WM_CHAR mode so intermediate '\n' doesn't accidentally submit
+    let normalized = text.replace("\r\n", " ").replace('\n', " ");
+    for unit in normalized.encode_utf16() {
+        unsafe {
+            PostMessageW(Some(target_hwnd), WM_CHAR, WPARAM(unit as usize), LPARAM(1))
+                .map_err(|e| format!("PostMessageW(WM_CHAR) に失敗しました: {}", e))?;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+
+    if press_enter {
+        thread::sleep(Duration::from_millis(20));
+        unsafe {
+            let lparam_down = LPARAM(0x001C_0001);
+            let lparam_up = LPARAM((0xC01C_0001u32) as isize);
+            PostMessageW(
+                Some(target_hwnd),
+                WM_KEYDOWN,
+                WPARAM(VK_RETURN.0 as usize),
+                lparam_down,
+            )
+            .map_err(|e| format!("PostMessageW(VK_RETURN down) に失敗しました: {}", e))?;
+            thread::sleep(Duration::from_millis(12));
+            PostMessageW(
+                Some(target_hwnd),
+                WM_KEYUP,
+                WPARAM(VK_RETURN.0 as usize),
+                lparam_up,
+            )
+            .map_err(|e| format!("PostMessageW(VK_RETURN up) に失敗しました: {}", e))?;
+        }
+    }
     Ok(())
 }
 

@@ -21,6 +21,7 @@ pub struct TtsStatusUpdate {
     pub speaking: bool,
     pub queued: usize,
     pub last_error: Option<String>,
+    pub is_manual_test: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -117,6 +118,7 @@ impl TtsQueueController {
                                 speaking: false,
                                 queued: remaining_after_pop + 1,
                                 last_error: Some("VOICEVOX をバックグラウンド起動中...".into()),
+                                is_manual_test: job.is_manual_test,
                             });
                             if crate::tts::launcher::ensure_running(
                                 &cfg.voicevox.base_url,
@@ -149,6 +151,7 @@ impl TtsQueueController {
                                     speaking: false,
                                     queued: remaining_after_pop,
                                     last_error: Some(err),
+                                    is_manual_test: job.is_manual_test,
                                 });
                                 continue;
                             }
@@ -172,6 +175,7 @@ impl TtsQueueController {
                                 speaking: false,
                                 queued: remaining_after_pop,
                                 last_error: Some(msg),
+                                is_manual_test: job.is_manual_test,
                             });
                             continue;
                         }
@@ -183,17 +187,24 @@ impl TtsQueueController {
                     speaking: true,
                     queued: remaining_after_pop,
                     last_error: None,
+                    is_manual_test: job.is_manual_test,
                 });
 
                 if cfg.pause_stt_while_speaking {
                     set_tts_playing(true);
                 }
 
+                let mut playback_failed = false;
                 if let Some((_, ref handle)) = audio_out {
                     if let Err(err) = sound::play_wav_bytes_blocking(handle, wav_bytes, 1.0, &stop_bg)
                     {
                         eprintln!("[voxdrop tts playback warning] {}", err);
+                        playback_failed = true;
                     }
+                }
+                if playback_failed {
+                    // Re-open default audio device on next job in case output device switched
+                    audio_out = None;
                 }
 
                 // Wait echo-guard tail window when no next job is immediately waiting (or stopped)
@@ -222,6 +233,7 @@ impl TtsQueueController {
                     speaking: false,
                     queued: queued_now,
                     last_error: None,
+                    is_manual_test: false,
                 });
             }
 
@@ -249,6 +261,9 @@ impl TtsQueueController {
         }
         let (lock, cvar) = &*self.shared;
         if let Ok(mut guard) = lock.lock() {
+            if guard.jobs.is_empty() {
+                self.stop_flag.store(false, Ordering::SeqCst);
+            }
             let max_q = guard.config.max_queue_size.clamp(1, 50);
             while guard.jobs.len() >= max_q {
                 guard.jobs.pop_front();

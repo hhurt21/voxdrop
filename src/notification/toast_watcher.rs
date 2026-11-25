@@ -19,8 +19,8 @@ use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationEventHandler,
     IUIAutomationEventHandler_Impl, TreeScope_Descendants, TreeScope_Subtree,
-    UIA_ControlTypePropertyId, UIA_TextControlTypeId, UIA_Window_WindowOpenedEventId,
-    UIA_EVENT_ID,
+    UIA_ControlTypePropertyId, UIA_GroupControlTypeId, UIA_TextControlTypeId,
+    UIA_Window_WindowOpenedEventId, UIA_EVENT_ID,
 };
 
 #[derive(Debug, Clone)]
@@ -80,7 +80,10 @@ impl IUIAutomationEventHandler_Impl for ToastEventHandler_Impl {
             return Ok(());
         }
 
-        let app_name_hint = detect_app_hint(&window_name, &texts);
+        let mut app_name_hint = detect_app_hint(&window_name, &texts);
+        if app_name_hint.is_empty() {
+            app_name_hint = unsafe { detect_app_hint_from_groups(&self.uia, elem) };
+        }
         (self.callback)(RawToastNotification {
             window_name,
             class_name,
@@ -190,6 +193,31 @@ fn detect_app_hint(window_name: &str, texts: &[String]) -> String {
         let l = t.trim().to_ascii_lowercase();
         if l == "discord" || l.starts_with("discord ") {
             return t.trim().to_string();
+        }
+    }
+    String::new()
+}
+
+unsafe fn detect_app_hint_from_groups(uia: &IUIAutomation, root: &IUIAutomationElement) -> String {
+    let Ok(grp_cond) = uia.CreatePropertyCondition(
+        UIA_ControlTypePropertyId,
+        &VARIANT::from(UIA_GroupControlTypeId.0),
+    ) else {
+        return String::new();
+    };
+    let Ok(arr) = root.FindAll(TreeScope_Descendants, &grp_cond) else {
+        return String::new();
+    };
+    let len = arr.Length().unwrap_or(0).min(16);
+    for i in 0..len {
+        if let Ok(item) = arr.GetElement(i) {
+            if let Ok(name) = item.CurrentName() {
+                let s = name.to_string();
+                let l = s.trim().to_ascii_lowercase();
+                if l == "discord" || l.starts_with("discord ") || l.contains("discord") {
+                    return "Discord".into();
+                }
+            }
         }
     }
     String::new()

@@ -1491,7 +1491,67 @@ fn handle_transcript(
     );
 }
 
+const MAIN_WINDOW_TITLE: &str = "VoxDrop — ハンズフリー音声チャット支援";
+
+struct SingleInstanceGuard(windows::Win32::Foundation::HANDLE);
+
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+fn acquire_single_instance() -> Option<SingleInstanceGuard> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
+    };
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateMutexW(
+            lp_mutex_attributes: *const core::ffi::c_void,
+            b_initial_owner: i32,
+            lp_name: *const u16,
+        ) -> *mut core::ffi::c_void;
+    }
+
+    let mutex_name: Vec<u16> = "Local\\VoxDrop_SingleInstance_Mutex\0"
+        .encode_utf16()
+        .collect();
+    unsafe {
+        let raw_handle = CreateMutexW(core::ptr::null(), 0, mutex_name.as_ptr());
+        if raw_handle.is_null() {
+            return Some(SingleInstanceGuard(HANDLE::default()));
+        }
+        let handle = HANDLE(raw_handle);
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            let _ = CloseHandle(handle);
+            let title_w: Vec<u16> = format!("{MAIN_WINDOW_TITLE}\0").encode_utf16().collect();
+            if let Ok(hwnd) = FindWindowW(None, PCWSTR(title_w.as_ptr())) {
+                if !hwnd.0.is_null() {
+                    let _ = ShowWindow(hwnd, SW_SHOW);
+                    if IsIconic(hwnd).as_bool() {
+                        let _ = ShowWindow(hwnd, SW_RESTORE);
+                    }
+                    let _ = SetForegroundWindow(hwnd);
+                }
+            }
+            return None;
+        }
+        Some(SingleInstanceGuard(handle))
+    }
+}
+
 fn main() -> wry::Result<()> {
+    let Some(_instance_guard) = acquire_single_instance() else {
+        return Ok(());
+    };
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
 
@@ -1953,6 +2013,17 @@ fn main() -> wry::Result<()> {
                 }
             }
             Event::UserEvent(UserEvent::TtsStatus(status)) => {
+                if status.is_manual_test {
+                    if let Some(ref err) = status.last_error {
+                        emit(
+                            &webview,
+                            &BackendEvent::Toast {
+                                level: "error".into(),
+                                message: format!("テスト読み上げ失敗: {}", err),
+                            },
+                        );
+                    }
+                }
                 emit(
                     &webview,
                     &BackendEvent::TtsStatusChanged {

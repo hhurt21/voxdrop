@@ -587,6 +587,7 @@
     const vv = tts.voicevox || {};
     $("chkTtsEnabled").checked = !!tts.enabled;
     $("chkTtsDmOnly").checked = tts.dm_only !== false;
+    $("chkTtsReadWithoutWinNotif").checked = tts.read_without_windows_notifications !== false;
     $("chkTtsReadSender").checked = tts.read_sender_name !== false;
     $("chkTtsPauseStt").checked = tts.pause_stt_while_speaking !== false;
     $("chkTtsDebugLog").checked = !!tts.debug_log_toasts;
@@ -746,6 +747,7 @@
       discord_tts: {
         enabled: $("chkTtsEnabled").checked,
         dm_only: $("chkTtsDmOnly").checked,
+        read_without_windows_notifications: $("chkTtsReadWithoutWinNotif").checked,
         read_sender_name: $("chkTtsReadSender").checked,
         template: $("ttsTemplate").value || "{sender}さんから。{message}",
         max_chars: parseInt($("ttsMaxChars").value, 10) || 80,
@@ -1091,6 +1093,7 @@
     send({ type: "VoicevoxDetectPath" });
   });
   $("chkTtsDmOnly").addEventListener("change", saveNow);
+  $("chkTtsReadWithoutWinNotif").addEventListener("change", saveNow);
   $("chkTtsReadSender").addEventListener("change", saveNow);
   $("chkTtsPauseStt").addEventListener("change", saveNow);
   $("chkTtsDebugLog").addEventListener("change", () => {
