@@ -7,6 +7,13 @@ pub struct ScannedChannelDto {
     pub name: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoicevoxSpeakerDto {
+    pub id: u32,
+    pub name: String,
+    pub style_name: String,
+}
+
 /// Messages sent from WebView JS (`window.ipc.postMessage(JSON.stringify(...))`) to Rust.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
@@ -38,6 +45,17 @@ pub enum ClientCommand {
     SimulateTranscript { text: String },
     // Phase 5 sound preview
     PlayTestSound { kind: String },
+    // Discord DM auto-reading (VOICEVOX TTS)
+    #[serde(alias = "voicevox_check_health")]
+    VoicevoxCheckHealth { base_url: Option<String> },
+    #[serde(alias = "voicevox_get_speakers")]
+    VoicevoxGetSpeakers { base_url: Option<String> },
+    #[serde(alias = "voicevox_test_speak")]
+    VoicevoxTestSpeak { text: Option<String> },
+    #[serde(alias = "voicevox_detect_path")]
+    VoicevoxDetectPath,
+    #[serde(alias = "tts_stop")]
+    TtsStop,
 }
 
 /// Events pushed from Rust to WebView JS (`window.onBackendEvent(...)`).
@@ -71,6 +89,7 @@ pub enum BackendEvent {
     },
     ConfirmationPrompt {
         active: bool,
+        has_next: bool,
         title: String,
         subtitle: String,
     },
@@ -115,6 +134,31 @@ pub enum BackendEvent {
     Toast {
         level: String,
         message: String,
+    },
+    VoicevoxHealthResult {
+        ok: bool,
+        version: Option<String>,
+        message: String,
+    },
+    VoicevoxSpeakersResult {
+        ok: bool,
+        speakers: Vec<VoicevoxSpeakerDto>,
+        message: String,
+    },
+    VoicevoxDetectResult {
+        found: bool,
+        path: String,
+        headless: bool,
+        message: String,
+    },
+    TtsStatusChanged {
+        connected: bool,
+        speaking: bool,
+        queued: usize,
+        last_error: Option<String>,
+    },
+    ToastDebugLog {
+        text: String,
     },
 }
 
@@ -163,6 +207,15 @@ mod tests {
                 navigate: true
             }
         ));
+
+        let cmd = ClientCommand::parse(r#"{"type":"voicevox_check_health"}"#).unwrap();
+        assert!(matches!(
+            cmd,
+            ClientCommand::VoicevoxCheckHealth { base_url: None }
+        ));
+
+        let cmd = ClientCommand::parse(r#"{"type":"tts_stop"}"#).unwrap();
+        assert!(matches!(cmd, ClientCommand::TtsStop));
     }
 
     #[test]

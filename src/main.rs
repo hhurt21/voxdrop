@@ -12,11 +12,13 @@ mod autostart;
 mod config;
 mod hotkey;
 mod ipc;
+mod notification;
 mod processor;
 mod runtime;
 mod sound;
 mod stt;
 mod tray;
+mod tts;
 
 use audio::capture::{list_input_devices, AudioController};
 use audio::AudioEvent;
@@ -25,7 +27,8 @@ use automation::input::KeyAction;
 use automation::uia;
 use config::{AppConfig, DiscordTarget, DiscordTargetKind, GuardConfig, InputMode};
 use hotkey::{HotkeyAction, HotkeyManager};
-use ipc::{BackendEvent, ClientCommand, ScannedChannelDto};
+use ipc::{BackendEvent, ClientCommand, ScannedChannelDto, VoicevoxSpeakerDto};
+use notification::{NotificationController, NotificationEvent};
 use processor::commands::{
     parse_confirmation_reply, ConfirmationReply, TargetSwitchAction, VoiceCommand,
 };
@@ -44,6 +47,8 @@ use tao::{
     window::WindowBuilder,
 };
 use tray::{TrayAction, TrayManager, TrayState};
+use tts::queue::{TtsQueueController, TtsStatusUpdate};
+use tts::voicevox::{VoicevoxClient, VoicevoxSpeaker};
 use wry::{WebView, WebViewBuilder};
 
 const INDEX_HTML_TEMPLATE: &str = include_str!("../ui/index.html");
@@ -92,6 +97,10 @@ enum UserEvent {
         action: String,
         message: String,
     },
+    TtsStatus(TtsStatusUpdate),
+    Notification(NotificationEvent),
+    VoicevoxHealthDone(Result<String, String>),
+    VoicevoxSpeakersDone(Result<Vec<VoicevoxSpeaker>, String>),
 }
 
 enum SttWorkerMsg {
@@ -131,27 +140,37 @@ impl PendingConfirmation {
             } => {
                 let current = &candidates[*index];
                 let label = discord::target_display_label(Some(current));
+                let has_next = candidates.len() > 1;
                 BackendEvent::ConfirmationPrompt {
                     active: true,
+                    has_next,
                     title: format!(
                         "確認 ({}/{}): 「{}」で合っていますか？",
                         index + 1,
                         candidates.len(),
                         label
                     ),
-                    subtitle: format!(
-                        "検索「{}」 — 「はい/この人」で確定 ・ 「違う/次」で別の候補 ・ 「キャンセル」",
-                        query
-                    ),
+                    subtitle: if has_next {
+                        format!(
+                            "検索「{}」 — 「はい」で確定 ・ 「違う/次」で別の候補 ・ 「いいえ」でキャンセル",
+                            query
+                        )
+                    } else {
+                        format!(
+                            "検索「{}」 — 「はい」で確定 ・ 「いいえ」でキャンセル（このまま通常の会話・操作も可能です）",
+                            query
+                        )
+                    },
                 }
             }
             Self::QuickSwitcher { query, index, .. } => BackendEvent::ConfirmationPrompt {
                 active: true,
+                has_next: true,
                 title: format!(
                     "Discord検索「{}」({}番目) この人で合っていますか？",
                     query, index
                 ),
-                subtitle: "「はい/この人」でDM入力欄へ ・ 「違う/次」で別の似た名前へ ・ 「キャンセル」"
+                subtitle: "「はい」でDM入力欄へ ・ 「違う/次」で別の似た名前へ ・ 「いいえ」でキャンセル"
                     .into(),
             },
         }
@@ -295,10 +314,34 @@ fn clear_confirmation_ui(main_wv: &WebView, overlay_wv: &WebView) {
         overlay_wv,
         &BackendEvent::ConfirmationPrompt {
             active: false,
+            has_next: false,
             title: String::new(),
             subtitle: String::new(),
         },
     );
+}
+
+fn spawn_voicevox_autostart(
+    base_url: String,
+    exe_path: String,
+    proxy: EventLoopProxy<UserEvent>,
+) {
+    thread::spawn(move || {
+        match tts::launcher::ensure_running(&base_url, &exe_path) {
+            Ok(_) => {
+                let client = VoicevoxClient::new();
+                if let Ok(ver) = client.check_health(&base_url) {
+                    let _ = proxy.send_event(UserEvent::VoicevoxHealthDone(Ok(ver)));
+                }
+                if let Ok(speakers) = client.get_speakers(&base_url) {
+                    let _ = proxy.send_event(UserEvent::VoicevoxSpeakersDone(Ok(speakers)));
+                }
+            }
+            Err(err) => {
+                let _ = proxy.send_event(UserEvent::VoicevoxHealthDone(Err(err)));
+            }
+        }
+    });
 }
 
 fn spawn_stt_worker(
@@ -663,6 +706,19 @@ fn handle_confirmation_reply(
             },
             ConfirmationReply::Next,
         ) => {
+            if candidates.len() <= 1 {
+                clear_confirmation_ui(main_wv, overlay_wv);
+                sound.play(SoundKind::Cancel, &state.config.sound);
+                emit_all(
+                    main_wv,
+                    overlay_wv,
+                    &BackendEvent::CommandExecuted {
+                        action: "confirm_cancel".into(),
+                        detail: "宛先の確認をキャンセルしました".into(),
+                    },
+                );
+                return;
+            }
             let next_idx = (index + 1) % candidates.len();
             let next_target = candidates[next_idx].clone();
             if next_target.webhook_url.trim().is_empty() {
@@ -694,6 +750,19 @@ fn handle_confirmation_reply(
             },
             ConfirmationReply::Prev,
         ) => {
+            if candidates.len() <= 1 {
+                clear_confirmation_ui(main_wv, overlay_wv);
+                sound.play(SoundKind::Cancel, &state.config.sound);
+                emit_all(
+                    main_wv,
+                    overlay_wv,
+                    &BackendEvent::CommandExecuted {
+                        action: "confirm_cancel".into(),
+                        detail: "宛先の確認をキャンセルしました".into(),
+                    },
+                );
+                return;
+            }
             let prev_idx = if index == 0 {
                 candidates.len() - 1
             } else {
@@ -1267,27 +1336,13 @@ fn handle_transcript(
     sound: &SoundPlayer,
     proxy: &EventLoopProxy<UserEvent>,
 ) {
-    // 1. If awaiting friend confirmation ("この人で合っていますか？"), handle Yes / Next / Prev / Cancel first!
+    // 1. If awaiting friend confirmation ("この人で合っていますか？"), handle Yes / No / Next / Prev
+    //    if the user spoke a short confirmation reply; otherwise let normal dictation & commands work!
     if state.pending_confirm.is_some() {
         if let Some(reply) = parse_confirmation_reply(raw) {
             handle_confirmation_reply(reply, state, main_wv, overlay_wv, tray, sound, proxy);
             return;
         }
-        // If the user speaks something unrelated, gently re-prompt
-        if let Some(ref pending) = state.pending_confirm {
-            emit_all(main_wv, overlay_wv, &pending.prompt_event());
-            emit(
-                main_wv,
-                &BackendEvent::Toast {
-                    level: "info".into(),
-                    message: format!(
-                        "確認中（「{}」）: 「はい」で確定 / 「違う・次」で別の人 / 「キャンセル」",
-                        raw.trim()
-                    ),
-                },
-            );
-        }
-        return;
     }
 
     let processed = processor::process_transcript(
@@ -1296,6 +1351,12 @@ fn handle_transcript(
         &state.config.commands,
         &state.config.discord_targets,
     );
+
+    if processed.target_switch.is_some() || processed.command == Some(VoiceCommand::ClearAll) {
+        if state.pending_confirm.take().is_some() {
+            clear_confirmation_ui(main_wv, overlay_wv);
+        }
+    }
 
     if state.sleeping {
         if processed.command == Some(VoiceCommand::Resume) {
@@ -1453,6 +1514,24 @@ fn main() -> wry::Result<()> {
             let _ = audio_proxy.send_event(UserEvent::Audio(ev));
         },
     );
+
+    let tts_proxy = proxy.clone();
+    let tts_ctrl = TtsQueueController::spawn(state.config.discord_tts.clone(), move |status| {
+        let _ = tts_proxy.send_event(UserEvent::TtsStatus(status));
+    });
+
+    let notif_proxy = proxy.clone();
+    let notif_ctrl = NotificationController::spawn(state.config.discord_tts.clone(), move |ev| {
+        let _ = notif_proxy.send_event(UserEvent::Notification(ev));
+    });
+
+    if state.config.discord_tts.enabled && state.config.discord_tts.voicevox.auto_launch {
+        spawn_voicevox_autostart(
+            state.config.discord_tts.voicevox.base_url.clone(),
+            state.config.discord_tts.voicevox.exe_path.clone(),
+            proxy.clone(),
+        );
+    }
 
     let hk_proxy = proxy.clone();
     let (mut hotkey_mgr, initial_hk_warnings) =
@@ -1873,6 +1952,90 @@ fn main() -> wry::Result<()> {
                     );
                 }
             }
+            Event::UserEvent(UserEvent::TtsStatus(status)) => {
+                emit(
+                    &webview,
+                    &BackendEvent::TtsStatusChanged {
+                        connected: status.connected,
+                        speaking: status.speaking,
+                        queued: status.queued,
+                        last_error: status.last_error,
+                    },
+                );
+            }
+            Event::UserEvent(UserEvent::Notification(ev)) => match ev {
+                NotificationEvent::SpeakText {
+                    sender,
+                    body,
+                    speech_text,
+                } => {
+                    tts_ctrl.enqueue(speech_text, false);
+                    if state.config.discord_tts.debug_log_toasts {
+                        emit(
+                            &webview,
+                            &BackendEvent::ToastDebugLog {
+                                text: format!("[読み上げキュー追加] {}: {}", sender, body),
+                            },
+                        );
+                    }
+                }
+                NotificationEvent::DebugToast(line) => {
+                    emit(&webview, &BackendEvent::ToastDebugLog { text: line });
+                }
+            },
+            Event::UserEvent(UserEvent::VoicevoxHealthDone(res)) => match res {
+                Ok(ver) => {
+                    emit(
+                        &webview,
+                        &BackendEvent::VoicevoxHealthResult {
+                            ok: true,
+                            version: Some(ver.clone()),
+                            message: format!("VOICEVOX 接続OK (v{})", ver),
+                        },
+                    );
+                }
+                Err(err) => {
+                    emit(
+                        &webview,
+                        &BackendEvent::VoicevoxHealthResult {
+                            ok: false,
+                            version: None,
+                            message: err,
+                        },
+                    );
+                }
+            },
+            Event::UserEvent(UserEvent::VoicevoxSpeakersDone(res)) => match res {
+                Ok(speakers) => {
+                    let count = speakers.len();
+                    let dto: Vec<VoicevoxSpeakerDto> = speakers
+                        .into_iter()
+                        .map(|s| VoicevoxSpeakerDto {
+                            id: s.id,
+                            name: s.name,
+                            style_name: s.style_name,
+                        })
+                        .collect();
+                    emit(
+                        &webview,
+                        &BackendEvent::VoicevoxSpeakersResult {
+                            ok: true,
+                            speakers: dto,
+                            message: format!("VOICEVOX 話者リストを {} 件取得しました", count),
+                        },
+                    );
+                }
+                Err(err) => {
+                    emit(
+                        &webview,
+                        &BackendEvent::VoicevoxSpeakersResult {
+                            ok: false,
+                            speakers: Vec::new(),
+                            message: err,
+                        },
+                    );
+                }
+            },
             Event::UserEvent(UserEvent::Hotkey(hk_action)) => match hk_action {
                 HotkeyAction::ToggleListening => {
                     let next = !state.listening;
@@ -1985,6 +2148,11 @@ fn main() -> wry::Result<()> {
                 }
                 TrayAction::Quit => {
                     let _ = state.config.save_to(&state.config_path);
+                    notif_ctrl.shutdown();
+                    tts_ctrl.shutdown();
+                    if state.config.discord_tts.voicevox.stop_on_exit {
+                        tts::launcher::stop_if_started_by_us();
+                    }
                     audio_ctrl.shutdown();
                     let _ = stt_tx.send(SttWorkerMsg::Shutdown);
                     *control_flow = ControlFlow::Exit;
@@ -2019,6 +2187,14 @@ fn main() -> wry::Result<()> {
                         let stt_changed = state.config.stt != config.stt;
                         let hotkeys_changed = state.config.hotkeys != config.hotkeys;
                         let autostart_changed = state.config.auto_start != config.auto_start;
+                        let should_launch_voicevox = config.discord_tts.enabled
+                            && config.discord_tts.voicevox.auto_launch
+                            && (!state.config.discord_tts.enabled
+                                || !state.config.discord_tts.voicevox.auto_launch
+                                || state.config.discord_tts.voicevox.exe_path
+                                    != config.discord_tts.voicevox.exe_path
+                                || state.config.discord_tts.voicevox.base_url
+                                    != config.discord_tts.voicevox.base_url);
                         state.config = config;
                         state.overlay_visible = state.config.overlay.enabled;
                         overlay_window.set_visible(state.overlay_visible);
@@ -2032,6 +2208,15 @@ fn main() -> wry::Result<()> {
                         audio_ctrl.set_device(state.config.audio_device.clone());
                         audio_ctrl.update_vad(state.config.vad.clone());
                         audio_ctrl.update_noise_cancel(state.config.noise_cancel.clone());
+                        tts_ctrl.update_config(state.config.discord_tts.clone());
+                        notif_ctrl.update_config(state.config.discord_tts.clone());
+                        if should_launch_voicevox {
+                            spawn_voicevox_autostart(
+                                state.config.discord_tts.voicevox.base_url.clone(),
+                                state.config.discord_tts.voicevox.exe_path.clone(),
+                                proxy.clone(),
+                            );
+                        }
 
                         if autostart_changed {
                             if let Err(err) = autostart::set_auto_start(state.config.auto_start) {
@@ -2493,6 +2678,113 @@ fn main() -> wry::Result<()> {
                         let mut preview_cfg = state.config.sound.clone();
                         preview_cfg.enabled = true;
                         sound_player.play(SoundKind::from_name(&kind), &preview_cfg);
+                    }
+                    ClientCommand::VoicevoxCheckHealth { base_url } => {
+                        let url = base_url
+                            .filter(|s| !s.trim().is_empty())
+                            .unwrap_or_else(|| state.config.discord_tts.voicevox.base_url.clone());
+                        let auto_launch = state.config.discord_tts.voicevox.auto_launch;
+                        let exe_path = state.config.discord_tts.voicevox.exe_path.clone();
+                        let p = proxy.clone();
+                        thread::spawn(move || {
+                            let client = VoicevoxClient::new();
+                            let res = match client.check_health(&url) {
+                                Ok(v) => Ok(v),
+                                Err(err) => {
+                                    if auto_launch
+                                        && tts::launcher::ensure_running(&url, &exe_path).is_ok()
+                                    {
+                                        client.check_health(&url)
+                                    } else {
+                                        Err(err)
+                                    }
+                                }
+                            };
+                            let _ = p.send_event(UserEvent::VoicevoxHealthDone(res));
+                        });
+                    }
+                    ClientCommand::VoicevoxGetSpeakers { base_url } => {
+                        let url = base_url
+                            .filter(|s| !s.trim().is_empty())
+                            .unwrap_or_else(|| state.config.discord_tts.voicevox.base_url.clone());
+                        let auto_launch = state.config.discord_tts.voicevox.auto_launch;
+                        let exe_path = state.config.discord_tts.voicevox.exe_path.clone();
+                        let p = proxy.clone();
+                        thread::spawn(move || {
+                            let client = VoicevoxClient::new();
+                            let res = match client.get_speakers(&url) {
+                                Ok(list) => Ok(list),
+                                Err(err) => {
+                                    if auto_launch
+                                        && tts::launcher::ensure_running(&url, &exe_path).is_ok()
+                                    {
+                                        client.get_speakers(&url)
+                                    } else {
+                                        Err(err)
+                                    }
+                                }
+                            };
+                            let _ = p.send_event(UserEvent::VoicevoxSpeakersDone(res));
+                        });
+                    }
+                    ClientCommand::VoicevoxDetectPath => {
+                        match tts::launcher::detect_voicevox_path() {
+                            Some((path, headless)) => {
+                                let path_str = path.to_string_lossy().into_owned();
+                                state.config.discord_tts.voicevox.exe_path = path_str.clone();
+                                let _ = state.config.save_to(&state.config_path);
+                                emit(
+                                    &webview,
+                                    &BackendEvent::VoicevoxDetectResult {
+                                        found: true,
+                                        path: path_str,
+                                        headless,
+                                        message: if headless {
+                                            "VOICEVOX エンジン（窓なしバックグラウンド起動対応）を検出しました".into()
+                                        } else {
+                                            "VOICEVOX 本体を検出しました".into()
+                                        },
+                                    },
+                                );
+                            }
+                            None => {
+                                emit(
+                                    &webview,
+                                    &BackendEvent::VoicevoxDetectResult {
+                                        found: false,
+                                        path: String::new(),
+                                        headless: false,
+                                        message: "VOICEVOX が見つかりませんでした（インストール済みなら実行ファイルパスを手動入力してください）".into(),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    ClientCommand::VoicevoxTestSpeak { text } => {
+                        let msg = text
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| "テスト読み上げです".to_string());
+                        tts_ctrl.enqueue(msg, true);
+                    }
+                    ClientCommand::TtsStop => {
+                        tts_ctrl.stop_and_clear();
+                        emit(
+                            &webview,
+                            &BackendEvent::TtsStatusChanged {
+                                connected: true,
+                                speaking: false,
+                                queued: 0,
+                                last_error: None,
+                            },
+                        );
+                        emit(
+                            &webview,
+                            &BackendEvent::Toast {
+                                level: "info".into(),
+                                message: "読み上げを停止し、キューをクリアしました".into(),
+                            },
+                        );
                     }
                 },
                 Err(err) => {

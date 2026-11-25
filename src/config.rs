@@ -465,6 +465,79 @@ impl Default for DiscordIntegrationConfig {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct VoicevoxConfig {
+    pub base_url: String,
+    pub speaker_id: u32,
+    pub speed_scale: f32,
+    pub pitch_scale: f32,
+    pub intonation_scale: f32,
+    pub volume_scale: f32,
+    /// VOICEVOX ENGINE を窓なしで裏起動する（beast-tools 同等、デフォルト: true）
+    pub auto_launch: bool,
+    /// VOICEVOX 実行ファイルの場所（空欄で自動検出・run.exe 優先）
+    pub exe_path: String,
+    /// VoxDrop 終了時に、VoxDrop が起動した VOICEVOX を止める（デフォルト: true）
+    pub stop_on_exit: bool,
+}
+
+impl Default for VoicevoxConfig {
+    fn default() -> Self {
+        Self {
+            base_url: "http://127.0.0.1:50021".into(),
+            speaker_id: 3,
+            speed_scale: 1.15,
+            pitch_scale: 0.0,
+            intonation_scale: 1.0,
+            volume_scale: 1.0,
+            auto_launch: true,
+            exe_path: String::new(),
+            stop_on_exit: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DiscordTtsConfig {
+    pub enabled: bool,
+    pub dm_only: bool,
+    pub read_sender_name: bool,
+    pub template: String,
+    pub max_chars: usize,
+    pub url_replacement: String,
+    pub dedup_window_ms: u64,
+    pub max_queue_size: usize,
+    pub pause_stt_while_speaking: bool,
+    pub echo_guard_tail_ms: u64,
+    pub allow_senders: Vec<String>,
+    pub block_senders: Vec<String>,
+    pub debug_log_toasts: bool,
+    pub voicevox: VoicevoxConfig,
+}
+
+impl Default for DiscordTtsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dm_only: true,
+            read_sender_name: true,
+            template: "{sender}さんから。{message}".into(),
+            max_chars: 80,
+            url_replacement: "URL省略".into(),
+            dedup_window_ms: 3000,
+            max_queue_size: 5,
+            pause_stt_while_speaking: true,
+            echo_guard_tail_ms: 400,
+            allow_senders: Vec::new(),
+            block_senders: Vec::new(),
+            debug_log_toasts: false,
+            voicevox: VoicevoxConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppConfig {
     pub input_mode: InputMode,
     pub audio_device: Option<String>,
@@ -477,6 +550,7 @@ pub struct AppConfig {
     pub noise_cancel: NoiseCancelConfig,
     pub discord_targets: DiscordTargetsConfig,
     pub discord_integration: DiscordIntegrationConfig,
+    pub discord_tts: DiscordTtsConfig,
     pub guard: GuardConfig,
     pub hotkeys: HotkeyConfig,
     pub overlay: OverlayConfig,
@@ -497,6 +571,7 @@ impl Default for AppConfig {
             noise_cancel: NoiseCancelConfig::default(),
             discord_targets: DiscordTargetsConfig::default(),
             discord_integration: DiscordIntegrationConfig::default(),
+            discord_tts: DiscordTtsConfig::default(),
             guard: GuardConfig::default(),
             hotkeys: HotkeyConfig::default(),
             overlay: OverlayConfig::default(),
@@ -593,6 +668,11 @@ mod tests {
             .iter()
             .any(|p| p == "Discord.exe"));
         assert!(!parsed.commands.send.is_empty());
+        assert!(!parsed.discord_tts.enabled);
+        assert!(parsed.discord_tts.dm_only);
+        assert!(parsed.discord_tts.pause_stt_while_speaking);
+        assert_eq!(parsed.discord_tts.voicevox.base_url, "http://127.0.0.1:50021");
+        assert_eq!(parsed.discord_tts.voicevox.speaker_id, 3);
     }
 
     #[test]

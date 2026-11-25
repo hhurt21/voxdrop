@@ -1,8 +1,10 @@
 use crate::config::SoundConfig;
-use rodio::{Decoder, OutputStream, Sink};
+use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
 use std::io::Cursor;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 const SOUND_SEND: &[u8] = include_bytes!("../assets/sounds/send.wav");
 const SOUND_CANCEL: &[u8] = include_bytes!("../assets/sounds/cancel.wav");
@@ -85,6 +87,33 @@ impl SoundPlayer {
             volume: cfg.volume,
         });
     }
+}
+
+/// Plays in-memory WAV bytes synchronously on a given `OutputStreamHandle`, polling `stop_flag`
+/// every 25ms so TTS playback can be interrupted immediately without leaking audio.
+pub fn play_wav_bytes_blocking(
+    handle: &OutputStreamHandle,
+    wav_bytes: Vec<u8>,
+    volume: f32,
+    stop_flag: &AtomicBool,
+) -> Result<(), String> {
+    if stop_flag.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    let sink = Sink::try_new(handle)
+        .map_err(|e| format!("オーディオ出力 Sink の作成に失敗しました: {}", e))?;
+    let source = Decoder::new(Cursor::new(wav_bytes))
+        .map_err(|e| format!("WAV データのデコードに失敗しました: {}", e))?;
+    sink.set_volume(volume.clamp(0.0, 2.0));
+    sink.append(source);
+    while !sink.empty() {
+        if stop_flag.load(Ordering::SeqCst) {
+            sink.stop();
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

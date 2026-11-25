@@ -25,6 +25,7 @@
           <button class="nav-btn" data-tab="channels">サーバー・チャンネル</button>
           <button class="nav-btn" data-tab="friends">フレンド・DM</button>
           <button class="nav-btn" data-tab="discord-link">Discord 連携・リモコン</button>
+          <button class="nav-btn" data-tab="dm-tts">DM読み上げ (VOICEVOX)</button>
           <div class="nav-section">カスタマイズ</div>
           <button class="nav-btn" data-tab="commands">合言葉・音声コマンド</button>
           <button class="nav-btn" data-tab="dictionary">辞書・整形</button>
@@ -84,7 +85,7 @@
             <div class="row gap-sm">
               <button class="btn-success btn-sm" id="btnConfirmYes">はい（この人）</button>
               <button class="btn-primary btn-sm" id="btnConfirmNext">違う（次の人）</button>
-              <button class="btn-danger btn-sm" id="btnConfirmCancel">キャンセル</button>
+              <button class="btn-danger btn-sm" id="btnConfirmCancel">いいえ（キャンセル）</button>
             </div>
           </div>
 
@@ -401,6 +402,144 @@
               <input type="checkbox" id="chkBotSend" />
               <span>チャンネル送信時に Bot API で裏から直接送信する（OFF＝自分のアカウントで安全に自動入力）</span>
             </label>
+          </div>
+        </section>
+
+        <!-- DM Auto-Reading (VOICEVOX) Tab -->
+        <section class="tab-panel" id="tab-dm-tts">
+          <div class="card">
+            <div class="row space-between">
+              <h3>Discord DM 自動読み上げ（VOICEVOX 連携）</h3>
+              <div class="row gap-xs">
+                <span class="pill" id="ttsConnBadge">VOICEVOX: 未確認</span>
+                <span class="pill" id="ttsSpeakingBadge">待機中</span>
+              </div>
+            </div>
+            <label class="checkbox-row" style="margin-top: 6px">
+              <input type="checkbox" id="chkTtsEnabled" />
+              <span><b>Discord のデスクトップ通知を検知して VOICEVOX で自動読み上げする（デフォルト: OFF）</b></span>
+            </label>
+            <p class="hint">
+              Windows 公式 UI Automation でトースト通知を検知します（Discord 規約準拠・プロセス注入なし）。<br />
+              ※ Discord の「デスクトップ通知を有効にする」および Windows の通知バナー表示を ON にしてご利用ください（集中モード中は通知が出ないため検知されません）。
+            </p>
+
+            <div class="toggle-grid" style="margin-top: 8px">
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkTtsAutoLaunch" />
+                <span>VOICEVOX を自動でバックグラウンド起動する（ウィンドウを出さずに裏で実行）</span>
+              </label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkTtsStopOnExit" />
+                <span>VoxDrop 終了時に、自動起動した VOICEVOX も自動で終了する</span>
+              </label>
+            </div>
+
+            <div class="form-grid" style="margin-top: 12px">
+              <label>VOICEVOX ENGINE URL
+                <div class="row gap-xs">
+                  <input type="text" id="ttsBaseUrl" class="input grow" placeholder="http://127.0.0.1:50021" />
+                  <button type="button" class="btn-primary btn-sm" id="btnVoicevoxRefresh">接続確認 / 話者更新</button>
+                </div>
+              </label>
+              <label>VOICEVOX 実行ファイル（空欄で run.exe 自動検出）
+                <div class="row gap-xs">
+                  <input type="text" id="ttsExePath" class="input grow" placeholder="自動検出（%APPDATA%\voicevox\...\run.exe）" />
+                  <button type="button" class="btn-secondary btn-sm" id="btnVoicevoxDetect">自動検出</button>
+                </div>
+              </label>
+              <label>話者（キャラクター・スタイル） <span class="hint-inline" id="ttsSpeakerIdHint">ID: 3</span>
+                <select id="ttsSpeakerSelect" class="input">
+                  <option value="3">ずんだもん（ノーマル） [ID: 3]</option>
+                </select>
+              </label>
+            </div>
+
+            <div class="form-grid" style="margin-top: 10px">
+              <label>話速 (speedScale): <strong id="ttsSpeedVal">1.15</strong>
+                <input type="range" id="ttsSpeed" min="0.5" max="2.0" step="0.05" value="1.15" />
+              </label>
+              <label>音量 (volumeScale): <strong id="ttsVolumeVal">1.00</strong>
+                <input type="range" id="ttsVolume" min="0.0" max="2.0" step="0.05" value="1.0" />
+              </label>
+              <label>音高 (pitchScale): <strong id="ttsPitchVal">0.00</strong>
+                <input type="range" id="ttsPitch" min="-0.15" max="0.15" step="0.01" value="0.0" />
+              </label>
+              <label>抑揚 (intonationScale): <strong id="ttsIntonationVal">1.00</strong>
+                <input type="range" id="ttsIntonation" min="0.0" max="2.0" step="0.05" value="1.0" />
+              </label>
+            </div>
+
+            <div class="row gap-sm" style="margin-top: 12px">
+              <input
+                type="text"
+                id="ttsTestText"
+                class="input grow"
+                value="テスト読み上げです"
+                placeholder="テスト読み上げテキスト..."
+              />
+              <button type="button" class="btn-success btn-sm" id="btnTtsTestSpeak">テスト読み上げ</button>
+              <button type="button" class="btn-danger btn-sm" id="btnTtsStop">読み上げ停止</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3>通知フィルタ・テキスト整形・エコー防止</h3>
+            <div class="toggle-grid">
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkTtsDmOnly" />
+                <span>DM のみ読み上げる（サーバーチャンネル通知を除外）</span>
+              </label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkTtsReadSender" />
+                <span>送信者名を読み上げる（例: 「たろうさんから。こんにちは」）</span>
+              </label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkTtsPauseStt" />
+                <span>読み上げ中は VoxDrop の音声入力を一時停止する（スピーカー音のエコー誤送信防止・推奨）</span>
+              </label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkTtsDebugLog" />
+                <span>Windows トースト通知の検知ログを下に表示する（デバッグ用）</span>
+              </label>
+            </div>
+
+            <div class="form-grid" style="margin-top: 12px">
+              <label>読み上げテンプレート（{sender} / {message}）
+                <input type="text" id="ttsTemplate" class="input" placeholder="{sender}さんから。{message}" />
+              </label>
+              <label>最大読み上げ文字数（超過時は「以下略」）
+                <input type="number" id="ttsMaxChars" class="input" min="10" max="300" value="80" />
+              </label>
+              <label>URL の置換テキスト
+                <input type="text" id="ttsUrlReplace" class="input" placeholder="URL省略" />
+              </label>
+              <label>重複通知スキップ時間 (ms)
+                <input type="number" id="ttsDedupMs" class="input" min="0" max="30000" value="3000" />
+              </label>
+              <label>最大キュー件数（超過時は古い通知を破棄）
+                <input type="number" id="ttsMaxQueue" class="input" min="1" max="30" value="5" />
+              </label>
+              <label>再生終了後のエコー防止余白 (ms)
+                <input type="number" id="ttsEchoTailMs" class="input" min="0" max="2000" value="400" />
+              </label>
+              <label>許可する送信者（カンマ区切り・空欄で全員）
+                <input type="text" id="ttsAllowSenders" class="input" placeholder="例: Taro, Hanako" />
+              </label>
+              <label>除外する送信者（カンマ区切り）
+                <input type="text" id="ttsBlockSenders" class="input" placeholder="例: BotName, SpamUser" />
+              </label>
+            </div>
+          </div>
+
+          <div class="card" id="ttsDebugCard" style="display: none">
+            <div class="row space-between">
+              <h3>通知検知デバッグログ</h3>
+              <button type="button" class="btn-secondary btn-sm" id="btnClearToastDebug">ログクリア</button>
+            </div>
+            <div id="ttsDebugList" class="history-list">
+              <div class="empty-state">通知を待機しています...</div>
+            </div>
           </div>
         </section>
 

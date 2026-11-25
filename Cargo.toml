@@ -16,6 +16,7 @@ global-hotkey = "0.7"
 rodio = { version = "0.20", default-features = false, features = ["wav"] }
 nnnoiseless = "0.5"
 flate2 = "1"
+windows-core = "0.61"
 
 [dependencies.windows]
 version = "0.61"

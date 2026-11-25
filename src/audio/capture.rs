@@ -436,6 +436,7 @@ where
     let to_48k = Arc::new(Mutex::new(LinearResampler::new(in_rate, RNNOISE_SAMPLE_RATE)));
     let to_16k = Arc::new(Mutex::new(Decimator48To16::new()));
     let last_meter = Arc::new(Mutex::new(Instant::now() - Duration::from_millis(50)));
+    let tts_echo_muted = Arc::new(AtomicBool::new(false));
 
     let process_f32 = {
         let vad_shared = vad_shared.clone();
@@ -446,9 +447,38 @@ where
         let to_48k = to_48k.clone();
         let to_16k = to_16k.clone();
         let last_meter = last_meter.clone();
+        let tts_echo_muted = tts_echo_muted.clone();
         move |interleaved: &[f32]| {
             if !listening_flag.load(Ordering::Relaxed) {
                 return;
+            }
+            // Echo-prevention guard: while VOICEVOX TTS is speaking, pause VAD/STT input
+            // so speaker output is never picked up by the mic and sent back to Discord.
+            if crate::tts::is_tts_playing() {
+                if !tts_echo_muted.swap(true, Ordering::SeqCst) {
+                    if let Ok(mut v) = vad_shared.lock() {
+                        v.reset();
+                    }
+                    callback(AudioEvent::SpeechCancelled);
+                }
+                if let Ok(mut last) = last_meter.lock() {
+                    if last.elapsed() >= Duration::from_millis(66) {
+                        *last = Instant::now();
+                        callback(AudioEvent::Level {
+                            rms: 0.0,
+                            is_speaking: false,
+                            vad_prob: 0.0,
+                            rnnoise_active: false,
+                            noise_floor: 0.0,
+                            effective_threshold: 0.0,
+                        });
+                    }
+                }
+                return;
+            } else if tts_echo_muted.swap(false, Ordering::SeqCst) {
+                if let Ok(mut v) = vad_shared.lock() {
+                    v.reset();
+                }
             }
             let mono = match downmixer.lock() {
                 Ok(mut dm) => dm.process(interleaved, channels),

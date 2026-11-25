@@ -6,6 +6,8 @@
   let lastScanData = null;
   let pendingDetectedUrl = null;
   const history = [];
+  const toastDebugLogs = [];
+  let voicevoxSpeakers = [];
 
   function send(msg) {
     if (window.ipc && typeof window.ipc.postMessage === "function") {
@@ -579,6 +581,92 @@
     $("sttLanguage").value = cfg.stt.language || "ja";
     $("vadSilenceMs").value = cfg.vad.silence_ms;
     $("vadMinSpeechMs").value = cfg.vad.min_speech_ms;
+
+    const tts = cfg.discord_tts || {};
+    const vv = tts.voicevox || {};
+    $("chkTtsEnabled").checked = !!tts.enabled;
+    $("chkTtsDmOnly").checked = tts.dm_only !== false;
+    $("chkTtsReadSender").checked = tts.read_sender_name !== false;
+    $("chkTtsPauseStt").checked = tts.pause_stt_while_speaking !== false;
+    $("chkTtsDebugLog").checked = !!tts.debug_log_toasts;
+    $("ttsDebugCard").style.display = tts.debug_log_toasts ? "block" : "none";
+    $("ttsTemplate").value = tts.template || "{sender}さんから。{message}";
+    $("ttsMaxChars").value = tts.max_chars != null ? tts.max_chars : 80;
+    $("ttsUrlReplace").value = tts.url_replacement || "URL省略";
+    $("ttsDedupMs").value = tts.dedup_window_ms != null ? tts.dedup_window_ms : 3000;
+    $("ttsMaxQueue").value = tts.max_queue_size != null ? tts.max_queue_size : 5;
+    $("ttsEchoTailMs").value = tts.echo_guard_tail_ms != null ? tts.echo_guard_tail_ms : 400;
+    $("ttsAllowSenders").value = joinCsv(tts.allow_senders);
+    $("ttsBlockSenders").value = joinCsv(tts.block_senders);
+
+    $("ttsBaseUrl").value = vv.base_url || "http://127.0.0.1:50021";
+    $("ttsExePath").value = vv.exe_path || "";
+    $("chkTtsAutoLaunch").checked = vv.auto_launch !== false;
+    $("chkTtsStopOnExit").checked = vv.stop_on_exit !== false;
+    const spkId = vv.speaker_id != null ? vv.speaker_id : 3;
+    renderVoicevoxSpeakerSelect(spkId);
+    const spd = vv.speed_scale != null ? vv.speed_scale : 1.15;
+    const vol = vv.volume_scale != null ? vv.volume_scale : 1.0;
+    const pit = vv.pitch_scale != null ? vv.pitch_scale : 0.0;
+    const into = vv.intonation_scale != null ? vv.intonation_scale : 1.0;
+    $("ttsSpeed").value = spd;
+    $("ttsSpeedVal").textContent = Number(spd).toFixed(2);
+    $("ttsVolume").value = vol;
+    $("ttsVolumeVal").textContent = Number(vol).toFixed(2);
+    $("ttsPitch").value = pit;
+    $("ttsPitchVal").textContent = Number(pit).toFixed(2);
+    $("ttsIntonation").value = into;
+    $("ttsIntonationVal").textContent = Number(into).toFixed(2);
+  }
+
+  function renderVoicevoxSpeakerSelect(selectedId) {
+    const sel = $("ttsSpeakerSelect");
+    const targetId = String(selectedId != null ? selectedId : 3);
+    sel.innerHTML = "";
+    if (voicevoxSpeakers.length > 0) {
+      let matched = false;
+      voicevoxSpeakers.forEach((sp) => {
+        const opt = document.createElement("option");
+        opt.value = String(sp.id);
+        opt.textContent = `${sp.name}（${sp.style_name}） [ID: ${sp.id}]`;
+        if (opt.value === targetId) matched = true;
+        sel.appendChild(opt);
+      });
+      if (!matched) {
+        const opt = document.createElement("option");
+        opt.value = targetId;
+        opt.textContent = `カスタム話者 [ID: ${targetId}]`;
+        sel.appendChild(opt);
+      }
+    } else {
+      const opt = document.createElement("option");
+      opt.value = targetId;
+      opt.textContent = `話者 ID: ${targetId}（「接続確認 / 話者更新」で一覧取得）`;
+      sel.appendChild(opt);
+    }
+    sel.value = targetId;
+    $("ttsSpeakerIdHint").textContent = `ID: ${targetId}`;
+  }
+
+  function addToastDebugLog(text) {
+    if (!text) return;
+    const time = new Date().toTimeString().slice(0, 8);
+    toastDebugLogs.unshift({ text, time });
+    if (toastDebugLogs.length > 40) toastDebugLogs.pop();
+    const list = $("ttsDebugList");
+    list.innerHTML = "";
+    toastDebugLogs.forEach((item) => {
+      const div = document.createElement("div");
+      div.className = "history-item";
+      const sp = document.createElement("span");
+      sp.textContent = item.text;
+      const tm = document.createElement("span");
+      tm.className = "history-time";
+      tm.textContent = item.time;
+      div.appendChild(sp);
+      div.appendChild(tm);
+      list.appendChild(div);
+    });
   }
 
   function collectConfigFromUi() {
@@ -653,6 +741,32 @@
         bot_token: $("botTokenInput").value.trim(),
         use_bot_for_send: $("chkBotSend").checked,
         clipboard_url_watch: $("chkClipboardWatch").checked,
+      },
+      discord_tts: {
+        enabled: $("chkTtsEnabled").checked,
+        dm_only: $("chkTtsDmOnly").checked,
+        read_sender_name: $("chkTtsReadSender").checked,
+        template: $("ttsTemplate").value || "{sender}さんから。{message}",
+        max_chars: parseInt($("ttsMaxChars").value, 10) || 80,
+        url_replacement: $("ttsUrlReplace").value || "URL省略",
+        dedup_window_ms: Math.max(0, parseInt($("ttsDedupMs").value, 10) || 0),
+        max_queue_size: Math.max(1, parseInt($("ttsMaxQueue").value, 10) || 5),
+        pause_stt_while_speaking: $("chkTtsPauseStt").checked,
+        echo_guard_tail_ms: Math.max(0, parseInt($("ttsEchoTailMs").value, 10) || 0),
+        allow_senders: splitCsv($("ttsAllowSenders").value),
+        block_senders: splitCsv($("ttsBlockSenders").value),
+        debug_log_toasts: $("chkTtsDebugLog").checked,
+        voicevox: {
+          base_url: $("ttsBaseUrl").value.trim() || "http://127.0.0.1:50021",
+          speaker_id: parseInt($("ttsSpeakerSelect").value, 10) || 0,
+          speed_scale: parseFloat($("ttsSpeed").value) || 1.15,
+          pitch_scale: parseFloat($("ttsPitch").value) || 0.0,
+          intonation_scale: parseFloat($("ttsIntonation").value) || 1.0,
+          volume_scale: parseFloat($("ttsVolume").value) || 1.0,
+          auto_launch: $("chkTtsAutoLaunch").checked,
+          exe_path: $("ttsExePath").value.trim(),
+          stop_on_exit: $("chkTtsStopOnExit").checked,
+        },
       },
       guard: {
         enabled: $("chkGuardEnabled").checked,
@@ -965,6 +1079,59 @@
   });
   $("chkStripPunct").addEventListener("change", saveNow);
   $("chkAppendPeriod").addEventListener("change", saveNow);
+
+  // Discord DM TTS (VOICEVOX) bindings
+  $("chkTtsEnabled").addEventListener("change", saveNow);
+  $("chkTtsAutoLaunch").addEventListener("change", saveNow);
+  $("chkTtsStopOnExit").addEventListener("change", saveNow);
+  $("btnVoicevoxDetect").addEventListener("click", () => {
+    send({ type: "VoicevoxDetectPath" });
+  });
+  $("chkTtsDmOnly").addEventListener("change", saveNow);
+  $("chkTtsReadSender").addEventListener("change", saveNow);
+  $("chkTtsPauseStt").addEventListener("change", saveNow);
+  $("chkTtsDebugLog").addEventListener("change", () => {
+    $("ttsDebugCard").style.display = $("chkTtsDebugLog").checked ? "block" : "none";
+    saveNow();
+  });
+  $("ttsSpeakerSelect").addEventListener("change", () => {
+    $("ttsSpeakerIdHint").textContent = "ID: " + $("ttsSpeakerSelect").value;
+    saveNow();
+  });
+  $("ttsSpeed").addEventListener("input", (e) => {
+    $("ttsSpeedVal").textContent = Number(e.target.value).toFixed(2);
+  });
+  $("ttsSpeed").addEventListener("change", saveNow);
+  $("ttsVolume").addEventListener("input", (e) => {
+    $("ttsVolumeVal").textContent = Number(e.target.value).toFixed(2);
+  });
+  $("ttsVolume").addEventListener("change", saveNow);
+  $("ttsPitch").addEventListener("input", (e) => {
+    $("ttsPitchVal").textContent = Number(e.target.value).toFixed(2);
+  });
+  $("ttsPitch").addEventListener("change", saveNow);
+  $("ttsIntonation").addEventListener("input", (e) => {
+    $("ttsIntonationVal").textContent = Number(e.target.value).toFixed(2);
+  });
+  $("ttsIntonation").addEventListener("change", saveNow);
+
+  $("btnVoicevoxRefresh").addEventListener("click", () => {
+    const baseUrl = $("ttsBaseUrl").value.trim() || "http://127.0.0.1:50021";
+    saveNow();
+    send({ type: "VoicevoxCheckHealth", base_url: baseUrl });
+    send({ type: "VoicevoxGetSpeakers", base_url: baseUrl });
+  });
+  $("btnTtsTestSpeak").addEventListener("click", () => {
+    saveNow();
+    send({ type: "VoicevoxTestSpeak", text: $("ttsTestText").value });
+  });
+  $("btnTtsStop").addEventListener("click", () => {
+    send({ type: "TtsStop" });
+  });
+  $("btnClearToastDebug").addEventListener("click", () => {
+    toastDebugLogs.length = 0;
+    $("ttsDebugList").innerHTML = '<div class="empty-state">通知を待機しています...</div>';
+  });
   $("btnConfirmYes").addEventListener("click", () =>
     send({ type: "ConfirmTargetReply", reply: "yes" })
   );
@@ -1153,6 +1320,7 @@
         if (ev.active) {
           $("confirmTitle").textContent = ev.title || "";
           $("confirmSub").textContent = ev.subtitle || "";
+          $("btnConfirmNext").style.display = ev.has_next === false ? "none" : "inline-block";
           banner.style.display = "flex";
         } else {
           banner.style.display = "none";
@@ -1265,6 +1433,70 @@
       }
       case "Toast":
         showToast(ev.message, ev.level);
+        break;
+      case "VoicevoxHealthResult": {
+        const badge = $("ttsConnBadge");
+        if (ev.ok) {
+          badge.textContent = "VOICEVOX: 接続OK (v" + (ev.version || "?") + ")";
+          badge.className = "pill ok";
+          showToast(ev.message, "ok");
+        } else {
+          badge.textContent = "VOICEVOX: 未接続";
+          badge.className = "pill warn";
+          showToast(ev.message, "error");
+        }
+        break;
+      }
+      case "VoicevoxSpeakersResult": {
+        if (ev.ok && Array.isArray(ev.speakers)) {
+          voicevoxSpeakers = ev.speakers;
+          const curId =
+            (currentConfig &&
+              currentConfig.discord_tts &&
+              currentConfig.discord_tts.voicevox &&
+              currentConfig.discord_tts.voicevox.speaker_id) != null
+              ? currentConfig.discord_tts.voicevox.speaker_id
+              : parseInt($("ttsSpeakerSelect").value, 10) || 3;
+          renderVoicevoxSpeakerSelect(curId);
+          showToast(ev.message, "ok");
+        } else if (!ev.ok) {
+          showToast(ev.message, "error");
+        }
+        break;
+      }
+      case "VoicevoxDetectResult": {
+        if (ev.found && ev.path) {
+          $("ttsExePath").value = ev.path;
+          showToast(ev.message, "ok");
+        } else {
+          showToast(ev.message, "error");
+        }
+        break;
+      }
+      case "TtsStatusChanged": {
+        const conn = $("ttsConnBadge");
+        if (!ev.connected && ev.last_error) {
+          conn.textContent = "VOICEVOX: 未接続";
+          conn.className = "pill warn";
+        } else if (ev.connected && conn.textContent.includes("未確認")) {
+          conn.textContent = "VOICEVOX: 接続OK";
+          conn.className = "pill ok";
+        }
+        const sp = $("ttsSpeakingBadge");
+        if (ev.speaking) {
+          sp.textContent = ev.queued > 0 ? `読み上げ中 (待機:${ev.queued})` : "読み上げ中";
+          sp.className = "pill active";
+        } else if (ev.queued > 0) {
+          sp.textContent = `待機中 (${ev.queued}件)`;
+          sp.className = "pill warn";
+        } else {
+          sp.textContent = "待機中";
+          sp.className = "pill";
+        }
+        break;
+      }
+      case "ToastDebugLog":
+        addToastDebugLog(ev.text);
         break;
     }
   };

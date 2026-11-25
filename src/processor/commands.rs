@@ -58,15 +58,29 @@ pub enum ConfirmationReply {
 }
 
 /// Parses spoken responses while VoxDrop is asking "この人で合っていますか？".
+/// Only matches short standalone confirmation replies so normal conversation is never hijacked.
 pub fn parse_confirmation_reply(input: &str) -> Option<ConfirmationReply> {
-    let s = trim_trailing_punct(input.trim());
-    if s.is_empty() {
+    let s = trim_trailing_punct(input.trim())
+        .trim_matches(|c: char| c.is_whitespace() || matches!(c, '、' | ','))
+        .trim();
+    if s.is_empty() || s.chars().count() > 14 {
         return None;
     }
     let lower = s.to_ascii_lowercase();
 
-    const CANCEL: &[&str] = &["キャンセル", "やめて", "やめ", "中止", "閉じる", "とじて"];
-    if CANCEL.iter().any(|&w| lower == w || s.contains(w)) {
+    const CANCEL: &[&str] = &[
+        "いいえ",
+        "いーえ",
+        "いや",
+        "no",
+        "キャンセル",
+        "やめて",
+        "やめ",
+        "中止",
+        "閉じる",
+        "とじて",
+    ];
+    if CANCEL.iter().any(|&w| lower == w || s == w) {
         return Some(ConfirmationReply::Cancel);
     }
 
@@ -80,8 +94,6 @@ pub fn parse_confirmation_reply(input: &str) -> Option<ConfirmationReply> {
         "ちがう",
         "ちがいます",
         "違います",
-        "いいえ",
-        "いや",
         "次",
         "つぎ",
         "別の人",
@@ -90,34 +102,34 @@ pub fn parse_confirmation_reply(input: &str) -> Option<ConfirmationReply> {
         "ほか",
         "他の人",
         "次の人",
-        "no",
         "next",
     ];
-    if NEXT.iter().any(|&w| lower == w || s.contains(w)) {
+    if NEXT.iter().any(|&w| lower == w || s == w) {
         return Some(ConfirmationReply::Next);
     }
 
     const YES: &[&str] = &[
         "はい",
+        "はいよ",
+        "はいはい",
         "うん",
         "そう",
         "そうです",
         "合ってる",
         "あってる",
         "合ってます",
+        "あってます",
         "オッケー",
         "おっけー",
         "ok",
         "yes",
         "この人",
         "その人",
-        "それ",
         "決定",
         "開いて",
         "ひらいて",
-        "送信",
     ];
-    if YES.iter().any(|&w| lower == w || s.contains(w)) {
+    if YES.iter().any(|&w| lower == w || s == w) {
         return Some(ConfirmationReply::Yes);
     }
 
@@ -597,9 +609,12 @@ mod tests {
 
         // Confirmation replies
         assert_eq!(parse_confirmation_reply("はい！"), Some(ConfirmationReply::Yes));
+        assert_eq!(parse_confirmation_reply("いいえ。"), Some(ConfirmationReply::Cancel));
         assert_eq!(parse_confirmation_reply("違う"), Some(ConfirmationReply::Next));
         assert_eq!(parse_confirmation_reply("別の人"), Some(ConfirmationReply::Next));
         assert_eq!(parse_confirmation_reply("前の人"), Some(ConfirmationReply::Prev));
         assert_eq!(parse_confirmation_reply("キャンセル"), Some(ConfirmationReply::Cancel));
+        // Long normal utterances containing "そう"/"うん"/"それ" must NOT be mistaken for confirmation
+        assert_eq!(parse_confirmation_reply("まあでもこれでよさそうだしテストしてみよう"), None);
     }
 }
