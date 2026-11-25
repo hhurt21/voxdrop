@@ -54,7 +54,8 @@ pub fn apply_fillers_and_dictionary(raw: &str, cfg: &TextFilterConfig) -> String
     text.trim().to_string()
 }
 
-/// Applies punctuation removal or automatic period insertion after command stripping.
+/// Applies punctuation removal, automatic Japanese punctuation restoration,
+/// automatic newline insertion, or automatic period insertion after command stripping.
 pub fn apply_punctuation_rules(input: &str, cfg: &TextFilterConfig) -> String {
     let mut text = input.trim().to_string();
     if text.is_empty() {
@@ -62,12 +63,34 @@ pub fn apply_punctuation_rules(input: &str, cfg: &TextFilterConfig) -> String {
     }
 
     if cfg.strip_punctuation {
+        if cfg.auto_newline {
+            text = crate::processor::japanese_fix::restore_japanese_punctuation(
+                &text,
+                false,
+                true,
+            );
+        }
         text = text.replace(['。', '、'], "");
         text = text.trim().to_string();
-    } else if cfg.append_period {
+        return text;
+    }
+
+    if cfg.auto_punctuation || cfg.auto_newline {
+        text = crate::processor::japanese_fix::restore_japanese_punctuation(
+            &text,
+            cfg.auto_punctuation,
+            cfg.auto_newline,
+        );
+    }
+
+    if cfg.append_period && !text.is_empty() {
         let ends_with_punct = text.ends_with(['。', '！', '？', '!', '?', '.', ':']);
         if !ends_with_punct {
-            text.push('。');
+            if crate::processor::japanese_fix::is_question_ending(&text) {
+                text.push('？');
+            } else {
+                text.push('。');
+            }
         }
     }
 
@@ -97,6 +120,8 @@ mod tests {
             auto_space: false,
             strip_punctuation: false,
             append_period: false,
+            auto_punctuation: true,
+            auto_newline: true,
         };
 
         let out = apply_fillers_and_dictionary("えーと、あのーくさナイス", &cfg);

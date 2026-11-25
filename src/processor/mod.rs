@@ -99,4 +99,35 @@ mod tests {
         assert_eq!(res.text, "草");
         assert_eq!(res.command, Some(VoiceCommand::Send));
     }
+
+    #[test]
+    fn auto_newline_toggle_controls_sentence_line_breaks() {
+        let mut filter_cfg = TextFilterConfig::default();
+        let cmd_cfg = VoiceCommandsConfig::default();
+        let targets_cfg = DiscordTargetsConfig::default();
+
+        filter_cfg.auto_newline = true;
+        let with_nl = process_transcript(
+            "これでいいのか？よさそうこれ一部だけ送信できるの？",
+            &filter_cfg,
+            &cmd_cfg,
+            &targets_cfg,
+        );
+        assert_eq!(
+            with_nl.text,
+            "これでいいのか？\nよさそう。\nこれ一部だけ送信できるの？"
+        );
+
+        filter_cfg.auto_newline = false;
+        let without_nl = process_transcript(
+            "これでいいのか？よさそうこれ一部だけ送信できるの？",
+            &filter_cfg,
+            &cmd_cfg,
+            &targets_cfg,
+        );
+        assert_eq!(
+            without_nl.text,
+            "これでいいのか？よさそう。これ一部だけ送信できるの？"
+        );
+    }
 }

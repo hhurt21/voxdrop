@@ -103,6 +103,10 @@ pub struct TextFilterConfig {
     pub auto_space: bool,
     pub strip_punctuation: bool,
     pub append_period: bool,
+    /// 文脈や接続詞・文節の区切りから自然な句読点（「、」「。」）を自動補完する（デフォルト: true）
+    pub auto_punctuation: bool,
+    /// 文の区切り・質問・話題転換などで自動的に改行を挿入する（デフォルト: true）
+    pub auto_newline: bool,
 }
 
 impl Default for TextFilterConfig {
@@ -130,6 +134,8 @@ impl Default for TextFilterConfig {
             auto_space: false,
             strip_punctuation: false,
             append_period: false,
+            auto_punctuation: true,
+            auto_newline: true,
         }
     }
 }
@@ -151,10 +157,10 @@ impl Default for VadConfig {
     fn default() -> Self {
         Self {
             threshold: 0.025,
-            silence_ms: 320,
+            silence_ms: 420,
             min_speech_ms: 140,
-            pre_roll_ms: 320,
-            max_utterance_ms: 10000,
+            pre_roll_ms: 360,
+            max_utterance_ms: 15000,
             silero_model_path: String::new(),
             auto_adjust: true,
         }

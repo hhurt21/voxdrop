@@ -49,7 +49,7 @@ pub struct VadSegmenter {
 
 impl VadSegmenter {
     pub fn new(config: VadConfig) -> Self {
-        let pre_roll_cap = ms_to_samples(config.pre_roll_ms.max(300));
+        let pre_roll_cap = ms_to_samples(config.pre_roll_ms.max(350));
         Self {
             config,
             in_speech: false,
@@ -171,7 +171,7 @@ impl VadSegmenter {
         let silence_limit = ms_to_samples(self.config.silence_ms.clamp(150, 2000));
         let min_speech = ms_to_samples(self.config.min_speech_ms.max(40));
         let max_utterance = ms_to_samples(self.config.max_utterance_ms.max(1500));
-        let max_pre_roll = ms_to_samples(self.config.pre_roll_ms.max(300));
+        let max_pre_roll = ms_to_samples(self.config.pre_roll_ms.max(350));
 
         // Voice start decision:
         // Either clearly above SNR threshold (and not rejected by neural VAD when strong hum),
@@ -206,21 +206,23 @@ impl VadSegmenter {
             self.utterance.extend_from_slice(samples);
             if rms > self.speech_peak_rms {
                 self.speech_peak_rms = self.speech_peak_rms * 0.6 + rms * 0.4;
+            } else {
+                // Gently decay peak envelope so one early loud syllable/laugh never cuts off quieter fast speech later
+                self.speech_peak_rms = (self.speech_peak_rms * 0.992).max(keep_th);
             }
             if neural_vad_prob > self.max_neural_prob {
                 self.max_neural_prob = neural_vad_prob;
             }
 
             // Peak-Drop End-of-Speech Detector:
-            // Compare current frame against BOTH ambient keep_th AND the speaker's own voice peak!
-            // When the user stops talking and level drops back near noise_floor (or <24% of peak),
-            // silence is counted immediately — NEVER getting stuck for 5-8 seconds!
-            let dynamic_drop_th = keep_th.max(self.speech_peak_rms * 0.24);
+            // Compare current frame against BOTH ambient keep_th AND the speaker's recent voice peak!
+            // Using 0.16x peak preserves softer trailing syllables in fast speech while still closing promptly.
+            let dynamic_drop_th = keep_th.max(self.speech_peak_rms * 0.16);
             let energy_active = rms >= dynamic_drop_th;
             let neural_still_talking = rnnoise_active
-                && neural_vad_prob >= 0.55
-                && rms >= keep_th
-                && rms >= self.speech_peak_rms * 0.16;
+                && neural_vad_prob >= 0.45
+                && rms >= keep_th * 0.85
+                && rms >= self.speech_peak_rms * 0.12;
 
             if energy_active || neural_still_talking {
                 self.speech_samples += samples.len();
@@ -247,9 +249,17 @@ impl VadSegmenter {
                 self.speech_peak_rms = 0.0;
                 self.max_neural_prob = 0.0;
 
+                if reached_max && !buf.is_empty() {
+                    // Carry 160ms overlap into pre_roll so fast speech split at max_utterance never drops a syllable
+                    let overlap = ms_to_samples(160).min(buf.len());
+                    let start = buf.len() - overlap;
+                    self.pre_roll.clear();
+                    self.pre_roll.extend(buf[start..].iter().copied());
+                }
+
                 if enough_speech && looks_like_voice && !buf.is_empty() {
-                    // Trim excess trailing silence beyond 100ms so STT runs fast on clean speech only
-                    let keep_tail = ms_to_samples(100);
+                    // Keep 160ms tail margin so trailing Japanese unvoiced consonants (す/く/つ/た) never clip
+                    let keep_tail = ms_to_samples(160);
                     if trailing_sil > keep_tail && buf.len() > trailing_sil {
                         let trim = trailing_sil - keep_tail;
                         buf.truncate(buf.len() - trim);
@@ -337,8 +347,8 @@ mod tests {
         assert_eq!(evs.len(), 1);
         match &evs[0] {
             VadEvent::SpeechEnd(samples) => {
-                // 100ms pre-roll + 250ms speech + 100ms trimmed tail = 450ms
-                assert_eq!(samples.len(), ms_to_samples(450));
+                // 100ms pre-roll + 250ms speech + 160ms trimmed tail = 510ms
+                assert_eq!(samples.len(), ms_to_samples(510));
             }
             _ => panic!("expected SpeechEnd"),
         }

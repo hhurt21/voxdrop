@@ -547,6 +547,9 @@
     $("cmdResume").value = joinCsv(cfg.commands.resume);
 
     $("chkRemoveFillers").checked = !!cfg.filter.remove_fillers;
+    $("chkAutoPunct").checked = cfg.filter.auto_punctuation !== false;
+    $("chkAutoNewline").checked = cfg.filter.auto_newline !== false;
+    $("chkQuickAutoNewline").checked = cfg.filter.auto_newline !== false;
     $("chkAutoSpace").checked = !!cfg.filter.auto_space;
     $("chkStripPunct").checked = !!cfg.filter.strip_punctuation;
     $("chkAppendPeriod").checked = !!cfg.filter.append_period;
@@ -616,6 +619,8 @@
         auto_space: $("chkAutoSpace").checked,
         strip_punctuation: $("chkStripPunct").checked,
         append_period: $("chkAppendPeriod").checked,
+        auto_punctuation: $("chkAutoPunct").checked,
+        auto_newline: $("chkAutoNewline").checked,
       },
       vad: {
         ...currentConfig.vad,
@@ -949,6 +954,17 @@
   $("btnSaveAll").addEventListener("click", saveNow);
   $("chkAutoStart").addEventListener("change", saveNow);
   $("chkStartMinimized").addEventListener("change", saveNow);
+  $("chkAutoPunct").addEventListener("change", saveNow);
+  $("chkAutoNewline").addEventListener("change", () => {
+    $("chkQuickAutoNewline").checked = $("chkAutoNewline").checked;
+    saveNow();
+  });
+  $("chkQuickAutoNewline").addEventListener("change", () => {
+    $("chkAutoNewline").checked = $("chkQuickAutoNewline").checked;
+    saveNow();
+  });
+  $("chkStripPunct").addEventListener("change", saveNow);
+  $("chkAppendPeriod").addEventListener("change", saveNow);
   $("btnConfirmYes").addEventListener("click", () =>
     send({ type: "ConfirmTargetReply", reply: "yes" })
   );

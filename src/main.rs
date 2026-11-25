@@ -176,6 +176,7 @@ struct AppState {
     overlay_visible: bool,
     draft_segments: Vec<String>,
     direct_history_lengths: Vec<usize>,
+    last_direct_utterance: String,
     pending_confirm: Option<PendingConfirmation>,
 }
 
@@ -206,6 +207,7 @@ impl AppState {
             overlay_visible,
             draft_segments: Vec::new(),
             direct_history_lengths: Vec::new(),
+            last_direct_utterance: String::new(),
             pending_confirm: None,
         }
     }
@@ -228,18 +230,13 @@ impl AppState {
     }
 
     fn draft_text(&self) -> String {
-        let mut out = String::new();
-        for seg in &self.draft_segments {
-            if !out.is_empty()
-                && self.config.filter.auto_space
-                && !out.ends_with('\n')
-                && !seg.starts_with('\n')
-            {
-                out.push(' ');
-            }
-            out.push_str(seg);
-        }
-        out
+        processor::japanese_fix::join_utterances_smart(
+            &self.draft_segments,
+            self.config.filter.auto_punctuation,
+            self.config.filter.auto_newline,
+            self.config.filter.auto_space,
+            self.config.filter.strip_punctuation,
+        )
     }
 
     fn tray_state(&self) -> TrayState {
@@ -915,6 +912,7 @@ fn execute_text_and_command(
                 }
                 InputMode::Direct => {
                     state.direct_history_lengths.clear();
+                    state.last_direct_utterance.clear();
                     spawn_key_async(
                         KeyAction::ClearAll,
                         VoiceCommand::ClearAll.as_str(),
@@ -953,6 +951,7 @@ fn execute_text_and_command(
                     );
                 }
                 InputMode::Direct => {
+                    state.last_direct_utterance.clear();
                     let key_action = match state.direct_history_lengths.pop() {
                         Some(n) if n > 0 => KeyAction::BackSpace(n),
                         _ => KeyAction::CtrlZ,
@@ -993,10 +992,24 @@ fn execute_text_and_command(
             }
             InputMode::Direct => {
                 let guard = state.config.guard.clone();
-                if !text.is_empty() {
-                    state.direct_history_lengths.push(text.chars().count());
+                let paste_text = if text.is_empty() {
+                    String::new()
+                } else {
+                    let joiner = processor::japanese_fix::compute_utterance_joiner(
+                        &state.last_direct_utterance,
+                        &text,
+                        state.config.filter.auto_punctuation,
+                        state.config.filter.auto_newline,
+                        state.config.filter.auto_space,
+                        state.config.filter.strip_punctuation,
+                    );
+                    format!("{}{}", joiner, text)
+                };
+                if !paste_text.is_empty() {
+                    state.direct_history_lengths.push(paste_text.chars().count());
                 }
-                let text_bg = text.clone();
+                state.last_direct_utterance = "\n".into();
+                let text_bg = paste_text;
                 let p = proxy.clone();
                 thread::spawn(move || {
                     if !text_bg.is_empty() {
@@ -1070,7 +1083,21 @@ fn execute_text_and_command(
                 }
             }
             InputMode::Direct => {
+                let paste_text = if text.is_empty() {
+                    String::new()
+                } else {
+                    let joiner = processor::japanese_fix::compute_utterance_joiner(
+                        &state.last_direct_utterance,
+                        &text,
+                        state.config.filter.auto_punctuation,
+                        state.config.filter.auto_newline,
+                        state.config.filter.auto_space,
+                        state.config.filter.strip_punctuation,
+                    );
+                    format!("{}{}", joiner, text)
+                };
                 state.direct_history_lengths.clear();
+                state.last_direct_utterance.clear();
                 emit_all(
                     main_wv,
                     overlay_wv,
@@ -1080,7 +1107,13 @@ fn execute_text_and_command(
                         is_final: true,
                     },
                 );
-                spawn_send_for_state(text, true, VoiceCommand::Send.as_str(), state, proxy.clone());
+                spawn_send_for_state(
+                    paste_text,
+                    true,
+                    VoiceCommand::Send.as_str(),
+                    state,
+                    proxy.clone(),
+                );
             }
         },
         Some(VoiceCommand::DiscordMuteMic) => {
@@ -1198,11 +1231,16 @@ fn execute_text_and_command(
                     );
                 }
                 InputMode::Direct => {
-                    let paste_text = if state.config.filter.auto_space {
-                        format!("{} ", text)
-                    } else {
-                        text.clone()
-                    };
+                    let joiner = processor::japanese_fix::compute_utterance_joiner(
+                        &state.last_direct_utterance,
+                        &text,
+                        state.config.filter.auto_punctuation,
+                        state.config.filter.auto_newline,
+                        state.config.filter.auto_space,
+                        state.config.filter.strip_punctuation,
+                    );
+                    let paste_text = format!("{}{}", joiner, text);
+                    state.last_direct_utterance = text.clone();
                     state.direct_history_lengths.push(paste_text.chars().count());
                     emit_all(
                         main_wv,
@@ -1284,6 +1322,7 @@ fn handle_transcript(
         match switch_action {
             TargetSwitchAction::Reset => {
                 state.config.discord_targets.active_target_id = None;
+                state.last_direct_utterance.clear();
                 let _ = state.config.save_to(&state.config_path);
                 sound.play(SoundKind::ToggleOff, &state.config.sound);
                 emit_all(main_wv, overlay_wv, &state.status_event());
@@ -2203,6 +2242,7 @@ fn main() -> wry::Result<()> {
                     }
                     ClientCommand::SetInputMode { mode } => {
                         state.config.input_mode = mode;
+                        state.last_direct_utterance.clear();
                         let _ = state.config.save_to(&state.config_path);
                         emit_all(&webview, &overlay_webview, &state.status_event());
                         emit(

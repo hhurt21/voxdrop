@@ -309,7 +309,7 @@ impl ResidentWhisperRecognizer {
                 rounded.clamp(256, 1500)
             };
             wparams.audio_ctx = if guard.is_kotoba {
-                if dur_sec <= 8.0 { 512 } else { 0 }
+                if dur_sec <= 7.5 { 512 } else { 0 }
             } else {
                 dyn_ctx
             };
@@ -333,11 +333,13 @@ impl ResidentWhisperRecognizer {
             wparams.suppress_nst = true;
             wparams.temperature = 0.0;
             wparams.temperature_inc = 0.2;
-            wparams.entropy_thold = 2.2;
+            // Relax entropy_thold slightly (2.2 -> 2.6) so fast casual Japanese never triggers noisy temperature>0 fallback
+            wparams.entropy_thold = 2.6;
             wparams.no_speech_thold = 0.60;
-            wparams.max_tokens = 96;
+            // Do not cap at 96 tokens so dense fast speech (80-150+ Japanese chars) never truncates
+            wparams.max_tokens = 0;
             if self.using_gpu {
-                wparams.beam_search.beam_size = 3;
+                wparams.beam_search.beam_size = 5;
             } else {
                 wparams.greedy.best_of = 1;
             }
@@ -364,7 +366,26 @@ impl ResidentWhisperRecognizer {
                 let ptr_txt = (guard.fns.full_get_segment_text)(guard.ctx, i);
                 if !ptr_txt.is_null() {
                     let seg = CStr::from_ptr(ptr_txt).to_string_lossy();
-                    out.push_str(seg.trim());
+                    let seg_trimmed = seg.trim();
+                    if seg_trimmed.is_empty() {
+                        continue;
+                    }
+                    if !out.is_empty() {
+                        let prev_ends_punct = out.ends_with([
+                            '。', '、', '！', '？', '!', '?', '.', ',', '…', '\n', '」', '）',
+                        ]);
+                        let next_starts_punct = seg_trimmed.starts_with([
+                            '。', '、', '！', '？', '!', '?', '.', ',', '…', '」', '）',
+                        ]);
+                        if !prev_ends_punct && !next_starts_punct {
+                            if crate::processor::japanese_fix::ends_like_complete_sentence(&out) {
+                                out.push('。');
+                            } else {
+                                out.push('、');
+                            }
+                        }
+                    }
+                    out.push_str(seg_trimmed);
                 }
             }
 
@@ -411,12 +432,22 @@ fn dedup_trailing_repetition(text: &str) -> String {
     if n < 8 {
         return text.to_string();
     }
-    // Check if the trailing slice of length L (>=4 chars) already appeared earlier in the utterance
+    // 1. Consecutive trailing repetition (len >= 4): e.g. "テストですテストです" -> "テストです"
     for len in (4..=(n / 2)).rev() {
         let tail = &chars[n - len..];
         let head = &chars[..n - len];
-        if head.windows(len).any(|w| w == tail) {
+        if head.ends_with(tail) {
             return head.iter().collect::<String>().trim().to_string();
+        }
+    }
+    // 2. Non-consecutive long phrase echo (len >= 8) so short natural endings ("と思います" etc.) are never clipped
+    if n >= 16 {
+        for len in (8..=(n / 2)).rev() {
+            let tail = &chars[n - len..];
+            let head = &chars[..n - len];
+            if head.windows(len).any(|w| w == tail) {
+                return head.iter().collect::<String>().trim().to_string();
+            }
         }
     }
     text.to_string()
@@ -536,6 +567,12 @@ mod tests {
         assert_eq!(
             filter_whisper_hallucinations("了解しましたあと5分で合流しますエンターあと5分で合流します"),
             "了解しましたあと5分で合流しますエンター"
+        );
+        // Consecutive 4-char echo is removed, while short non-consecutive words are preserved
+        assert_eq!(filter_whisper_hallucinations("テストですテストです"), "テストです");
+        assert_eq!(
+            filter_whisper_hallucinations("テストでこれもテストで"),
+            "テストでこれもテストで"
         );
     }
 

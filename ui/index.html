@@ -185,6 +185,10 @@
             <div class="row space-between">
               <h3>ドラフト（下書き）バッファ</h3>
               <div class="row gap-sm">
+                <label class="checkbox-row small-check" title="文の区切りや話題の切り替わりで自動的に改行します">
+                  <input type="checkbox" id="chkQuickAutoNewline" />
+                  <span>自動改行</span>
+                </label>
                 <button class="btn-secondary btn-sm" id="btnClearDraft">クリア</button>
                 <button class="btn-success btn-sm" id="btnForceSend">今すぐ送信</button>
               </div>
@@ -477,6 +481,14 @@
               <label class="checkbox-row">
                 <input type="checkbox" id="chkRemoveFillers" />
                 <span>フィラー（「えーと」「あのー」等）を自動除去</span>
+              </label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkAutoPunct" />
+                <span>句読点（「、」「。」）を自動で補完（連続発話や文節の区切り）</span>
+              </label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkAutoNewline" />
+                <span>明らかに改行したほうがよい文の区切りで自動改行（ON / OFF）</span>
               </label>
               <label class="checkbox-row">
                 <input type="checkbox" id="chkAutoSpace" />
