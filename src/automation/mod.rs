@@ -392,11 +392,58 @@ pub fn send_to_discord_target(
 }
 
 /// Sends a keyboard or mouse-wheel command action (auto-focusing Discord if configured).
+/// Supports idempotent Mute/Unmute & Deafen/Undeafen via UIA state check, plus non-SendInput
+/// single keys via `PostMessageW` in `WindowMessage` mode.
 pub fn send_action_guarded(action: KeyAction, guard: &GuardConfig) -> Result<String, String> {
     let (already_allowed, _) = check_target(guard);
+
+    // 1. Idempotent UIA Mute / Unmute / Deafen / Undeafen check & direct UIA toggle
+    let audio_req = match action {
+        KeyAction::DiscordMuteMic => Some((false, true)),
+        KeyAction::DiscordUnmuteMic => Some((false, false)),
+        KeyAction::DiscordDeafen => Some((true, true)),
+        KeyAction::DiscordUndeafen => Some((true, false)),
+        _ => None,
+    };
+    if let Some((is_deafen, desired_muted)) = audio_req {
+        let allow_uia_invoke = guard.send_method != SendMethod::NoSendInput;
+        if let Some((already_target, msg)) = uia::handle_discord_audio_toggle_uia(
+            &guard.allowed_processes,
+            is_deafen,
+            desired_muted,
+            allow_uia_invoke,
+        ) {
+            if already_target || allow_uia_invoke {
+                return Ok(msg);
+            }
+        }
+    }
+
+    // 2. Non-SendInput single-key dispatch in `WindowMessage` mode
+    if guard.send_method == SendMethod::WindowMessage {
+        if let Some(vk) = input::window_message_single_vk(action) {
+            if let Some((top_hwnd, render_hwnd)) =
+                window::find_discord_render_hwnd(&guard.allowed_processes)
+            {
+                let prev = window::get_foreground_hwnd_raw();
+                let _ = window::focus_hwnd_ex(top_hwnd, false);
+                if input::post_key_window_message(render_hwnd, vk).is_ok() {
+                    if !already_allowed && guard.restore_previous_window && prev != 0 {
+                        maybe_restore_ex(Some(prev), false);
+                    }
+                    return Ok(format!("PostMessage操作({:?})を実行しました（SendInput不使用）", action));
+                }
+            }
+        }
+        return Ok(format!(
+            "PostMessageモード中はショートカット({:?})を送信できません（標準 または ゲーム中セーフで有効）",
+            action
+        ));
+    }
+
     if guard.should_avoid_send_input(already_allowed) {
         return Ok(format!(
-            "セーフモード中のためキー操作({:?})をスキップしました",
+            "セーフモード中のためスキップしました: Discordを前面にして実行するか、送信方式を確認してください ({:?})",
             action
         ));
     }

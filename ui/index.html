@@ -360,27 +360,39 @@
 
           <div class="card">
             <div class="row space-between">
-              <h3>声で操作する Discord リモコン（キーボード / マウス連携）</h3>
+              <h3>声で操作する Discord リモコン（すべてON/解除・戻る/進む両対応）</h3>
               <label class="small-label">テスト遅延(秒):
                 <input type="number" id="remoteDelaySec" class="input" style="width: 64px" value="2" min="0" max="5" />
               </label>
             </div>
             <p class="hint">
-              Discord が最前面のとき、ボタンまたは下のカッコ内の音声コマンドを喋るだけでハンズフリー操作できます。
+              通話ミュート・スピーカーミュートは Discord 画面の状態を確認して重複反転を防ぎます。各ボタン右側の音声コマンドを喋るだけで操作できます。
             </p>
             <div class="remote-grid">
-              <button type="button" class="remote-btn" data-remote="mute_mic"><b>通話ミュート</b><span>「通話ミュート」 (Ctrl+Shift+M)</span></button>
-              <button type="button" class="remote-btn" data-remote="deafen"><b>スピーカーミュート</b><span>「スピーカーミュート」 (Ctrl+Shift+D)</span></button>
-              <button type="button" class="remote-btn" data-remote="prev_channel"><b>前のチャンネル</b><span>「前のチャンネル」 (Alt+↑)</span></button>
-              <button type="button" class="remote-btn" data-remote="next_channel"><b>次のチャンネル</b><span>「次のチャンネル」 (Alt+↓)</span></button>
-              <button type="button" class="remote-btn" data-remote="next_unread"><b>未読チャンネルへ</b><span>「未読へ」 (Alt+Shift+↓)</span></button>
-              <button type="button" class="remote-btn" data-remote="prev_server"><b>前のサーバー</b><span>「前のサーバー」 (Ctrl+Alt+↑)</span></button>
-              <button type="button" class="remote-btn" data-remote="next_server"><b>次のサーバー</b><span>「次のサーバー」 (Ctrl+Alt+↓)</span></button>
-              <button type="button" class="remote-btn" data-remote="scroll_up"><b>上にスクロール</b><span>「上にスクロール」 (PageUp+Wheel)</span></button>
-              <button type="button" class="remote-btn" data-remote="scroll_down"><b>下にスクロール</b><span>「下にスクロール」 (PageDown+Wheel)</span></button>
-              <button type="button" class="remote-btn" data-remote="edit_last"><b>直前の発言を編集</b><span>「直前を編集」 (↑)</span></button>
-              <button type="button" class="remote-btn" data-remote="mark_read"><b>サーバー既読</b><span>「既読にして」 (Shift+Esc)</span></button>
-              <button type="button" class="remote-btn" data-remote="toggle_members"><b>メンバー表示切替</b><span>「メンバー表示」 (Ctrl+U)</span></button>
+              <button type="button" class="remote-btn" data-remote="mute_mic"><b>🎤 マイクミュート (ON)</b><span>「通話ミュート」「マイクオフ」</span></button>
+              <button type="button" class="remote-btn" data-remote="unmute_mic"><b>🎙️ マイク解除 (戻す)</b><span>「ミュート解除」「マイク戻して」</span></button>
+              <button type="button" class="remote-btn" data-remote="deafen"><b>🔇 スピーカーミュート (ON)</b><span>「スピーカーミュート」「デフン」</span></button>
+              <button type="button" class="remote-btn" data-remote="undeafen"><b>🔊 スピーカー解除 (戻す)</b><span>「スピーカー解除」「デフン解除」</span></button>
+              <button type="button" class="remote-btn" data-remote="nav_back"><b>◀ 前の画面へ戻る</b><span>「前の画面」「画面戻して」 (Alt+←)</span></button>
+              <button type="button" class="remote-btn" data-remote="nav_forward"><b>▶ 次の画面へ進む</b><span>「次の画面」「画面進めて」 (Alt+→)</span></button>
+              <button type="button" class="remote-btn" data-remote="prev_channel"><b>▲ 前のチャンネル</b><span>「前のチャンネル」 (Alt+↑)</span></button>
+              <button type="button" class="remote-btn" data-remote="next_channel"><b>▼ 次のチャンネル</b><span>「次のチャンネル」 (Alt+↓)</span></button>
+              <button type="button" class="remote-btn" data-remote="prev_unread"><b>🔔 前の未読チャンネル</b><span>「前の未読」 (Alt+Shift+↑)</span></button>
+              <button type="button" class="remote-btn" data-remote="next_unread"><b>🔔 次の未読チャンネル</b><span>「未読へ」「次の未読」 (Alt+Shift+↓)</span></button>
+              <button type="button" class="remote-btn" data-remote="prev_server"><b>🌐 前のサーバー</b><span>「前のサーバー」 (Ctrl+Alt+↑)</span></button>
+              <button type="button" class="remote-btn" data-remote="next_server"><b>🌐 次のサーバー</b><span>「次のサーバー」 (Ctrl+Alt+↓)</span></button>
+              <button type="button" class="remote-btn" data-remote="scroll_up"><b>⬆ 上にスクロール</b><span>「上にスクロール」 (PageUp)</span></button>
+              <button type="button" class="remote-btn" data-remote="scroll_down"><b>⬇ 下にスクロール</b><span>「下にスクロール」 (PageDown)</span></button>
+              <button type="button" class="remote-btn" data-remote="jump_present"><b>⏬ 最新メッセージへ戻る</b><span>「最新へ」「一番下へ」 (Shift+PgDn)</span></button>
+              <button type="button" class="remote-btn" data-remote="mark_read"><b>✔ サーバーを既読にする</b><span>「既読にして」 (Shift+Esc)</span></button>
+              <button type="button" class="remote-btn" data-remote="edit_last"><b>✏ 直前の発言を編集</b><span>「直前を編集」 (↑)</span></button>
+              <button type="button" class="remote-btn" data-remote="cancel_escape"><b>✖ 編集キャンセル・閉じる / 既読</b><span>「編集キャンセル」「検索を閉じる」 (Esc)</span></button>
+              <button type="button" class="remote-btn" data-remote="enter"><b>↵ 編集確定 / 決定</b><span>「送信して」「エンター」 (Enter)</span></button>
+              <button type="button" class="remote-btn" data-remote="search"><b>🔍 チャンネル内検索</b><span>「チャンネル検索」 (Ctrl+F)</span></button>
+              <button type="button" class="remote-btn" data-remote="quick_switcher"><b>🔎 クイックスイッチャー</b><span>「クイック切替」 (Ctrl+K)</span></button>
+              <button type="button" class="remote-btn" data-remote="toggle_members"><b>👥 メンバー表示 / 非表示</b><span>「メンバー表示 / 非表示」 (Ctrl+U)</span></button>
+              <button type="button" class="remote-btn" data-remote="toggle_pins"><b>📌 ピン留め表示 / 非表示</b><span>「ピン留め表示」 (Ctrl+P)</span></button>
+              <button type="button" class="remote-btn" data-remote="toggle_inbox"><b>📥 受信トレイ表示 / 非表示</b><span>「受信トレイ」 (Ctrl+I)</span></button>
             </div>
           </div>
 
@@ -420,8 +432,7 @@
               <span><b>Discord のデスクトップ通知を検知して VOICEVOX で自動読み上げする（デフォルト: OFF）</b></span>
             </label>
             <p class="hint">
-              Windows 公式 UI Automation でトースト通知を検知します（Discord 規約準拠・プロセス注入なし）。<br />
-              ※ Discord の「デスクトップ通知を有効にする」および Windows の通知バナー表示を ON にしてご利用ください（集中モード中は通知が出ないため検知されません）。
+              Windows 通知（おやすみモード中・最小化中含む）および Discord UI Automation で新着を検知します（Discord 規約準拠・プロセス注入なし）。
             </p>
 
             <div class="toggle-grid" style="margin-top: 8px">

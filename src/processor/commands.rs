@@ -9,19 +9,30 @@ pub enum VoiceCommand {
     Newline,
     Mute,
     Resume,
-    // Discord remote control commands
+    // Discord remote control commands (bidirectional / reversible)
     DiscordMuteMic,
+    DiscordUnmuteMic,
     DiscordDeafen,
+    DiscordUndeafen,
+    DiscordNavBack,
+    DiscordNavForward,
     DiscordNextChannel,
     DiscordPrevChannel,
+    DiscordPrevUnread,
     DiscordNextUnread,
     DiscordNextServer,
     DiscordPrevServer,
     DiscordScrollUp,
     DiscordScrollDown,
+    DiscordJumpPresent,
     DiscordEditLast,
+    DiscordCancelEscape,
     DiscordMarkRead,
     DiscordToggleMembers,
+    DiscordTogglePins,
+    DiscordToggleInbox,
+    DiscordSearch,
+    DiscordQuickSwitcher,
 }
 
 impl VoiceCommand {
@@ -34,17 +45,28 @@ impl VoiceCommand {
             Self::Mute => "mute",
             Self::Resume => "resume",
             Self::DiscordMuteMic => "discord_mute_mic",
+            Self::DiscordUnmuteMic => "discord_unmute_mic",
             Self::DiscordDeafen => "discord_deafen",
+            Self::DiscordUndeafen => "discord_undeafen",
+            Self::DiscordNavBack => "discord_nav_back",
+            Self::DiscordNavForward => "discord_nav_forward",
             Self::DiscordNextChannel => "discord_next_channel",
             Self::DiscordPrevChannel => "discord_prev_channel",
+            Self::DiscordPrevUnread => "discord_prev_unread",
             Self::DiscordNextUnread => "discord_next_unread",
             Self::DiscordNextServer => "discord_next_server",
             Self::DiscordPrevServer => "discord_prev_server",
             Self::DiscordScrollUp => "discord_scroll_up",
             Self::DiscordScrollDown => "discord_scroll_down",
+            Self::DiscordJumpPresent => "discord_jump_present",
             Self::DiscordEditLast => "discord_edit_last",
+            Self::DiscordCancelEscape => "discord_cancel_escape",
             Self::DiscordMarkRead => "discord_mark_read",
             Self::DiscordToggleMembers => "discord_toggle_members",
+            Self::DiscordTogglePins => "discord_toggle_pins",
+            Self::DiscordToggleInbox => "discord_toggle_inbox",
+            Self::DiscordSearch => "discord_search",
+            Self::DiscordQuickSwitcher => "discord_quick_switcher",
         }
     }
 }
@@ -338,17 +360,28 @@ pub fn parse_voice_command(input: &str, cfg: &VoiceCommandsConfig) -> CommandPar
         (VoiceCommand::Mute, &cfg.mute),
         (VoiceCommand::Resume, &cfg.resume),
         (VoiceCommand::DiscordMuteMic, &cfg.discord_mute_mic),
+        (VoiceCommand::DiscordUnmuteMic, &cfg.discord_unmute_mic),
         (VoiceCommand::DiscordDeafen, &cfg.discord_deafen),
+        (VoiceCommand::DiscordUndeafen, &cfg.discord_undeafen),
+        (VoiceCommand::DiscordNavBack, &cfg.discord_nav_back),
+        (VoiceCommand::DiscordNavForward, &cfg.discord_nav_forward),
         (VoiceCommand::DiscordNextChannel, &cfg.discord_next_channel),
         (VoiceCommand::DiscordPrevChannel, &cfg.discord_prev_channel),
+        (VoiceCommand::DiscordPrevUnread, &cfg.discord_prev_unread),
         (VoiceCommand::DiscordNextUnread, &cfg.discord_next_unread),
         (VoiceCommand::DiscordNextServer, &cfg.discord_next_server),
         (VoiceCommand::DiscordPrevServer, &cfg.discord_prev_server),
         (VoiceCommand::DiscordScrollUp, &cfg.discord_scroll_up),
         (VoiceCommand::DiscordScrollDown, &cfg.discord_scroll_down),
+        (VoiceCommand::DiscordJumpPresent, &cfg.discord_jump_present),
         (VoiceCommand::DiscordEditLast, &cfg.discord_edit_last),
+        (VoiceCommand::DiscordCancelEscape, &cfg.discord_cancel_escape),
         (VoiceCommand::DiscordMarkRead, &cfg.discord_mark_read),
         (VoiceCommand::DiscordToggleMembers, &cfg.discord_toggle_members),
+        (VoiceCommand::DiscordTogglePins, &cfg.discord_toggle_pins),
+        (VoiceCommand::DiscordToggleInbox, &cfg.discord_toggle_inbox),
+        (VoiceCommand::DiscordSearch, &cfg.discord_search),
+        (VoiceCommand::DiscordQuickSwitcher, &cfg.discord_quick_switcher),
     ];
     for (cmd, list) in groups {
         for p in *list {
@@ -578,6 +611,28 @@ mod tests {
         let r5 = parse_voice_command("送信。", &cfg);
         assert_eq!(r5.remaining_text, "");
         assert_eq!(r5.command, Some(VoiceCommand::Send));
+
+        // Bidirectional Discord remote control commands
+        assert_eq!(
+            parse_voice_command("ミュート解除", &cfg).command,
+            Some(VoiceCommand::DiscordUnmuteMic)
+        );
+        assert_eq!(
+            parse_voice_command("デフン解除", &cfg).command,
+            Some(VoiceCommand::DiscordUndeafen)
+        );
+        assert_eq!(
+            parse_voice_command("前の未読", &cfg).command,
+            Some(VoiceCommand::DiscordPrevUnread)
+        );
+        assert_eq!(
+            parse_voice_command("前の画面", &cfg).command,
+            Some(VoiceCommand::DiscordNavBack)
+        );
+        assert_eq!(
+            parse_voice_command("編集キャンセル", &cfg).command,
+            Some(VoiceCommand::DiscordCancelEscape)
+        );
     }
 
     #[test]

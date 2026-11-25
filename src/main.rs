@@ -1193,10 +1193,42 @@ fn execute_text_and_command(
                 proxy.clone(),
             );
         }
+        Some(VoiceCommand::DiscordUnmuteMic) => {
+            spawn_key_async(
+                KeyAction::DiscordUnmuteMic,
+                "discord_unmute_mic",
+                state.config.guard.clone(),
+                proxy.clone(),
+            );
+        }
         Some(VoiceCommand::DiscordDeafen) => {
             spawn_key_async(
                 KeyAction::DiscordDeafen,
                 "discord_deafen",
+                state.config.guard.clone(),
+                proxy.clone(),
+            );
+        }
+        Some(VoiceCommand::DiscordUndeafen) => {
+            spawn_key_async(
+                KeyAction::DiscordUndeafen,
+                "discord_undeafen",
+                state.config.guard.clone(),
+                proxy.clone(),
+            );
+        }
+        Some(VoiceCommand::DiscordNavBack) => {
+            spawn_key_async(
+                KeyAction::DiscordNavBack,
+                "discord_nav_back",
+                state.config.guard.clone(),
+                proxy.clone(),
+            );
+        }
+        Some(VoiceCommand::DiscordNavForward) => {
+            spawn_key_async(
+                KeyAction::DiscordNavForward,
+                "discord_nav_forward",
                 state.config.guard.clone(),
                 proxy.clone(),
             );
@@ -1213,6 +1245,14 @@ fn execute_text_and_command(
             spawn_key_async(
                 KeyAction::DiscordPrevChannel,
                 "discord_prev_channel",
+                state.config.guard.clone(),
+                proxy.clone(),
+            );
+        }
+        Some(VoiceCommand::DiscordPrevUnread) => {
+            spawn_key_async(
+                KeyAction::DiscordPrevUnread,
+                "discord_prev_unread",
                 state.config.guard.clone(),
                 proxy.clone(),
             );
@@ -1257,10 +1297,26 @@ fn execute_text_and_command(
                 proxy.clone(),
             );
         }
+        Some(VoiceCommand::DiscordJumpPresent) => {
+            spawn_key_async(
+                KeyAction::DiscordJumpPresent,
+                "discord_jump_present",
+                state.config.guard.clone(),
+                proxy.clone(),
+            );
+        }
         Some(VoiceCommand::DiscordEditLast) => {
             spawn_key_async(
                 KeyAction::DiscordEditLast,
                 "discord_edit_last",
+                state.config.guard.clone(),
+                proxy.clone(),
+            );
+        }
+        Some(VoiceCommand::DiscordCancelEscape) => {
+            spawn_key_async(
+                KeyAction::DiscordCancelEscape,
+                "discord_cancel_escape",
                 state.config.guard.clone(),
                 proxy.clone(),
             );
@@ -1277,6 +1333,38 @@ fn execute_text_and_command(
             spawn_key_async(
                 KeyAction::DiscordToggleMembers,
                 "discord_toggle_members",
+                state.config.guard.clone(),
+                proxy.clone(),
+            );
+        }
+        Some(VoiceCommand::DiscordTogglePins) => {
+            spawn_key_async(
+                KeyAction::DiscordTogglePins,
+                "discord_toggle_pins",
+                state.config.guard.clone(),
+                proxy.clone(),
+            );
+        }
+        Some(VoiceCommand::DiscordToggleInbox) => {
+            spawn_key_async(
+                KeyAction::DiscordToggleInbox,
+                "discord_toggle_inbox",
+                state.config.guard.clone(),
+                proxy.clone(),
+            );
+        }
+        Some(VoiceCommand::DiscordSearch) => {
+            spawn_key_async(
+                KeyAction::DiscordSearch,
+                "discord_search",
+                state.config.guard.clone(),
+                proxy.clone(),
+            );
+        }
+        Some(VoiceCommand::DiscordQuickSwitcher) => {
+            spawn_key_async(
+                KeyAction::DiscordQuickSwitcher,
+                "discord_quick_switcher",
                 state.config.guard.clone(),
                 proxy.clone(),
             );
@@ -2434,17 +2522,28 @@ fn main() -> wry::Result<()> {
                     ClientCommand::DiscordRemoteAction { action, delay_ms } => {
                         let key_action = match action.as_str() {
                             "mute_mic" => KeyAction::DiscordMuteMic,
+                            "unmute_mic" => KeyAction::DiscordUnmuteMic,
                             "deafen" => KeyAction::DiscordDeafen,
+                            "undeafen" => KeyAction::DiscordUndeafen,
+                            "nav_back" => KeyAction::DiscordNavBack,
+                            "nav_forward" => KeyAction::DiscordNavForward,
                             "next_channel" => KeyAction::DiscordNextChannel,
                             "prev_channel" => KeyAction::DiscordPrevChannel,
+                            "prev_unread" => KeyAction::DiscordPrevUnread,
                             "next_unread" => KeyAction::DiscordNextUnread,
                             "next_server" => KeyAction::DiscordNextServer,
                             "prev_server" => KeyAction::DiscordPrevServer,
                             "scroll_up" => KeyAction::DiscordScrollUp,
                             "scroll_down" => KeyAction::DiscordScrollDown,
+                            "jump_present" => KeyAction::DiscordJumpPresent,
                             "edit_last" => KeyAction::DiscordEditLast,
+                            "enter" => KeyAction::Enter,
+                            "cancel_escape" => KeyAction::DiscordCancelEscape,
                             "mark_read" => KeyAction::DiscordMarkRead,
                             "toggle_members" => KeyAction::DiscordToggleMembers,
+                            "toggle_pins" => KeyAction::DiscordTogglePins,
+                            "toggle_inbox" => KeyAction::DiscordToggleInbox,
+                            "quick_switcher" => KeyAction::DiscordQuickSwitcher,
                             "search" => KeyAction::DiscordSearch,
                             _ => KeyAction::DiscordMuteMic,
                         };

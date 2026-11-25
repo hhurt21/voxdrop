@@ -62,10 +62,16 @@ impl TtsQueueController {
         let status_cb = Arc::new(on_status);
 
         thread::spawn(move || {
+            struct PlayingResetGuard;
+            impl Drop for PlayingResetGuard {
+                fn drop(&mut self) {
+                    set_tts_playing(false);
+                }
+            }
+            let _reset_on_exit = PlayingResetGuard;
+
             let engine = VoicevoxClient::new();
             let mut audio_out: Option<(OutputStream, rodio::OutputStreamHandle)> = None;
-            let mut consecutive_failures: u32 = 0;
-            let mut backoff_until: Option<Instant> = None;
 
             loop {
                 let (job, cfg, remaining_after_pop) = {
@@ -92,25 +98,9 @@ impl TtsQueueController {
                 // Clear any stale stop signal from a previous cancellation before starting this job
                 stop_bg.store(false, Ordering::SeqCst);
 
-                // Apply 10s backoff for automatic DM jobs after consecutive connection failures
-                if !job.is_manual_test {
-                    if let Some(until) = backoff_until {
-                        if Instant::now() < until {
-                            continue;
-                        }
-                    }
-                } else {
-                    consecutive_failures = 0;
-                    backoff_until = None;
-                }
-
-                // Synthesize via VOICEVOX Engine (auto-launch headlessly if enabled and not yet running)
+                // Synthesize via VOICEVOX Engine (fast TCP/health check & auto-launch if not yet running)
                 let wav_bytes = match engine.synthesize(&job.text, &cfg.voicevox) {
-                    Ok(bytes) => {
-                        consecutive_failures = 0;
-                        backoff_until = None;
-                        bytes
-                    }
+                    Ok(bytes) => bytes,
                     Err(first_err) => {
                         let retried = if cfg.voicevox.auto_launch {
                             status_cb(TtsStatusUpdate {
@@ -120,31 +110,20 @@ impl TtsQueueController {
                                 last_error: Some("VOICEVOX をバックグラウンド起動中...".into()),
                                 is_manual_test: job.is_manual_test,
                             });
-                            if crate::tts::launcher::ensure_running(
+                            match crate::tts::launcher::ensure_running(
                                 &cfg.voicevox.base_url,
                                 &cfg.voicevox.exe_path,
-                            )
-                            .is_ok()
-                            {
-                                engine.synthesize(&job.text, &cfg.voicevox)
-                            } else {
-                                Err(first_err)
+                            ) {
+                                Ok(_) => engine.synthesize(&job.text, &cfg.voicevox),
+                                Err(launch_err) => Err(launch_err),
                             }
                         } else {
                             Err(first_err)
                         };
 
                         match retried {
-                            Ok(bytes) => {
-                                consecutive_failures = 0;
-                                backoff_until = None;
-                                bytes
-                            }
+                            Ok(bytes) => bytes,
                             Err(err) => {
-                                consecutive_failures = consecutive_failures.saturating_add(1);
-                                if consecutive_failures >= 2 {
-                                    backoff_until = Some(Instant::now() + Duration::from_secs(10));
-                                }
                                 eprintln!("[voxdrop tts warning] {}", err);
                                 status_cb(TtsStatusUpdate {
                                     connected: false,
@@ -202,10 +181,6 @@ impl TtsQueueController {
                         playback_failed = true;
                     }
                 }
-                if playback_failed {
-                    // Re-open default audio device on next job in case output device switched
-                    audio_out = None;
-                }
 
                 // Wait echo-guard tail window when no next job is immediately waiting (or stopped)
                 let has_more = shared_bg
@@ -213,6 +188,12 @@ impl TtsQueueController {
                     .lock()
                     .map(|g| !g.jobs.is_empty() && !g.shutdown)
                     .unwrap_or(false);
+
+                // Drop WASAPI output stream whenever queue drains or on failure so device switches /
+                // sleeping wireless headsets NEVER leave audio_out stuck on a dead audio endpoint!
+                if !has_more || playback_failed {
+                    audio_out = None;
+                }
 
                 if cfg.pause_stt_while_speaking && (!has_more || stop_bg.load(Ordering::SeqCst)) {
                     let tail_ms = cfg.echo_guard_tail_ms.min(2000);
@@ -236,8 +217,6 @@ impl TtsQueueController {
                     is_manual_test: false,
                 });
             }
-
-            set_tts_playing(false);
         });
 
         Self { shared, stop_flag }

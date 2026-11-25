@@ -339,22 +339,48 @@ impl VoicevoxClient {
         parse_speakers_json(&bytes)
     }
 
-    /// `POST /audio_query` (5s) -> override scales -> `POST /synthesis` (10s) -> WAV bytes.
+    /// `POST /audio_query` (15s) -> override scales -> `POST /synthesis` (30s) -> WAV bytes.
+    /// Automatically retries transient errors once and falls back to the first available speaker
+    /// if the configured `speaker_id` is rejected (HTTP 400/422) by the active engine.
     pub fn synthesize_wav(&self, text: &str, cfg: &VoicevoxConfig) -> Result<Vec<u8>, String> {
-        let trimmed = text.trim();
+        let cleaned: String = text
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        let trimmed = cleaned.trim();
         if trimmed.is_empty() {
             return Err("読み上げテキストが空です".into());
         }
         let base = parse_base_url(&cfg.base_url)?;
         let encoded = percent_encode_utf8(trimmed);
-        let query_path = format!("/audio_query?text={}&speaker={}", encoded, cfg.speaker_id);
 
-        let (q_status, q_bytes) =
-            winhttp_bytes_request(&base, "POST", &query_path, None, Some(b""), 15_000)?;
+        let mut active_speaker = cfg.speaker_id;
+        let query_path = format!("/audio_query?text={}&speaker={}", encoded, active_speaker);
+
+        let (mut q_status, mut q_bytes) =
+            winhttp_request_with_retry(&base, "POST", &query_path, None, Some(b""), 15_000)?;
+
+        // Fallback gracefully if user switched engine / speaker_id does not exist on this engine
+        if (q_status == 400 || q_status == 422) && cfg.speaker_id != 0 {
+            if let Ok(speakers) = self.get_speakers(&cfg.base_url) {
+                if let Some(first) = speakers.first() {
+                    active_speaker = first.id;
+                    let fb_path =
+                        format!("/audio_query?text={}&speaker={}", encoded, active_speaker);
+                    if let Ok((st, by)) =
+                        winhttp_request_with_retry(&base, "POST", &fb_path, None, Some(b""), 15_000)
+                    {
+                        q_status = st;
+                        q_bytes = by;
+                    }
+                }
+            }
+        }
+
         if !(200..300).contains(&q_status) {
             return Err(format!(
                 "VOICEVOX /audio_query が HTTP {} を返しました（話者ID {} を確認してください）",
-                q_status, cfg.speaker_id
+                q_status, active_speaker
             ));
         }
 
@@ -364,8 +390,8 @@ impl VoicevoxClient {
         let synth_body = serde_json::to_vec(&query_json)
             .map_err(|e| format!("AudioQuery JSON のシリアライズに失敗しました: {}", e))?;
 
-        let synth_path = format!("/synthesis?speaker={}", cfg.speaker_id);
-        let (s_status, wav_bytes) = winhttp_bytes_request(
+        let synth_path = format!("/synthesis?speaker={}", active_speaker);
+        let (s_status, wav_bytes) = winhttp_request_with_retry(
             &base,
             "POST",
             &synth_path,
@@ -383,6 +409,23 @@ impl VoicevoxClient {
             return Err("VOICEVOX から有効な WAV データが返されませんでした".into());
         }
         Ok(wav_bytes)
+    }
+}
+
+fn winhttp_request_with_retry(
+    base: &ParsedBaseUrl,
+    method: &str,
+    path_and_query: &str,
+    content_type: Option<&str>,
+    body: Option<&[u8]>,
+    timeout_ms: i32,
+) -> Result<(u32, Vec<u8>), String> {
+    match winhttp_bytes_request(base, method, path_and_query, content_type, body, timeout_ms) {
+        Ok(ok) => Ok(ok),
+        Err(_first_err) => {
+            std::thread::sleep(std::time::Duration::from_millis(350));
+            winhttp_bytes_request(base, method, path_and_query, content_type, body, timeout_ms)
+        }
     }
 }
 

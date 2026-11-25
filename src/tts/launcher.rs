@@ -140,14 +140,22 @@ pub fn ensure_running(base_url: &str, configured_path: &str) -> Result<String, S
         }
     }
 
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(45);
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(500));
         if let Ok(ver) = client.check_health(base_url) {
             return Ok(format!("VOICEVOX をバックグラウンドで起動しました (v{})", ver));
         }
+        let exited = ENGINE_PROC
+            .lock()
+            .ok()
+            .and_then(|mut g| g.as_mut().and_then(|c| c.try_wait().ok().flatten()))
+            .is_some();
+        if exited {
+            return Err("VOICEVOX エンジンが起動直後に終了しました（実行ファイルやポート競合を確認してください）".into());
+        }
     }
-    Err("VOICEVOX を起動しましたが応答がありません（30秒タイムアウト）".into())
+    Err("VOICEVOX を起動しましたが応答がありません（45秒タイムアウト）".into())
 }
 
 /// Stops the engine only if VoxDrop started it.

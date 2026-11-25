@@ -8,8 +8,9 @@ use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
     KEYEVENTF_KEYUP, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT,
-    VIRTUAL_KEY, VK_A, VK_BACK, VK_CONTROL, VK_D, VK_DOWN, VK_ESCAPE, VK_F, VK_K, VK_M, VK_MENU,
-    VK_NEXT, VK_PRIOR, VK_RETURN, VK_SHIFT, VK_U, VK_UP, VK_V, VK_Z,
+    VIRTUAL_KEY, VK_A, VK_BACK, VK_CONTROL, VK_D, VK_DOWN, VK_ESCAPE, VK_F, VK_I, VK_K, VK_LEFT,
+    VK_M, VK_MENU, VK_NEXT, VK_P, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_U, VK_UP, VK_V,
+    VK_Z,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, PostMessageW, SetCursorPos, WM_CHAR, WM_KEYDOWN, WM_KEYUP,
@@ -44,24 +45,34 @@ pub enum KeyAction {
     Escape,
     ClearAll,
     BackSpace(usize),
-    // Discord remote control actions
+    // Discord remote control actions (all reversible / bidirectional)
     DiscordMuteMic,
+    DiscordUnmuteMic,
     DiscordDeafen,
+    DiscordUndeafen,
+    DiscordNavBack,
+    DiscordNavForward,
     DiscordNextChannel,
     DiscordPrevChannel,
+    DiscordPrevUnread,
     DiscordNextUnread,
     DiscordNextServer,
     DiscordPrevServer,
     DiscordScrollUp,
     DiscordScrollDown,
+    DiscordJumpPresent,
     DiscordEditLast,
+    DiscordCancelEscape,
     DiscordMarkRead,
     DiscordToggleMembers,
+    DiscordTogglePins,
+    DiscordToggleInbox,
+    DiscordQuickSwitcher,
     DiscordSearch,
 }
 
 fn is_extended_key(vk: VIRTUAL_KEY) -> bool {
-    matches!(vk, VK_UP | VK_DOWN | VK_PRIOR | VK_NEXT)
+    matches!(vk, VK_UP | VK_DOWN | VK_LEFT | VK_RIGHT | VK_PRIOR | VK_NEXT)
 }
 
 fn key_input(vk: VIRTUAL_KEY, key_up: bool) -> INPUT {
@@ -228,10 +239,17 @@ fn send_key_action_unlocked(action: KeyAction) -> Result<(), String> {
             Ok(())
         }
         // Discord official keyboard & mouse-wheel shortcuts
-        KeyAction::DiscordMuteMic => send_combo3(VK_CONTROL, VK_SHIFT, VK_M),
-        KeyAction::DiscordDeafen => send_combo3(VK_CONTROL, VK_SHIFT, VK_D),
+        KeyAction::DiscordMuteMic | KeyAction::DiscordUnmuteMic => {
+            send_combo3(VK_CONTROL, VK_SHIFT, VK_M)
+        }
+        KeyAction::DiscordDeafen | KeyAction::DiscordUndeafen => {
+            send_combo3(VK_CONTROL, VK_SHIFT, VK_D)
+        }
+        KeyAction::DiscordNavBack => send_combo(VK_MENU, VK_LEFT),
+        KeyAction::DiscordNavForward => send_combo(VK_MENU, VK_RIGHT),
         KeyAction::DiscordNextChannel => send_combo(VK_MENU, VK_DOWN),
         KeyAction::DiscordPrevChannel => send_combo(VK_MENU, VK_UP),
+        KeyAction::DiscordPrevUnread => send_combo3(VK_MENU, VK_SHIFT, VK_UP),
         KeyAction::DiscordNextUnread => send_combo3(VK_MENU, VK_SHIFT, VK_DOWN),
         KeyAction::DiscordNextServer => send_combo3(VK_CONTROL, VK_MENU, VK_DOWN),
         KeyAction::DiscordPrevServer => send_combo3(VK_CONTROL, VK_MENU, VK_UP),
@@ -246,11 +264,52 @@ fn send_key_action_unlocked(action: KeyAction) -> Result<(), String> {
             let _ = send_inputs(&[mouse_wheel_input(-360)]);
             Ok(())
         }
+        KeyAction::DiscordJumpPresent => send_combo(VK_SHIFT, VK_NEXT),
         KeyAction::DiscordEditLast => send_single_key(VK_UP),
+        KeyAction::DiscordCancelEscape => send_single_key(VK_ESCAPE),
         KeyAction::DiscordMarkRead => send_combo(VK_SHIFT, VK_ESCAPE),
         KeyAction::DiscordToggleMembers => send_combo(VK_CONTROL, VK_U),
+        KeyAction::DiscordTogglePins => send_combo(VK_CONTROL, VK_P),
+        KeyAction::DiscordToggleInbox => send_combo(VK_CONTROL, VK_I),
+        KeyAction::DiscordQuickSwitcher => send_combo(VK_CONTROL, VK_K),
         KeyAction::DiscordSearch => send_combo(VK_CONTROL, VK_F),
     }
+}
+
+/// Maps simple non-modifier `KeyAction`s to a virtual key for `PostMessageW` (non-SendInput).
+pub fn window_message_single_vk(action: KeyAction) -> Option<VIRTUAL_KEY> {
+    match action {
+        KeyAction::Enter => Some(VK_RETURN),
+        KeyAction::Escape | KeyAction::DiscordCancelEscape => Some(VK_ESCAPE),
+        KeyAction::UpArrow | KeyAction::DiscordEditLast => Some(VK_UP),
+        KeyAction::DownArrow => Some(VK_DOWN),
+        KeyAction::DiscordScrollUp => Some(VK_PRIOR),
+        KeyAction::DiscordScrollDown => Some(VK_NEXT),
+        _ => None,
+    }
+}
+
+/// Posts a single non-modifier key down+up directly via `PostMessageW` (zero `SendInput`).
+pub fn post_key_window_message(target_hwnd: HWND, vk: VIRTUAL_KEY) -> Result<(), String> {
+    let _guard = INPUT_MUTEX
+        .lock()
+        .map_err(|_| "入力ロックの取得に失敗しました".to_string())?;
+    if target_hwnd.0.is_null() {
+        return Err("送信先ウィンドウハンドルが無効です".into());
+    }
+    unsafe {
+        PostMessageW(Some(target_hwnd), WM_KEYDOWN, WPARAM(vk.0 as usize), LPARAM(1))
+            .map_err(|e| format!("PostMessageW(WM_KEYDOWN) に失敗しました: {}", e))?;
+        thread::sleep(Duration::from_millis(12));
+        PostMessageW(
+            Some(target_hwnd),
+            WM_KEYUP,
+            WPARAM(vk.0 as usize),
+            LPARAM(0xC000_0001u32 as isize),
+        )
+        .map_err(|e| format!("PostMessageW(WM_KEYUP) に失敗しました: {}", e))?;
+    }
+    Ok(())
 }
 
 /// Copies `text` to the system clipboard WITHOUT issuing any `SendInput` or `SetCursorPos` calls

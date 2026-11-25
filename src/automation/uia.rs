@@ -18,8 +18,9 @@ use windows::Win32::System::Threading::{
 use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationInvokePattern,
-    IUIAutomationTreeWalker, TreeScope_Descendants, UIA_ButtonControlTypeId,
-    UIA_ControlTypePropertyId, UIA_EditControlTypeId, UIA_InvokePatternId, UIA_NamePropertyId,
+    IUIAutomationTogglePattern, IUIAutomationTreeWalker, ToggleState_On, TreeScope_Descendants,
+    UIA_ButtonControlTypeId, UIA_ControlTypePropertyId, UIA_EditControlTypeId, UIA_InvokePatternId,
+    UIA_NamePropertyId, UIA_TogglePatternId,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
@@ -661,6 +662,108 @@ pub fn is_discord_chat_composer_label(label: &str) -> bool {
         || s.contains("にメッセージを送信")
         || lower.starts_with("message @")
         || lower.starts_with("message #")
+}
+
+/// Checks Discord's voice control UI button (Mic Mute / Deafen) via UIA without mouse/keyboard,
+/// and optionally toggles it ONLY if `desired_muted` differs from the live state (`invoke_toggle = true`).
+/// Returns `Some(Ok((was_already_target, action_msg)))` if the UIA control was found.
+pub fn handle_discord_audio_toggle_uia(
+    allowed_processes: &[String],
+    is_deafen: bool,
+    desired_muted: bool,
+    allow_uia_toggle: bool,
+) -> Option<(bool, String)> {
+    let (hwnd, _) = find_discord_window(allowed_processes)?;
+    let labels: &[(&str, Option<bool>)] = if is_deafen {
+        &[
+            ("スピーカーミュート解除", Some(true)),
+            ("スピーカーミュート", None),
+            ("Undeafen", Some(true)),
+            ("Deafen", None),
+        ]
+    } else {
+        &[
+            ("ミュート解除", Some(true)),
+            ("ミュート", None),
+            ("Unmute", Some(true)),
+            ("Mute", None),
+        ]
+    };
+    let target_label = if is_deafen { "スピーカー" } else { "マイク" };
+
+    let mut found_result: Option<(bool, String)> = None;
+    unsafe {
+        let com_inited = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
+        if let Ok(uia) =
+            CoCreateInstance::<_, IUIAutomation>(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
+        {
+            if let Ok(root) = uia.ElementFromHandle(hwnd) {
+                for &(name_str, label_implies_muted) in labels {
+                    if let Ok(name_cond) =
+                        uia.CreatePropertyCondition(UIA_NamePropertyId, &VARIANT::from(name_str))
+                    {
+                        if let Ok(elem) = root.FindFirst(TreeScope_Descendants, &name_cond) {
+                            let toggle_pat = elem
+                                .GetCurrentPatternAs::<IUIAutomationTogglePattern>(UIA_TogglePatternId)
+                                .ok();
+                            let current_muted = if let Some(ref tp) = toggle_pat {
+                                tp.CurrentToggleState()
+                                    .map(|st| st == ToggleState_On)
+                                    .unwrap_or(false)
+                            } else if let Some(m) = label_implies_muted {
+                                m
+                            } else {
+                                false
+                            };
+
+                            if current_muted == desired_muted {
+                                let state_txt = if desired_muted {
+                                    "すでにミュート中です"
+                                } else {
+                                    "すでにミュート解除されています"
+                                };
+                                found_result =
+                                    Some((true, format!("{}は{}", target_label, state_txt)));
+                                break;
+                            }
+
+                            if allow_uia_toggle {
+                                let mut toggled = false;
+                                if let Some(ref tp) = toggle_pat {
+                                    if tp.Toggle().is_ok() {
+                                        toggled = true;
+                                    }
+                                } else if let Ok(ip) = elem
+                                    .GetCurrentPatternAs::<IUIAutomationInvokePattern>(
+                                        UIA_InvokePatternId,
+                                    )
+                                {
+                                    if ip.Invoke().is_ok() {
+                                        toggled = true;
+                                    }
+                                }
+                                if toggled {
+                                    let done_txt = if desired_muted {
+                                        "をミュートにしました"
+                                    } else {
+                                        "のミュートを解除しました"
+                                    };
+                                    found_result =
+                                        Some((false, format!("{}{}", target_label, done_txt)));
+                                    break;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if com_inited {
+            CoUninitialize();
+        }
+    }
+    found_result
 }
 
 #[cfg(test)]

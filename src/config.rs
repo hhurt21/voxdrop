@@ -30,19 +30,30 @@ pub struct VoiceCommandsConfig {
     pub newline: Vec<String>,
     pub mute: Vec<String>,
     pub resume: Vec<String>,
-    // Discord remote control voice commands
+    // Discord remote control voice commands (reversible pairs)
     pub discord_mute_mic: Vec<String>,
+    pub discord_unmute_mic: Vec<String>,
     pub discord_deafen: Vec<String>,
+    pub discord_undeafen: Vec<String>,
+    pub discord_nav_back: Vec<String>,
+    pub discord_nav_forward: Vec<String>,
     pub discord_next_channel: Vec<String>,
     pub discord_prev_channel: Vec<String>,
+    pub discord_prev_unread: Vec<String>,
     pub discord_next_unread: Vec<String>,
     pub discord_next_server: Vec<String>,
     pub discord_prev_server: Vec<String>,
     pub discord_scroll_up: Vec<String>,
     pub discord_scroll_down: Vec<String>,
+    pub discord_jump_present: Vec<String>,
     pub discord_edit_last: Vec<String>,
+    pub discord_cancel_escape: Vec<String>,
     pub discord_mark_read: Vec<String>,
     pub discord_toggle_members: Vec<String>,
+    pub discord_toggle_pins: Vec<String>,
+    pub discord_toggle_inbox: Vec<String>,
+    pub discord_search: Vec<String>,
+    pub discord_quick_switcher: Vec<String>,
 }
 
 impl Default for VoiceCommandsConfig {
@@ -58,14 +69,44 @@ impl Default for VoiceCommandsConfig {
                 "通話ミュート".into(),
                 "ボイチャミュート".into(),
                 "マイクミュート".into(),
+                "マイクオフ".into(),
+            ],
+            discord_unmute_mic: vec![
+                "ミュート解除".into(),
+                "マイク解除".into(),
+                "マイク戻して".into(),
+                "マイクオン".into(),
+                "通話復帰".into(),
             ],
             discord_deafen: vec![
                 "スピーカーミュート".into(),
                 "デフン".into(),
                 "通話音消して".into(),
+                "聞こえなくして".into(),
+            ],
+            discord_undeafen: vec![
+                "スピーカー解除".into(),
+                "デフン解除".into(),
+                "スピーカー戻して".into(),
+                "通話音戻して".into(),
+                "聞こえるようにして".into(),
+            ],
+            discord_nav_back: vec![
+                "前の画面".into(),
+                "画面戻して".into(),
+                "前に戻る".into(),
+            ],
+            discord_nav_forward: vec![
+                "次の画面".into(),
+                "画面進めて".into(),
+                "次に進む".into(),
             ],
             discord_next_channel: vec!["次のチャンネル".into(), "下のチャンネル".into()],
             discord_prev_channel: vec!["前のチャンネル".into(), "上のチャンネル".into()],
+            discord_prev_unread: vec![
+                "前の未読".into(),
+                "上の未読".into(),
+            ],
             discord_next_unread: vec![
                 "未読へ".into(),
                 "次の未読".into(),
@@ -81,15 +122,33 @@ impl Default for VoiceCommandsConfig {
             discord_scroll_down: vec![
                 "下にスクロール".into(),
                 "下スクロール".into(),
+            ],
+            discord_jump_present: vec![
                 "最新へ".into(),
+                "一番下へ".into(),
+                "最新に戻って".into(),
             ],
             discord_edit_last: vec![
                 "直前を編集".into(),
                 "さっきの編集".into(),
                 "メッセージ編集".into(),
             ],
+            discord_cancel_escape: vec![
+                "編集キャンセル".into(),
+                "検索を閉じる".into(),
+                "画面を閉じて".into(),
+                "操作取り消し".into(),
+            ],
             discord_mark_read: vec!["既読にして".into(), "全部既読".into()],
-            discord_toggle_members: vec!["メンバー表示".into(), "メンバーリスト".into()],
+            discord_toggle_members: vec![
+                "メンバー表示".into(),
+                "メンバー非表示".into(),
+                "メンバーリスト".into(),
+            ],
+            discord_toggle_pins: vec!["ピン留め表示".into(), "ピン留め".into()],
+            discord_toggle_inbox: vec!["受信トレイ".into(), "通知一覧".into()],
+            discord_search: vec!["チャンネル検索".into(), "メッセージ検索".into()],
+            discord_quick_switcher: vec!["クイックスイッチャー".into(), "クイック切替".into()],
         }
     }
 }
