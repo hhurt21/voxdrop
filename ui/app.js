@@ -561,6 +561,7 @@
     $("chkGuardEnabled").checked = !!cfg.guard.enabled;
     $("chkGuardAutoFocus").checked = cfg.guard.auto_focus_discord !== false;
     $("chkGuardRestoreWindow").checked = cfg.guard.restore_previous_window !== false;
+    $("guardSendMethod").value = cfg.guard.send_method || "auto_paste";
     $("allowedProcesses").value = joinCsv(cfg.guard.allowed_processes);
     $("clipboardDelay").value = cfg.guard.clipboard_restore_delay_ms;
 
@@ -772,6 +773,7 @@
         enabled: $("chkGuardEnabled").checked,
         auto_focus_discord: $("chkGuardAutoFocus").checked,
         restore_previous_window: $("chkGuardRestoreWindow").checked,
+        send_method: $("guardSendMethod").value || "auto_paste",
         allowed_processes: splitCsv($("allowedProcesses").value),
         clipboard_restore_delay_ms: parseInt($("clipboardDelay").value, 10) || 80,
       },
@@ -1013,6 +1015,7 @@
   $("chkBotSend").addEventListener("change", saveNow);
   $("chkGuardAutoFocus").addEventListener("change", saveNow);
   $("chkGuardRestoreWindow").addEventListener("change", saveNow);
+  $("guardSendMethod").addEventListener("change", saveNow);
 
   $("btnSyncBot").addEventListener("click", () => {
     const token = $("botTokenInput").value.trim();

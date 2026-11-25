@@ -3,7 +3,9 @@ pub mod input;
 pub mod uia;
 pub mod window;
 
-use crate::config::{DiscordIntegrationConfig, DiscordTarget, DiscordTargetKind, GuardConfig};
+use crate::config::{
+    DiscordIntegrationConfig, DiscordTarget, DiscordTargetKind, GuardConfig, SendMethod,
+};
 use input::KeyAction;
 use std::sync::Mutex;
 use std::thread;
@@ -50,7 +52,8 @@ fn maybe_restore(restore_hwnd: Option<isize>) {
     }
 }
 
-/// Pastes text into the active (or auto-focused Discord) window with clipboard backup/restore.
+/// Pastes text into the active (or auto-focused Discord) window with clipboard backup/restore,
+/// or copies to clipboard only when `guard.send_method` avoids `SendInput`.
 pub fn paste_text_guarded(
     text: &str,
     press_enter: bool,
@@ -58,6 +61,14 @@ pub fn paste_text_guarded(
 ) -> Result<String, String> {
     if text.is_empty() && !press_enter {
         return Ok("送信テキストが空のためスキップしました".into());
+    }
+    let (already_allowed, _) = check_target(guard);
+    if guard.should_avoid_send_input(already_allowed) {
+        if text.is_empty() {
+            return Ok("セーフモード中のため Enter 送信をスキップしました".into());
+        }
+        input::copy_text_to_clipboard_only(text)?;
+        return Ok("セーフモード: SendInputを使わずクリップボードへコピーしました（Ctrl+Vで貼り付け）".into());
     }
     let (restore_hwnd, proc_name) = prepare_foreground(guard)?;
 
@@ -115,6 +126,21 @@ pub fn navigate_and_focus_discord_target(
                 discord::target_display_label(Some(target))
             ));
         }
+    }
+
+    let (already_allowed, _) = check_target(guard);
+    if guard.send_method == SendMethod::NoSendInput
+        || (guard.send_method == SendMethod::SafeWhenGameActive && !already_allowed)
+    {
+        if guard.send_method == SendMethod::NoSendInput {
+            if let Some(link) = discord::build_deep_link(target) {
+                let _ = discord::open_deep_link(&link);
+            }
+        }
+        return Ok(format!(
+            "{}（セーフモード: SendInput / マウス移動をスキップ）",
+            discord::target_display_label(Some(target))
+        ));
     }
 
     if let Some(link) = discord::build_deep_link(target) {
@@ -229,6 +255,18 @@ pub fn send_to_discord_target(
     let prev_hwnd = window::get_foreground_hwnd_raw();
     let (already_allowed, _) = check_target(guard);
 
+    if guard.should_avoid_send_input(already_allowed) {
+        if formatted.is_empty() {
+            return Ok("セーフモード中のため空送信をスキップしました".into());
+        }
+        input::copy_text_to_clipboard_only(&formatted)?;
+        let label = discord::target_display_label(target);
+        return Ok(format!(
+            "{} → セーフモード: SendInputを使わずクリップボードへコピーしました（Discordで Ctrl+V → Enter）",
+            label
+        ));
+    }
+
     if let Some(t) = target {
         if auto_navigate {
             let _ = navigate_and_focus_discord_target(t, guard, navigate_delay_ms, true);
@@ -275,6 +313,13 @@ pub fn send_to_discord_target(
 
 /// Sends a keyboard or mouse-wheel command action (auto-focusing Discord if configured).
 pub fn send_action_guarded(action: KeyAction, guard: &GuardConfig) -> Result<String, String> {
+    let (already_allowed, _) = check_target(guard);
+    if guard.should_avoid_send_input(already_allowed) {
+        return Ok(format!(
+            "セーフモード中のためキー操作({:?})をスキップしました",
+            action
+        ));
+    }
     let (restore_hwnd, proc_name) = prepare_foreground(guard)?;
     let res = input::send_key_action(action);
     maybe_restore(restore_hwnd);

@@ -251,6 +251,22 @@ fn send_key_action_unlocked(action: KeyAction) -> Result<(), String> {
     }
 }
 
+/// Copies `text` to the system clipboard WITHOUT issuing any `SendInput` or `SetCursorPos` calls
+/// (safe for strict anti-cheat environments).
+pub fn copy_text_to_clipboard_only(text: &str) -> Result<(), String> {
+    let _guard = INPUT_MUTEX
+        .lock()
+        .map_err(|_| "クリップボード操作ロックの取得に失敗しました".to_string())?;
+    LAST_OWN_CLIPBOARD_MS.store(now_ms(), Ordering::Relaxed);
+    let mut clipboard = Clipboard::new()
+        .map_err(|e| format!("クリップボードのオープンに失敗しました: {}", e))?;
+    clipboard
+        .set_text(text.to_string())
+        .map_err(|e| format!("クリップボードへの書き込みに失敗しました: {}", e))?;
+    LAST_OWN_CLIPBOARD_MS.store(now_ms(), Ordering::Relaxed);
+    Ok(())
+}
+
 /// Safely backs up current clipboard text, pastes `text` via Ctrl+V (and optional Enter),
 /// waits `restore_delay_ms` (default 50..100ms), and restores the original clipboard text.
 pub fn paste_with_clipboard_restore(

@@ -660,6 +660,21 @@
         <!-- Guard & Automation Tab -->
         <section class="tab-panel" id="tab-guard">
           <div class="card">
+            <h3>アンチチート配慮・送信方式（SendInput の制御）</h3>
+            <label style="display: block">
+              送信方式
+              <select id="guardSendMethod" class="input" style="margin-top: 6px">
+                <option value="auto_paste">標準: 自動貼り付け＋送信（SendInput で完全ハンズフリー）</option>
+                <option value="safe_when_game_active">ゲーム中セーフ: ゲーム最前面時は SendInput を止め Webhook/Bot またはクリップボードコピーに切替</option>
+                <option value="no_send_input">完全セーフ: SendInput・マウス移動を一切使わない（Webhook/Bot裏送信 ＋ DM等はクリップボードコピーのみ）</option>
+              </select>
+            </label>
+            <p class="hint">
+              アンチチート搭載ゲームと同時に使う場合は「ゲーム中セーフ」または「完全セーフ」を選択してください。グローバルホットキーも無効にする場合は「詳細設定」タブのホットキー欄を空欄にしてください。
+            </p>
+          </div>
+
+          <div class="card">
             <h3>対象プロセス限定ガード &amp; 非アクティブ時自動フォーカス</h3>
             <div class="toggle-grid">
               <label class="checkbox-row">

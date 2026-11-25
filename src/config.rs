@@ -333,6 +333,23 @@ impl DiscordTargetsConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SendMethod {
+    /// 標準: Discord へ自動フォーカスし SendInput (Ctrl+V / Enter) で自動送信
+    AutoPaste,
+    /// ゲーム中セーフ: Discord 以外が最前面のときは SendInput を使わず Webhook/Bot またはクリップボードコピーのみ
+    SafeWhenGameActive,
+    /// 完全セーフ: SendInput / SetCursorPos を一切使わず、Webhook/Bot 送信＋クリップボードコピーのみ
+    NoSendInput,
+}
+
+impl Default for SendMethod {
+    fn default() -> Self {
+        Self::AutoPaste
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GuardConfig {
@@ -343,6 +360,18 @@ pub struct GuardConfig {
     pub auto_focus_discord: bool,
     /// 自動フォーカスで送信した後、元のウィンドウ（ゲーム等）へフォーカスを戻す（デフォルト: true）
     pub restore_previous_window: bool,
+    /// アンチチート干渉回避のための SendInput 制御方式
+    pub send_method: SendMethod,
+}
+
+impl GuardConfig {
+    pub fn should_avoid_send_input(&self, target_already_foreground: bool) -> bool {
+        match self.send_method {
+            SendMethod::AutoPaste => false,
+            SendMethod::NoSendInput => true,
+            SendMethod::SafeWhenGameActive => !target_already_foreground,
+        }
+    }
 }
 
 impl Default for GuardConfig {
@@ -357,6 +386,7 @@ impl Default for GuardConfig {
             clipboard_restore_delay_ms: 80,
             auto_focus_discord: true,
             restore_previous_window: true,
+            send_method: SendMethod::AutoPaste,
         }
     }
 }
@@ -673,6 +703,17 @@ mod tests {
         assert!(parsed.discord_tts.pause_stt_while_speaking);
         assert_eq!(parsed.discord_tts.voicevox.base_url, "http://127.0.0.1:50021");
         assert_eq!(parsed.discord_tts.voicevox.speaker_id, 3);
+        assert_eq!(parsed.guard.send_method, SendMethod::AutoPaste);
+        assert!(!parsed.guard.should_avoid_send_input(false));
+
+        let mut g = GuardConfig::default();
+        g.send_method = SendMethod::SafeWhenGameActive;
+        assert!(g.should_avoid_send_input(false));
+        assert!(!g.should_avoid_send_input(true));
+
+        g.send_method = SendMethod::NoSendInput;
+        assert!(g.should_avoid_send_input(false));
+        assert!(g.should_avoid_send_input(true));
     }
 
     #[test]
