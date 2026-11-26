@@ -1,8 +1,9 @@
 use crate::audio::vad::TARGET_SAMPLE_RATE;
 use crate::config::SttConfig;
+use crate::stt::http_asr::LocalHttpAsrEngine;
 use crate::stt::sherpa_ffi::{ResidentModelSpec, ResidentSherpaRecognizer, SpeechDenoiserSpec};
 use crate::stt::whisper_ffi::ResidentWhisperRecognizer;
-use crate::stt::SttEngine;
+use crate::stt::{SttEngine, TranscribeContext};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -88,6 +89,44 @@ enum SherpaModelKind {
         model: PathBuf,
         tokens: PathBuf,
     },
+    Qwen3Asr {
+        conv_frontend: PathBuf,
+        encoder: PathBuf,
+        decoder: PathBuf,
+        tokenizer: PathBuf,
+    },
+}
+
+/// Checks whether a sherpa-onnx Qwen3-ASR model directory is installed under `model_dir`.
+pub fn has_qwen3_asr_model(cfg: &SttConfig, runtime_dir: Option<&Path>) -> bool {
+    let Some(dir) = resolve_model_dir(&cfg.model_dir, runtime_dir) else {
+        return false;
+    };
+    discover_sherpa_qwen3_model(&dir).is_some()
+}
+
+/// Resolves the writable target directory for downloading external models.
+pub fn resolve_download_model_dir(configured: &str, runtime_dir: Option<&Path>) -> PathBuf {
+    let raw = PathBuf::from(configured.trim());
+    if !configured.trim().is_empty() && (raw.is_absolute() || raw.exists()) {
+        return raw;
+    }
+    if let Some(dir) = exe_dir() {
+        let candidate = dir.join(if configured.trim().is_empty() {
+            "models"
+        } else {
+            configured.trim()
+        });
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    if !configured.trim().is_empty() {
+        return raw;
+    }
+    runtime_dir
+        .map(|rt| rt.join("models"))
+        .unwrap_or_else(|| PathBuf::from("models"))
 }
 
 /// Lists available GGML Whisper `.bin` model filenames ordered by quality priority.
@@ -114,7 +153,7 @@ fn collect_ggml_models(dir: &Path) -> Vec<PathBuf> {
         if path.is_file() {
             if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
                 let l = name.to_ascii_lowercase();
-                if l.ends_with(".bin") && (l.contains("kotoba") || l.contains("ggml") || l.contains("whisper")) {
+                if l.ends_with(".bin") {
                     found.push(path);
                 }
             }
@@ -129,7 +168,7 @@ fn collect_ggml_models(dir: &Path) -> Vec<PathBuf> {
                 if path.is_file() {
                     if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
                         let l = name.to_ascii_lowercase();
-                        if l.ends_with(".bin") && (l.contains("kotoba") || l.contains("ggml") || l.contains("whisper")) {
+                        if l.ends_with(".bin") {
                             found.push(path);
                         }
                     }
@@ -253,8 +292,16 @@ impl WhisperResidentEngine {
 }
 
 impl SttEngine for WhisperResidentEngine {
+    fn id(&self) -> &'static str {
+        "whisper-cpp"
+    }
+
     fn name(&self) -> String {
         self.label.clone()
+    }
+
+    fn device_name(&self) -> String {
+        self.recognizer.device_name().to_string()
     }
 
     fn is_ready(&self) -> bool {
@@ -274,6 +321,18 @@ impl SttEngine for WhisperResidentEngine {
             .transcribe_with_clarity(samples_16k, radio_clarity)
     }
 
+    fn transcribe_with_context(
+        &self,
+        samples_16k: &[f32],
+        ctx: &TranscribeContext,
+    ) -> Result<String, String> {
+        if let Some(ref prompt) = ctx.hotwords_prompt {
+            self.recognizer.set_prompt_hints(prompt);
+        }
+        self.recognizer
+            .transcribe_with_clarity(samples_16k, ctx.radio_clarity)
+    }
+
     fn set_prompt_hints(&self, hints: &str) {
         self.recognizer.set_prompt_hints(hints);
     }
@@ -282,10 +341,52 @@ impl SttEngine for WhisperResidentEngine {
 /// Ultra-fast resident in-memory `sherpa-onnx-c-api.dll` STT engine (zero reload latency).
 pub struct SherpaResidentEngine {
     label: String,
+    #[allow(dead_code)]
+    is_qwen3: bool,
     recognizer: ResidentSherpaRecognizer,
 }
 
 impl SherpaResidentEngine {
+    pub fn discover_qwen3(cfg: &SttConfig, runtime_dir: Option<&Path>) -> Option<Self> {
+        let dll_path = find_file_in_search_dirs(
+            "",
+            &["sherpa-onnx-c-api.dll"],
+            runtime_dir,
+        )?;
+        let model_dir = resolve_model_dir(&cfg.model_dir, runtime_dir)?;
+        let SherpaModelKind::Qwen3Asr {
+            conv_frontend,
+            encoder,
+            decoder,
+            tokenizer,
+        } = discover_sherpa_qwen3_model(&model_dir)?
+        else {
+            return None;
+        };
+
+        let spec = ResidentModelSpec::Qwen3Asr {
+            conv_frontend: &conv_frontend,
+            encoder: &encoder,
+            decoder: &decoder,
+            tokenizer: &tokenizer,
+            hotwords: "",
+        };
+        match ResidentSherpaRecognizer::load(&dll_path, spec, None, cfg.threads) {
+            Ok(recognizer) => {
+                let label = format!("sherpa-onnx Qwen3-ASR 0.6B ({})", recognizer.device_name());
+                Some(Self {
+                    label,
+                    is_qwen3: true,
+                    recognizer,
+                })
+            }
+            Err(err) => {
+                eprintln!("[qwen3-asr resident warning] {}", err);
+                None
+            }
+        }
+    }
+
     pub fn discover(cfg: &SttConfig, runtime_dir: Option<&Path>) -> Option<Self> {
         let dll_path = find_file_in_search_dirs(
             "",
@@ -300,7 +401,23 @@ impl SherpaResidentEngine {
             cfg.language.trim()
         };
 
+        let is_qwen3 = matches!(model_kind, SherpaModelKind::Qwen3Asr { .. });
         let (label, spec) = match &model_kind {
+            SherpaModelKind::Qwen3Asr {
+                conv_frontend,
+                encoder,
+                decoder,
+                tokenizer,
+            } => (
+                "sherpa-onnx Qwen3-ASR 0.6B".to_string(),
+                ResidentModelSpec::Qwen3Asr {
+                    conv_frontend,
+                    encoder,
+                    decoder,
+                    tokenizer,
+                    hotwords: "",
+                },
+            ),
             SherpaModelKind::Whisper {
                 encoder,
                 decoder,
@@ -379,13 +496,16 @@ impl SherpaResidentEngine {
 
         match ResidentSherpaRecognizer::load(&dll_path, spec, denoiser_spec, cfg.threads) {
             Ok(recognizer) => {
-                let full_label = if let Some(dn) = recognizer.denoiser_name() {
+                let full_label = if is_qwen3 {
+                    format!("{} ({})", label, recognizer.device_name())
+                } else if let Some(dn) = recognizer.denoiser_name() {
                     format!("{} + {}", label, dn)
                 } else {
                     label
                 };
                 Some(Self {
                     label: full_label,
+                    is_qwen3,
                     recognizer,
                 })
             }
@@ -398,8 +518,20 @@ impl SherpaResidentEngine {
 }
 
 impl SttEngine for SherpaResidentEngine {
+    fn id(&self) -> &'static str {
+        if self.is_qwen3 {
+            "sherpa-qwen3"
+        } else {
+            "sherpa-onnx"
+        }
+    }
+
     fn name(&self) -> String {
         self.label.clone()
+    }
+
+    fn device_name(&self) -> String {
+        self.recognizer.device_name().to_string()
     }
 
     fn is_ready(&self) -> bool {
@@ -462,6 +594,7 @@ impl SttEngine for SherpaOnnxEngine {
             SherpaModelKind::Moonshine { .. } => "sherpa-onnx CLI (Moonshine-Ja)".into(),
             SherpaModelKind::Transducer { .. } => "sherpa-onnx CLI (ReazonSpeech)".into(),
             SherpaModelKind::Paraformer { .. } => "sherpa-onnx CLI (Paraformer)".into(),
+            SherpaModelKind::Qwen3Asr { .. } => "sherpa-onnx CLI (Qwen3-ASR)".into(),
         }
     }
 
@@ -524,6 +657,17 @@ impl SttEngine for SherpaOnnxEngine {
             SherpaModelKind::Paraformer { model, tokens } => {
                 cmd.arg(format!("--paraformer={}", model.display()));
                 cmd.arg(format!("--tokens={}", tokens.display()));
+            }
+            SherpaModelKind::Qwen3Asr {
+                conv_frontend,
+                encoder,
+                decoder,
+                tokenizer,
+            } => {
+                cmd.arg(format!("--qwen3-asr-conv-frontend={}", conv_frontend.display()));
+                cmd.arg(format!("--qwen3-asr-encoder={}", encoder.display()));
+                cmd.arg(format!("--qwen3-asr-decoder={}", decoder.display()));
+                cmd.arg(format!("--qwen3-asr-tokenizer={}", tokenizer.display()));
             }
         }
         cmd.arg(&wav_path);
@@ -661,6 +805,37 @@ pub fn create_local_engine(cfg: &SttConfig, runtime_dir: Option<&Path>) -> Arc<d
             explicit_mock: true,
             reason: String::new(),
         }),
+        "whisper-cpp" | "whisper" => {
+            if let Some(e) = WhisperResidentEngine::discover(cfg, runtime_dir) {
+                Arc::new(e)
+            } else if let Some(e) = WhisperCliEngine::discover(cfg, runtime_dir) {
+                Arc::new(e)
+            } else {
+                Arc::new(MockSttEngine {
+                    explicit_mock: false,
+                    reason: format!(
+                        "whisper.dll または GGML .bin モデルが '{}' に見つかりません",
+                        cfg.model_dir
+                    ),
+                })
+            }
+        }
+        "sherpa-qwen3" | "qwen3-asr" => {
+            if let Some(e) = SherpaResidentEngine::discover_qwen3(cfg, runtime_dir) {
+                Arc::new(e)
+            } else {
+                Arc::new(MockSttEngine {
+                    explicit_mock: false,
+                    reason: format!(
+                        "Qwen3-ASR モデル（conv_frontend.onnx / encoder / decoder / tokenizer）が '{}' に見つかりません（詳細設定からダウンロードしてください）",
+                        cfg.model_dir
+                    ),
+                })
+            }
+        }
+        "local-http" | "http-asr" => {
+            Arc::new(LocalHttpAsrEngine::new(cfg.http_asr.clone(), &cfg.language))
+        }
         "sherpa-onnx" => {
             if let Some(e) = SherpaResidentEngine::discover(cfg, runtime_dir) {
                 Arc::new(e)
@@ -690,8 +865,7 @@ pub fn create_local_engine(cfg: &SttConfig, runtime_dir: Option<&Path>) -> Arc<d
             }
         }
         _ => {
-            // Prefer Vulkan-GPU Resident Kotoba-Whisper v2.0 first (sub-300ms + 100% Japanese accuracy!),
-            // then Resident sherpa-onnx DLL, then CLI fallbacks.
+            // Prefer Vulkan-GPU Resident Whisper first, then Resident sherpa-onnx DLL, then CLI fallbacks.
             if let Some(e) = WhisperResidentEngine::discover(cfg, runtime_dir) {
                 Arc::new(e)
             } else if let Some(e) = SherpaResidentEngine::discover(cfg, runtime_dir) {
@@ -793,6 +967,62 @@ fn find_file_in_search_dirs(
                 if candidate.is_file() {
                     return Some(candidate);
                 }
+            }
+        }
+    }
+    None
+}
+
+fn discover_sherpa_qwen3_model(dir: &Path) -> Option<SherpaModelKind> {
+    if !dir.exists() {
+        return None;
+    }
+    let mut subdirs: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for e in entries.flatten() {
+            if e.path().is_dir() {
+                subdirs.push(e.path());
+            }
+        }
+    }
+    subdirs.sort();
+    let mut search_roots = vec![dir.to_path_buf()];
+    search_roots.extend(subdirs);
+
+    for root in &search_roots {
+        let conv_frontend = root.join("conv_frontend.onnx");
+        if !conv_frontend.is_file() {
+            continue;
+        }
+        let encoder = find_direct_file(root, |n| {
+            let l = n.to_ascii_lowercase();
+            l.starts_with("encoder") && l.ends_with(".int8.onnx")
+        })
+        .or_else(|| {
+            find_direct_file(root, |n| {
+                let l = n.to_ascii_lowercase();
+                l.starts_with("encoder") && l.ends_with(".onnx")
+            })
+        });
+        let decoder = find_direct_file(root, |n| {
+            let l = n.to_ascii_lowercase();
+            l.starts_with("decoder") && l.ends_with(".int8.onnx")
+        })
+        .or_else(|| {
+            find_direct_file(root, |n| {
+                let l = n.to_ascii_lowercase();
+                l.starts_with("decoder") && l.ends_with(".onnx")
+            })
+        });
+        let tokenizer = root.join("tokenizer");
+        if tokenizer.is_dir() {
+            if let (Some(encoder), Some(decoder)) = (encoder, decoder) {
+                return Some(SherpaModelKind::Qwen3Asr {
+                    conv_frontend,
+                    encoder,
+                    decoder,
+                    tokenizer,
+                });
             }
         }
     }
@@ -1133,5 +1363,46 @@ Elapsed seconds: 0.12
         assert!(eng.is_ready());
         let text = eng.transcribe(&vec![0.0; 16_000]).unwrap();
         assert!(text.contains("1.0秒"));
+    }
+
+    #[test]
+    fn discovers_sherpa_qwen3_model_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "voxdrop_qwen3_disc_{}",
+            std::process::id()
+        ));
+        let model_sub = dir.join("sherpa-onnx-qwen3-asr-0.6B-int8");
+        let tok_dir = model_sub.join("tokenizer");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&tok_dir).unwrap();
+        fs::write(model_sub.join("conv_frontend.onnx"), b"stub").unwrap();
+        fs::write(model_sub.join("encoder.int8.onnx"), b"stub").unwrap();
+        fs::write(model_sub.join("decoder.int8.onnx"), b"stub").unwrap();
+
+        let found = discover_sherpa_qwen3_model(&dir);
+        match found {
+            Some(SherpaModelKind::Qwen3Asr {
+                conv_frontend,
+                encoder,
+                decoder,
+                tokenizer,
+            }) => {
+                assert!(conv_frontend.ends_with("conv_frontend.onnx"));
+                assert!(encoder.ends_with("encoder.int8.onnx"));
+                assert!(decoder.ends_with("decoder.int8.onnx"));
+                assert_eq!(tokenizer, tok_dir);
+            }
+            other => panic!("expected Qwen3Asr variant, got {:?}", other),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn creates_local_http_engine_from_config() {
+        let mut cfg = SttConfig::default();
+        cfg.engine = "local-http".into();
+        let eng = create_local_engine(&cfg, None);
+        assert_eq!(eng.id(), "local-http");
+        assert!(eng.device_name().contains("HTTP"));
     }
 }

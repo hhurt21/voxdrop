@@ -41,9 +41,9 @@ impl SoundKind {
     }
 }
 
-struct PlayRequest {
-    kind: SoundKind,
-    volume: f32,
+enum PlayRequest {
+    Builtin { kind: SoundKind, volume: f32 },
+    RawWav { wav_bytes: Vec<u8>, volume: f32 },
 }
 
 /// Non-blocking audio feedback player backed by a dedicated `rodio` worker thread.
@@ -63,14 +63,27 @@ impl SoundPlayer {
                     }
                 }
                 if let Some((_, ref handle)) = output {
-                    let (bytes, speed) = req.kind.wav_bytes_and_speed();
-                    if let (Ok(sink), Ok(source)) =
-                        (Sink::try_new(handle), Decoder::new(Cursor::new(bytes)))
-                    {
-                        sink.set_volume(req.volume.clamp(0.0, 1.0));
-                        sink.set_speed(speed);
-                        sink.append(source);
-                        sink.detach();
+                    match req {
+                        PlayRequest::Builtin { kind, volume } => {
+                            let (bytes, speed) = kind.wav_bytes_and_speed();
+                            if let (Ok(sink), Ok(source)) =
+                                (Sink::try_new(handle), Decoder::new(Cursor::new(bytes)))
+                            {
+                                sink.set_volume(volume.clamp(0.0, 1.0));
+                                sink.set_speed(speed);
+                                sink.append(source);
+                                sink.detach();
+                            }
+                        }
+                        PlayRequest::RawWav { wav_bytes, volume } => {
+                            if let (Ok(sink), Ok(source)) =
+                                (Sink::try_new(handle), Decoder::new(Cursor::new(wav_bytes)))
+                            {
+                                sink.set_volume(volume.clamp(0.0, 1.5));
+                                sink.append(source);
+                                sink.detach();
+                            }
+                        }
                     }
                 }
             }
@@ -82,10 +95,18 @@ impl SoundPlayer {
         if !cfg.enabled || cfg.volume <= 0.001 {
             return;
         }
-        let _ = self.tx.send(PlayRequest {
+        let _ = self.tx.send(PlayRequest::Builtin {
             kind,
             volume: cfg.volume,
         });
+    }
+
+    /// Plays an in-memory WAV buffer (e.g. recorded 16 kHz utterance replay in Diagnostics).
+    pub fn play_wav_bytes(&self, wav_bytes: Vec<u8>, volume: f32) {
+        if wav_bytes.is_empty() {
+            return;
+        }
+        let _ = self.tx.send(PlayRequest::RawWav { wav_bytes, volume });
     }
 }
 

@@ -381,6 +381,13 @@ pub enum ResidentModelSpec<'a> {
         model: &'a Path,
         tokens: &'a Path,
     },
+    Qwen3Asr {
+        conv_frontend: &'a Path,
+        encoder: &'a Path,
+        decoder: &'a Path,
+        tokenizer: &'a Path,
+        hotwords: &'a str,
+    },
 }
 
 pub enum SpeechDenoiserSpec<'a> {
@@ -397,7 +404,8 @@ pub enum SpeechDenoiserSpec<'a> {
 pub struct ResidentSherpaRecognizer {
     inner: Mutex<ResidentInner>,
     denoiser_label: Option<String>,
-    is_whisper: bool,
+    provider_label: String,
+    is_whisper_or_qwen: bool,
 }
 
 impl ResidentSherpaRecognizer {
@@ -423,9 +431,14 @@ impl ResidentSherpaRecognizer {
         config.feat_config.feature_dim = 80;
         config.model_config.num_threads = threads.clamp(1, 16) as i32;
         config.model_config.debug = 0;
-        config.model_config.provider = cstr("cpu")?;
         config.decoding_method = cstr("greedy_search")?;
         config.max_active_paths = 4;
+
+        let is_qwen3 = matches!(spec, ResidentModelSpec::Qwen3Asr { .. });
+        let is_whisper_or_qwen = matches!(
+            spec,
+            ResidentModelSpec::Whisper { .. } | ResidentModelSpec::Qwen3Asr { .. }
+        );
 
         match spec {
             ResidentModelSpec::Whisper {
@@ -480,9 +493,44 @@ impl ResidentSherpaRecognizer {
                 config.model_config.paraformer.model = cstr(&model.to_string_lossy())?;
                 config.model_config.tokens = cstr(&tokens.to_string_lossy())?;
             }
+            ResidentModelSpec::Qwen3Asr {
+                conv_frontend,
+                encoder,
+                decoder,
+                tokenizer,
+                hotwords,
+            } => {
+                config.model_config.qwen3_asr.conv_frontend =
+                    cstr(&conv_frontend.to_string_lossy())?;
+                config.model_config.qwen3_asr.encoder = cstr(&encoder.to_string_lossy())?;
+                config.model_config.qwen3_asr.decoder = cstr(&decoder.to_string_lossy())?;
+                config.model_config.qwen3_asr.tokenizer = cstr(&tokenizer.to_string_lossy())?;
+                config.model_config.qwen3_asr.max_total_len = 512;
+                config.model_config.qwen3_asr.max_new_tokens = 256;
+                config.model_config.qwen3_asr.temperature = 0.0;
+                config.model_config.qwen3_asr.top_p = 1.0;
+                config.model_config.qwen3_asr.seed = 42;
+                config.model_config.qwen3_asr.hotwords = cstr(hotwords)?;
+                config.model_config.tokens = cstr("")?;
+            }
         }
 
-        let recognizer = unsafe { (fns.create_recognizer)(&config) };
+        // Try DirectML (AMD RX 6700 XT GPU acceleration) first for Qwen3-ASR when available,
+        // falling back cleanly to CPU if the bundled ONNX Runtime was built CPU-only.
+        let mut provider_label = "CPU".to_string();
+        let mut recognizer: *const c_void = ptr::null();
+        if is_qwen3 {
+            config.model_config.provider = cstr("directml")?;
+            recognizer = unsafe { (fns.create_recognizer)(&config) };
+            if !recognizer.is_null() {
+                provider_label = "DirectML (GPU)".to_string();
+            }
+        }
+        if recognizer.is_null() {
+            config.model_config.provider = cstr("cpu")?;
+            recognizer = unsafe { (fns.create_recognizer)(&config) };
+            provider_label = "CPU".to_string();
+        }
         drop(keep_alive);
 
         if recognizer.is_null() {
@@ -492,13 +540,12 @@ impl ResidentSherpaRecognizer {
             return Err("SherpaOnnxCreateOfflineRecognizer が失敗しました（モデルまたは設定を確認してください）".into());
         }
 
-        // Whisper Large-v3-Turbo has a 32-layer noise-robust encoder trained on 5M hours;
+        // Whisper Large-v3-Turbo & Qwen3-ASR have noise-robust encoders;
         // double neural denoising (RNNoise + DPDFNet2) degrades muffled/slurred consonants,
-        // so Whisper uses Smart AGC + gentle vocal contour directly for maximum accuracy & speed!
-        let is_whisper = matches!(spec, ResidentModelSpec::Whisper { .. });
+        // so they use clean AGC directly for maximum accuracy & speed!
         let mut denoiser: *const c_void = ptr::null();
         let mut denoiser_label: Option<String> = None;
-        if !is_whisper {
+        if !is_whisper_or_qwen {
             if let (Some(dspec), Some(create_sd)) = (denoiser_spec, fns.create_denoiser) {
                 if let Ok(prov_c) = CString::new("cpu") {
                     let mut sd_cfg: SherpaOnnxOfflineSpeechDenoiserConfig =
@@ -543,12 +590,17 @@ impl ResidentSherpaRecognizer {
                 denoiser,
             }),
             denoiser_label,
-            is_whisper,
+            provider_label,
+            is_whisper_or_qwen,
         })
     }
 
     pub fn denoiser_name(&self) -> Option<&str> {
         self.denoiser_label.as_deref()
+    }
+
+    pub fn device_name(&self) -> &str {
+        &self.provider_label
     }
 
     pub fn transcribe_json_enhanced(
@@ -564,10 +616,10 @@ impl ResidentSherpaRecognizer {
             .lock()
             .map_err(|_| "STT認識エンジンのロック取得に失敗しました".to_string())?;
 
-        // 1. Apply smart quiet-mic AGC + 80Hz high-pass (preserve natural Mel tilt for Whisper!)
+        // 1. Apply smart quiet-mic AGC (preserve natural Mel tilt for Whisper / Qwen3-ASR!)
         let pre_conditioned = crate::audio::enhance::enhance_utterance_16k(
             samples_16k,
-            radio_clarity && !self.is_whisper && guard.denoiser.is_null(),
+            radio_clarity && !self.is_whisper_or_qwen && guard.denoiser.is_null(),
             true,
         );
 

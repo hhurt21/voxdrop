@@ -15,6 +15,33 @@ impl Default for InputMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConversationPreset {
+    Normal,
+    Fast,
+    Slow,
+}
+
+impl Default for ConversationPreset {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivationMode {
+    Vad,
+    PushToTalk,
+}
+
+impl Default for ActivationMode {
+    fn default() -> Self {
+        Self::Vad
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DictionaryEntry {
     pub from: String,
@@ -61,8 +88,8 @@ impl Default for VoiceCommandsConfig {
         Self {
             send: vec!["送信して".into(), "送って".into(), "エンター".into()],
             clear_all: vec!["今の消して".into(), "全部消して".into(), "キャンセル".into()],
-            undo: vec!["一つ戻して".into(), "さっきの消して".into()],
-            newline: vec!["改行して".into()],
+            undo: vec!["一つ戻して".into(), "ひとつ戻して".into(), "さっきの消して".into()],
+            newline: vec!["改行して".into(), "改行".into()],
             mute: vec!["ミュートして".into()],
             resume: vec!["認識再開".into()],
             discord_mute_mic: vec![
@@ -512,15 +539,45 @@ impl Default for SoundConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct HttpAsrConfig {
+    pub base_url: String,
+    pub endpoint_path: String,
+    pub model: String,
+    pub api_key: String,
+    pub auto_launch: bool,
+    pub server_exe_path: String,
+    pub server_args: String,
+    pub stop_on_exit: bool,
+}
+
+impl Default for HttpAsrConfig {
+    fn default() -> Self {
+        Self {
+            base_url: "http://127.0.0.1:8080".into(),
+            endpoint_path: "/v1/audio/transcriptions".into(),
+            model: "qwen3-asr-1.7b".into(),
+            api_key: String::new(),
+            auto_launch: false,
+            server_exe_path: String::new(),
+            server_args: String::new(),
+            stop_on_exit: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SttConfig {
-    /// "auto" | "sherpa-onnx" | "whisper-cli" | "mock"
+    /// "auto" | "whisper-cpp" | "sherpa-qwen3" | "sherpa-onnx" | "local-http" | "whisper-cli" | "mock"
     pub engine: String,
     pub model_dir: String,
-    /// Optional explicit GGML model filename (empty = auto highest-accuracy model)
+    /// Optional explicit GGML / ONNX model filename or subfolder (empty = auto highest-accuracy model)
     pub model_file: String,
     pub cli_path: String,
     pub language: String,
     pub threads: u32,
+    pub preset: ConversationPreset,
+    pub http_asr: HttpAsrConfig,
 }
 
 impl Default for SttConfig {
@@ -532,6 +589,54 @@ impl Default for SttConfig {
             cli_path: String::new(),
             language: "ja".into(),
             threads: 8,
+            preset: ConversationPreset::Normal,
+            http_asr: HttpAsrConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SendCountdownConfig {
+    pub enabled: bool,
+    pub duration_ms: u64,
+}
+
+impl Default for SendCountdownConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            duration_ms: 1500,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GameProfile {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub process_names: Vec<String>,
+    pub dictionary: Vec<DictionaryEntry>,
+    pub send_method: Option<SendMethod>,
+    pub overlay_x: Option<i32>,
+    pub overlay_y: Option<i32>,
+    pub overlay_opacity: Option<f32>,
+}
+
+impl Default for GameProfile {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            enabled: true,
+            process_names: Vec::new(),
+            dictionary: Vec::new(),
+            send_method: None,
+            overlay_x: None,
+            overlay_y: None,
+            overlay_opacity: None,
         }
     }
 }
@@ -643,6 +748,7 @@ pub struct AppConfig {
     #[serde(default = "default_legacy_config_version")]
     pub config_version: u32,
     pub input_mode: InputMode,
+    pub activation_mode: ActivationMode,
     pub audio_device: Option<String>,
     /// Windows起動時に自動起動する（デフォルト: false / OFF）
     pub auto_start: bool,
@@ -655,6 +761,8 @@ pub struct AppConfig {
     pub discord_integration: DiscordIntegrationConfig,
     pub discord_tts: DiscordTtsConfig,
     pub guard: GuardConfig,
+    pub send_countdown: SendCountdownConfig,
+    pub game_profiles: Vec<GameProfile>,
     pub hotkeys: HotkeyConfig,
     pub overlay: OverlayConfig,
     pub sound: SoundConfig,
@@ -666,6 +774,7 @@ impl Default for AppConfig {
         Self {
             config_version: 2,
             input_mode: InputMode::Draft,
+            activation_mode: ActivationMode::Vad,
             audio_device: None,
             auto_start: false,
             start_minimized: false,
@@ -677,6 +786,8 @@ impl Default for AppConfig {
             discord_integration: DiscordIntegrationConfig::default(),
             discord_tts: DiscordTtsConfig::default(),
             guard: GuardConfig::default(),
+            send_countdown: SendCountdownConfig::default(),
+            game_profiles: Vec::new(),
             hotkeys: HotkeyConfig::default(),
             overlay: OverlayConfig::default(),
             sound: SoundConfig::default(),
@@ -867,5 +978,75 @@ mod tests {
         assert_eq!(cfg.filter.dictionary.len(), 1);
         assert_eq!(cfg.filter.dictionary[0].to, "TEST");
         assert!(!cfg.migrate());
+    }
+
+    #[test]
+    fn v140_config_backward_compat() {
+        let v140_json = r#"{
+            "config_version": 2,
+            "input_mode": "draft",
+            "stt": {
+                "engine": "auto",
+                "model_file": "ggml-kotoba-whisper-v2.0-q5_0.bin",
+                "language": "ja"
+            },
+            "filter": {
+                "dictionary": [{ "from": "ぼっくす", "to": "VoxDrop" }]
+            },
+            "discord_targets": {
+                "active_target_id": "t1",
+                "targets": [
+                    { "id": "t1", "kind": "channel", "name": "一般", "server_name": "MyServer", "aliases": ["一般"], "url": "https://discord.com/channels/1/2" }
+                ]
+            },
+            "discord_tts": {
+                "enabled": true,
+                "voicevox": {
+                    "base_url": "http://127.0.0.1:50021",
+                    "speaker_id": 8
+                }
+            }
+        }"#;
+        let cfg: AppConfig = serde_json::from_str(v140_json).expect("deserialize v1.4.0 config");
+        assert_eq!(cfg.activation_mode, ActivationMode::Vad);
+        assert!(!cfg.send_countdown.enabled);
+        assert_eq!(cfg.send_countdown.duration_ms, 1500);
+        assert!(cfg.game_profiles.is_empty());
+        assert_eq!(cfg.stt.preset, ConversationPreset::Normal);
+        assert_eq!(cfg.stt.http_asr.base_url, "http://127.0.0.1:8080");
+        assert_eq!(cfg.stt.model_file, "ggml-kotoba-whisper-v2.0-q5_0.bin");
+        assert_eq!(cfg.filter.dictionary.len(), 1);
+        assert_eq!(cfg.filter.dictionary[0].to, "VoxDrop");
+        assert_eq!(cfg.discord_targets.targets.len(), 1);
+        assert_eq!(cfg.discord_targets.active_target_id.as_deref(), Some("t1"));
+        assert!(cfg.discord_tts.enabled);
+        assert_eq!(cfg.discord_tts.voicevox.speaker_id, 8);
+    }
+
+    #[test]
+    fn game_profile_serde_roundtrip() {
+        let mut cfg = AppConfig::default();
+        cfg.activation_mode = ActivationMode::PushToTalk;
+        cfg.send_countdown = SendCountdownConfig {
+            enabled: true,
+            duration_ms: 1800,
+        };
+        cfg.game_profiles.push(GameProfile {
+            id: "gp_val".into(),
+            name: "VALORANT".into(),
+            enabled: true,
+            process_names: vec!["VALORANT-Win64-Shipping.exe".into()],
+            dictionary: vec![DictionaryEntry {
+                from: "ばんだる".into(),
+                to: "ヴァンダル".into(),
+            }],
+            send_method: Some(SendMethod::WindowMessage),
+            overlay_x: Some(40),
+            overlay_y: Some(80),
+            overlay_opacity: Some(0.75),
+        });
+        let json = serde_json::to_string(&cfg).expect("serialize");
+        let back: AppConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(cfg, back);
     }
 }

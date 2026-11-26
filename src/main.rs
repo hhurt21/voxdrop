@@ -25,20 +25,27 @@ use audio::AudioEvent;
 use automation::discord;
 use automation::input::KeyAction;
 use automation::uia;
-use config::{AppConfig, DiscordTarget, DiscordTargetKind, GuardConfig, InputMode};
+use config::{
+    ActivationMode, AppConfig, DictionaryEntry, DiscordTarget, DiscordTargetKind, GameProfile,
+    GuardConfig, InputMode, TextFilterConfig,
+};
 use hotkey::{HotkeyAction, HotkeyManager};
-use ipc::{BackendEvent, ClientCommand, ScannedChannelDto, VoicevoxSpeakerDto};
+use ipc::{
+    BackendEvent, ClientCommand, ScannedChannelDto, UtteranceDiagnosticDto, VoicevoxSpeakerDto,
+};
 use notification::{NotificationController, NotificationEvent};
 use processor::commands::{
-    parse_confirmation_reply, ConfirmationReply, TargetSwitchAction, VoiceCommand,
+    parse_confirmation_reply, parse_countdown_cancel, ConfirmationReply, TargetSwitchAction,
+    VoiceCommand,
 };
 use sound::{SoundKind, SoundPlayer};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, RwLock};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread;
-use std::time::Duration;
-use stt::SttEngine;
+use std::time::{Duration, Instant};
+use stt::{SttEngine, TranscribeContext};
 use tao::{
     dpi::{LogicalPosition, LogicalSize},
     event::{Event, WindowEvent},
@@ -61,6 +68,9 @@ impl SttEngine for BootLoadingEngine {
     fn name(&self) -> String {
         "モデル読み込み中...".into()
     }
+    fn device_name(&self) -> String {
+        "初期化中...".into()
+    }
     fn is_ready(&self) -> bool {
         false
     }
@@ -79,7 +89,43 @@ enum UserEvent {
         runtime_dir: Option<PathBuf>,
         error: Option<String>,
     },
-    TranscriptReady(Result<String, String>),
+    TranscriptReady {
+        samples_16k: Vec<f32>,
+        duration_sec: f32,
+        peak_dbfs: f32,
+        infer_ms: u64,
+        rtf: f32,
+        engine_label: String,
+        device_name: String,
+        result: Result<String, String>,
+    },
+    AbCompareDone {
+        id: u64,
+        engine_label: String,
+        device_name: String,
+        infer_ms: u64,
+        rtf: f32,
+        result: Result<String, String>,
+    },
+    SendCountdownTick {
+        id: u64,
+        remaining_ms: u64,
+        total_ms: u64,
+    },
+    SendCountdownFire {
+        id: u64,
+    },
+    SendCountdownCancelEsc {
+        id: u64,
+    },
+    ModelDownloadProgress {
+        model_id: String,
+        progress: u8,
+        message: String,
+        done: bool,
+        ok: bool,
+    },
+    HttpAsrHealthDone(Result<String, String>),
     ActiveWindowChanged {
         process: String,
         target_active: bool,
@@ -106,18 +152,95 @@ enum UserEvent {
 enum SttWorkerMsg {
     Transcribe {
         samples: Vec<f32>,
-        radio_clarity: bool,
+        ctx: TranscribeContext,
     },
     ReloadEngine(Arc<dyn SttEngine>),
     UpdatePromptHints(String),
     Shutdown,
 }
 
-fn build_stt_prompt_hints(cfg: &AppConfig) -> String {
+static AB_ENGINE_CACHE: Mutex<Option<(String, Arc<dyn SttEngine>)>> = Mutex::new(None);
+
+#[repr(C)]
+struct WinSystemTime {
+    year: u16,
+    month: u16,
+    day_of_week: u16,
+    day: u16,
+    hour: u16,
+    minute: u16,
+    second: u16,
+    milliseconds: u16,
+}
+
+fn current_local_hms() -> String {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetLocalTime(lp_system_time: *mut WinSystemTime);
+    }
+    let mut st = WinSystemTime {
+        year: 0,
+        month: 0,
+        day_of_week: 0,
+        day: 0,
+        hour: 0,
+        minute: 0,
+        second: 0,
+        milliseconds: 0,
+    };
+    unsafe {
+        GetLocalTime(&mut st);
+    }
+    format!("{:02}:{:02}:{:02}", st.hour, st.minute, st.second)
+}
+
+pub fn compute_peak_dbfs(samples: &[f32]) -> f32 {
+    let peak = samples
+        .iter()
+        .fold(0.0f32, |acc, &s| acc.max(s.abs()));
+    if peak < 1e-5 {
+        -96.0
+    } else {
+        (20.0 * peak.log10()).clamp(-96.0, 0.0)
+    }
+}
+
+pub fn find_matching_game_profile<'a>(
+    process: &str,
+    profiles: &'a [GameProfile],
+) -> Option<&'a GameProfile> {
+    let proc_trim = process.trim();
+    if proc_trim.is_empty() {
+        return None;
+    }
+    profiles.iter().find(|p| {
+        p.enabled
+            && p.process_names
+                .iter()
+                .any(|n| !n.trim().is_empty() && n.trim().eq_ignore_ascii_case(proc_trim))
+    })
+}
+
+pub fn merge_profile_filter(
+    base: &TextFilterConfig,
+    profile: Option<&GameProfile>,
+) -> TextFilterConfig {
+    let mut merged = base.clone();
+    if let Some(p) = profile {
+        for entry in &p.dictionary {
+            if !entry.from.trim().is_empty() {
+                merged.dictionary.push(entry.clone());
+            }
+        }
+    }
+    merged
+}
+
+fn build_stt_prompt_hints(cfg: &AppConfig, active_profile: Option<&GameProfile>) -> String {
     let mut terms: Vec<String> = Vec::new();
     let mut push_term = |s: &str| {
         let t = s.trim();
-        if t.is_empty() || t.starts_with(':') && t.ends_with(':') {
+        if t.is_empty() || (t.starts_with(':') && t.ends_with(':')) {
             return;
         }
         if !terms.iter().any(|existing| existing == t) {
@@ -138,6 +261,11 @@ fn build_stt_prompt_hints(cfg: &AppConfig) -> String {
     {
         push_term(s);
     }
+    if let Some(p) = active_profile {
+        for d in &p.dictionary {
+            push_term(&d.to);
+        }
+    }
     for d in &cfg.filter.dictionary {
         push_term(&d.to);
     }
@@ -151,7 +279,7 @@ fn build_stt_prompt_hints(cfg: &AppConfig) -> String {
     let mut out = String::new();
     for term in terms {
         let add_len = term.chars().count() + if out.is_empty() { 0 } else { 1 };
-        if out.chars().count() + add_len > 150 {
+        if out.chars().count() + add_len > 160 {
             break;
         }
         if !out.is_empty() {
@@ -227,6 +355,46 @@ impl PendingConfirmation {
     }
 }
 
+#[derive(Clone)]
+struct UtteranceDiagnostic {
+    id: u64,
+    timestamp: String,
+    samples_16k: Vec<f32>,
+    duration_sec: f32,
+    peak_dbfs: f32,
+    infer_ms: u64,
+    rtf: f32,
+    device_name: String,
+    engine_label: String,
+    raw_text: String,
+    final_text: String,
+}
+
+impl UtteranceDiagnostic {
+    fn to_dto(&self) -> UtteranceDiagnosticDto {
+        UtteranceDiagnosticDto {
+            id: self.id,
+            timestamp: self.timestamp.clone(),
+            duration_sec: self.duration_sec,
+            peak_dbfs: self.peak_dbfs,
+            infer_ms: self.infer_ms,
+            rtf: self.rtf,
+            device_name: self.device_name.clone(),
+            engine_label: self.engine_label.clone(),
+            raw_text: self.raw_text.clone(),
+            final_text: self.final_text.clone(),
+        }
+    }
+}
+
+struct PendingSendCountdown {
+    id: u64,
+    text: String,
+    press_enter: bool,
+    action: &'static str,
+    cancel_flag: Arc<AtomicBool>,
+}
+
 struct AppState {
     config: AppConfig,
     config_path: PathBuf,
@@ -235,6 +403,9 @@ struct AppState {
     clipboard_watch_flag: Arc<AtomicBool>,
     stt_ready: bool,
     stt_engine_name: String,
+    stt_device_name: String,
+    last_infer_ms: u64,
+    last_rtf: f32,
     listening: bool,
     sleeping: bool,
     recognizing: bool,
@@ -242,11 +413,16 @@ struct AppState {
     listening_before_ptt: bool,
     target_active: bool,
     active_process: String,
+    active_game_profile_id: Option<String>,
     overlay_visible: bool,
     draft_segments: Vec<String>,
     direct_history_lengths: Vec<usize>,
     last_direct_utterance: String,
     pending_confirm: Option<PendingConfirmation>,
+    pending_countdown: Option<PendingSendCountdown>,
+    next_countdown_id: u64,
+    recent_utterances: VecDeque<UtteranceDiagnostic>,
+    next_diag_id: u64,
 }
 
 impl AppState {
@@ -258,6 +434,9 @@ impl AppState {
         let clipboard_watch_flag =
             Arc::new(AtomicBool::new(config.discord_integration.clipboard_url_watch));
         let (target_active, active_process) = automation::check_target(&config.guard);
+        let active_game_profile_id =
+            find_matching_game_profile(&active_process, &config.game_profiles)
+                .map(|p| p.id.clone());
         Self {
             config,
             config_path,
@@ -266,6 +445,9 @@ impl AppState {
             clipboard_watch_flag,
             stt_ready: false,
             stt_engine_name: "モデル読み込み中...".into(),
+            stt_device_name: "初期化中...".into(),
+            last_infer_ms: 0,
+            last_rtf: 0.0,
             listening: false,
             sleeping: false,
             recognizing: false,
@@ -273,18 +455,82 @@ impl AppState {
             listening_before_ptt: false,
             target_active,
             active_process,
+            active_game_profile_id,
             overlay_visible,
             draft_segments: Vec::new(),
             direct_history_lengths: Vec::new(),
             last_direct_utterance: String::new(),
             pending_confirm: None,
+            pending_countdown: None,
+            next_countdown_id: 1,
+            recent_utterances: VecDeque::with_capacity(5),
+            next_diag_id: 1,
         }
     }
 
-    fn sync_guard(&self) {
-        if let Ok(mut g) = self.shared_guard.write() {
-            *g = self.config.guard.clone();
+    fn active_profile(&self) -> Option<&GameProfile> {
+        let id = self.active_game_profile_id.as_deref()?;
+        self.config
+            .game_profiles
+            .iter()
+            .find(|p| p.enabled && p.id == id)
+    }
+
+    fn effective_guard(&self) -> GuardConfig {
+        let mut g = self.config.guard.clone();
+        if let Some(p) = self.active_profile() {
+            if let Some(sm) = p.send_method {
+                g.send_method = sm;
+            }
         }
+        g
+    }
+
+    fn effective_filter(&self) -> TextFilterConfig {
+        merge_profile_filter(&self.config.filter, self.active_profile())
+    }
+
+    fn sync_guard(&self) {
+        let eff = self.effective_guard();
+        if let Ok(mut g) = self.shared_guard.write() {
+            *g = eff;
+        }
+    }
+
+    fn push_diagnostic(
+        &mut self,
+        samples_16k: Vec<f32>,
+        duration_sec: f32,
+        peak_dbfs: f32,
+        infer_ms: u64,
+        rtf: f32,
+        device_name: String,
+        engine_label: String,
+        raw_text: String,
+        final_text: String,
+    ) {
+        let id = self.next_diag_id;
+        self.next_diag_id += 1;
+        if self.recent_utterances.len() >= 5 {
+            self.recent_utterances.pop_back();
+        }
+        self.recent_utterances.push_front(UtteranceDiagnostic {
+            id,
+            timestamp: current_local_hms(),
+            samples_16k,
+            duration_sec,
+            peak_dbfs,
+            infer_ms,
+            rtf,
+            device_name,
+            engine_label,
+            raw_text,
+            final_text,
+        });
+    }
+
+    fn diagnostic_dtos(&self) -> Vec<UtteranceDiagnosticDto> {
+        self.recent_utterances.iter().map(|d| d.to_dto()).collect()
     }
 
     fn active_discord_target(&self) -> Option<DiscordTarget> {
@@ -329,12 +575,17 @@ impl AppState {
             target_active: self.target_active,
             active_process: self.active_process.clone(),
             input_mode: self.config.input_mode,
+            activation_mode: self.config.activation_mode,
             overlay_visible: self.overlay_visible,
             stt_ready: self.stt_ready,
             stt_engine: self.stt_engine_name.clone(),
+            stt_device: self.stt_device_name.clone(),
+            last_infer_ms: self.last_infer_ms,
+            last_rtf: self.last_rtf,
             rnnoise_enabled: self.config.noise_cancel.enabled,
             active_discord_target_id: active_target.map(|t| t.id.clone()),
             active_discord_target_label: discord::target_display_label(active_target),
+            active_profile: self.active_profile().map(|p| p.name.clone()),
         }
     }
 }
@@ -394,6 +645,16 @@ fn spawn_voicevox_autostart(
     });
 }
 
+fn spawn_http_asr_autostart(
+    http_cfg: config::HttpAsrConfig,
+    proxy: EventLoopProxy<UserEvent>,
+) {
+    thread::spawn(move || {
+        let res = stt::http_asr::ensure_http_asr_running(&http_cfg);
+        let _ = proxy.send_event(UserEvent::HttpAsrHealthDone(res));
+    });
+}
+
 fn spawn_stt_worker(
     initial_engine: Arc<dyn SttEngine>,
     proxy: EventLoopProxy<UserEvent>,
@@ -403,13 +664,30 @@ fn spawn_stt_worker(
         let mut engine = initial_engine;
         while let Ok(msg) = rx.recv() {
             match msg {
-                SttWorkerMsg::Transcribe {
-                    samples,
-                    radio_clarity,
-                } => {
-                    let result = engine.transcribe_enhanced(&samples, radio_clarity);
+                SttWorkerMsg::Transcribe { samples, ctx } => {
+                    let duration_sec = samples.len() as f32 / 16_000.0;
+                    let peak_dbfs = compute_peak_dbfs(&samples);
+                    let t0 = Instant::now();
+                    let result = engine.transcribe_with_context(&samples, &ctx);
+                    let infer_ms = t0.elapsed().as_millis() as u64;
+                    let rtf = if duration_sec > 0.01 {
+                        (infer_ms as f32 / 1000.0) / duration_sec
+                    } else {
+                        0.0
+                    };
+                    let engine_label = engine.name();
+                    let device_name = engine.device_name();
                     if proxy
-                        .send_event(UserEvent::TranscriptReady(result))
+                        .send_event(UserEvent::TranscriptReady {
+                            samples_16k: samples,
+                            duration_sec,
+                            peak_dbfs,
+                            infer_ms,
+                            rtf,
+                            engine_label,
+                            device_name,
+                            result,
+                        })
                         .is_err()
                     {
                         break;
@@ -536,7 +814,7 @@ fn spawn_send_for_state(
     let target = state.active_discord_target();
     let auto_nav = state.config.discord_targets.auto_navigate_on_send;
     let nav_delay = state.config.discord_targets.navigate_delay_ms;
-    let guard = state.config.guard.clone();
+    let guard = state.effective_guard();
     let integration = state.config.discord_integration.clone();
     thread::spawn(move || {
         let res = automation::send_to_discord_target(
@@ -561,6 +839,122 @@ fn spawn_send_for_state(
             },
         });
     });
+}
+
+fn start_send_countdown(
+    text: String,
+    press_enter: bool,
+    action: &'static str,
+    state: &mut AppState,
+    main_wv: &WebView,
+    overlay_wv: &WebView,
+    proxy: EventLoopProxy<UserEvent>,
+) {
+    if let Some(prev) = state.pending_countdown.take() {
+        prev.cancel_flag.store(true, Ordering::SeqCst);
+    }
+    let id = state.next_countdown_id;
+    state.next_countdown_id += 1;
+    let total_ms = state.config.send_countdown.duration_ms.clamp(300, 10_000);
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let preview: String = text.chars().take(60).collect();
+
+    state.pending_countdown = Some(PendingSendCountdown {
+        id,
+        text,
+        press_enter,
+        action,
+        cancel_flag: cancel_flag.clone(),
+    });
+
+    emit_all(
+        main_wv,
+        overlay_wv,
+        &BackendEvent::SendCountdown {
+            active: true,
+            remaining_ms: total_ms,
+            total_ms,
+            preview_text: preview,
+        },
+    );
+
+    thread::spawn(move || {
+        let mut remaining = total_ms;
+        while remaining > 0 {
+            let step = remaining.min(100);
+            thread::sleep(Duration::from_millis(step));
+            if cancel_flag.load(Ordering::SeqCst) {
+                return;
+            }
+            let esc_down = unsafe {
+                use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE};
+                (GetAsyncKeyState(VK_ESCAPE.0 as i32) as u16 & 0x8000) != 0
+            };
+            if esc_down {
+                let _ = proxy.send_event(UserEvent::SendCountdownCancelEsc { id });
+                return;
+            }
+            remaining = remaining.saturating_sub(step);
+            if remaining > 0 {
+                let _ = proxy.send_event(UserEvent::SendCountdownTick {
+                    id,
+                    remaining_ms: remaining,
+                    total_ms,
+                });
+            }
+        }
+        if !cancel_flag.load(Ordering::SeqCst) {
+            let _ = proxy.send_event(UserEvent::SendCountdownFire { id });
+        }
+    });
+}
+
+fn cancel_send_countdown(
+    state: &mut AppState,
+    main_wv: &WebView,
+    overlay_wv: &WebView,
+    sound: &SoundPlayer,
+    reason: &str,
+) {
+    let Some(pending) = state.pending_countdown.take() else {
+        return;
+    };
+    pending.cancel_flag.store(true, Ordering::SeqCst);
+    if state.config.input_mode == InputMode::Draft
+        && !pending.text.is_empty()
+        && state.draft_segments.is_empty()
+    {
+        state.draft_segments.push(pending.text);
+        let draft = state.draft_text();
+        emit_all(
+            main_wv,
+            overlay_wv,
+            &BackendEvent::TranscriptUpdate {
+                text: String::new(),
+                draft,
+                is_final: true,
+            },
+        );
+    }
+    sound.play(SoundKind::Cancel, &state.config.sound);
+    emit_all(
+        main_wv,
+        overlay_wv,
+        &BackendEvent::SendCountdown {
+            active: false,
+            remaining_ms: 0,
+            total_ms: 0,
+            preview_text: String::new(),
+        },
+    );
+    emit_all(
+        main_wv,
+        overlay_wv,
+        &BackendEvent::CommandExecuted {
+            action: "countdown_cancelled".into(),
+            detail: reason.to_string(),
+        },
+    );
 }
 
 fn spawn_navigate_target(
@@ -1194,6 +1588,18 @@ fn execute_text_and_command(
                             message: "送信するテキストがありません".into(),
                         },
                     );
+                } else if state.config.send_countdown.enabled
+                    && state.config.send_countdown.duration_ms >= 300
+                {
+                    start_send_countdown(
+                        full_text,
+                        true,
+                        VoiceCommand::Send.as_str(),
+                        state,
+                        main_wv,
+                        overlay_wv,
+                        proxy.clone(),
+                    );
                 } else {
                     spawn_send_for_state(
                         full_text,
@@ -1229,13 +1635,28 @@ fn execute_text_and_command(
                         is_final: true,
                     },
                 );
-                spawn_send_for_state(
-                    paste_text,
-                    true,
-                    VoiceCommand::Send.as_str(),
-                    state,
-                    proxy.clone(),
-                );
+                if state.config.send_countdown.enabled
+                    && state.config.send_countdown.duration_ms >= 300
+                    && !paste_text.trim().is_empty()
+                {
+                    start_send_countdown(
+                        paste_text,
+                        true,
+                        VoiceCommand::Send.as_str(),
+                        state,
+                        main_wv,
+                        overlay_wv,
+                        proxy.clone(),
+                    );
+                } else {
+                    spawn_send_for_state(
+                        paste_text,
+                        true,
+                        VoiceCommand::Send.as_str(),
+                        state,
+                        proxy.clone(),
+                    );
+                }
             }
         },
         Some(VoiceCommand::DiscordMuteMic) => {
@@ -1476,22 +1897,36 @@ fn handle_transcript(
     tray: &Option<TrayManager>,
     sound: &SoundPlayer,
     proxy: &EventLoopProxy<UserEvent>,
-) {
+) -> String {
+    // 0. If a pre-send countdown is active, allow spoken "待って" / "取り消し" / "キャンセル" to abort send!
+    if state.pending_countdown.is_some() && parse_countdown_cancel(raw) {
+        cancel_send_countdown(
+            state,
+            main_wv,
+            overlay_wv,
+            sound,
+            "音声コマンドで送信をキャンセルしました",
+        );
+        return String::new();
+    }
+
     // 1. If awaiting friend confirmation ("この人で合っていますか？"), handle Yes / No / Next / Prev
     //    if the user spoke a short confirmation reply; otherwise let normal dictation & commands work!
     if state.pending_confirm.is_some() {
         if let Some(reply) = parse_confirmation_reply(raw) {
             handle_confirmation_reply(reply, state, main_wv, overlay_wv, tray, sound, proxy);
-            return;
+            return String::new();
         }
     }
 
+    let eff_filter = state.effective_filter();
     let processed = processor::process_transcript(
         raw,
-        &state.config.filter,
+        &eff_filter,
         &state.config.commands,
         &state.config.discord_targets,
     );
+    let final_text = processed.text.clone();
 
     if processed.target_switch.is_some() || processed.command == Some(VoiceCommand::ClearAll) {
         if state.pending_confirm.take().is_some() {
@@ -1516,7 +1951,7 @@ fn handle_transcript(
                 },
             );
         }
-        return;
+        return String::new();
     }
 
     // 2. Handle friend name / passphrase target switching
@@ -1572,7 +2007,7 @@ fn handle_transcript(
                     if first.webhook_url.trim().is_empty() {
                         spawn_navigate_target(
                             first,
-                            state.config.guard.clone(),
+                            state.effective_guard(),
                             state.config.discord_targets.navigate_delay_ms,
                             proxy.clone(),
                         );
@@ -1587,12 +2022,12 @@ fn handle_transcript(
                     sound.play(SoundKind::ToggleOn, &state.config.sound);
                     emit_all(main_wv, overlay_wv, &pending.prompt_event());
                     state.pending_confirm = Some(pending);
-                    return;
+                    return final_text;
                 } else if state.config.discord_targets.use_quick_switcher_for_unknown {
                     // Unregistered friend -> open Discord Quick Switcher (Ctrl+K) with @<name> and ask confirmation!
                     spawn_quick_switcher_open(
                         query.clone(),
-                        state.config.guard.clone(),
+                        state.effective_guard(),
                         state.config.discord_targets.navigate_delay_ms,
                         proxy.clone(),
                     );
@@ -1605,7 +2040,7 @@ fn handle_transcript(
                     sound.play(SoundKind::ToggleOn, &state.config.sound);
                     emit_all(main_wv, overlay_wv, &pending.prompt_event());
                     state.pending_confirm = Some(pending);
-                    return;
+                    return final_text;
                 } else {
                     emit(
                         main_wv,
@@ -1614,7 +2049,7 @@ fn handle_transcript(
                             message: format!("「{}」に一致する宛先が見つかりませんでした", query),
                         },
                     );
-                    return;
+                    return final_text;
                 }
             }
         }
@@ -1630,6 +2065,7 @@ fn handle_transcript(
         sound,
         proxy,
     );
+    final_text
 }
 
 const MAIN_WINDOW_TITLE: &str = "VoxDrop — ハンズフリー音声チャット支援";
@@ -1732,6 +2168,12 @@ fn main() -> wry::Result<()> {
             state.config.discord_tts.voicevox.exe_path.clone(),
             proxy.clone(),
         );
+    }
+
+    if state.config.stt.engine.eq_ignore_ascii_case("local-http")
+        && state.config.stt.http_asr.auto_launch
+    {
+        spawn_http_asr_autostart(state.config.stt.http_asr.clone(), proxy.clone());
     }
 
     let hk_proxy = proxy.clone();
@@ -1838,18 +2280,22 @@ fn main() -> wry::Result<()> {
                     state.runtime_dir = runtime_dir;
                     audio_ctrl.set_runtime_dir(state.runtime_dir.clone());
                 }
-                let hints = build_stt_prompt_hints(&state.config);
+                let hints = build_stt_prompt_hints(&state.config, state.active_profile());
                 engine.set_prompt_hints(&hints);
                 state.stt_ready = engine.is_ready();
                 state.stt_engine_name = engine.name();
+                state.stt_device_name = engine.device_name();
                 let _ = stt_tx.send(SttWorkerMsg::ReloadEngine(engine));
                 let models =
                     stt::local::list_available_ggml_models(&state.config.stt, state.runtime_dir.as_deref());
+                let qwen3_installed =
+                    stt::local::has_qwen3_asr_model(&state.config.stt, state.runtime_dir.as_deref());
                 emit(
                     &webview,
                     &BackendEvent::SttModels {
                         models,
                         selected: state.config.stt.model_file.clone(),
+                        qwen3_installed,
                     },
                 );
                 emit_all(&webview, &overlay_webview, &state.status_event());
@@ -1866,7 +2312,10 @@ fn main() -> wry::Result<()> {
                         &webview,
                         &BackendEvent::Toast {
                             level: "ok".into(),
-                            message: format!("STT準備完了: {}", state.stt_engine_name),
+                            message: format!(
+                                "STT準備完了: {} [{}]",
+                                state.stt_engine_name, state.stt_device_name
+                            ),
                         },
                     );
                 }
@@ -1933,10 +2382,14 @@ fn main() -> wry::Result<()> {
                     emit_all(&webview, &overlay_webview, &state.status_event());
                 }
                 AudioEvent::Utterance(samples) => {
-                    let _ = stt_tx.send(SttWorkerMsg::Transcribe {
-                        samples,
+                    let hints = build_stt_prompt_hints(&state.config, state.active_profile());
+                    let ctx = TranscribeContext {
+                        language: state.config.stt.language.clone(),
+                        hotwords_prompt: if hints.is_empty() { None } else { Some(hints) },
+                        preset: state.config.stt.preset,
                         radio_clarity: state.config.noise_cancel.radio_clarity_mode,
-                    });
+                    };
+                    let _ = stt_tx.send(SttWorkerMsg::Transcribe { samples, ctx });
                 }
                 AudioEvent::Error(err) => {
                     state.listening = false;
@@ -1955,8 +2408,22 @@ fn main() -> wry::Result<()> {
                     );
                 }
             },
-            Event::UserEvent(UserEvent::TranscriptReady(result)) => {
+            Event::UserEvent(UserEvent::TranscriptReady {
+                samples_16k,
+                duration_sec,
+                peak_dbfs,
+                infer_ms,
+                rtf,
+                engine_label,
+                device_name,
+                result,
+            }) => {
                 state.recognizing = false;
+                state.last_infer_ms = infer_ms;
+                state.last_rtf = rtf;
+                if !device_name.is_empty() {
+                    state.stt_device_name = device_name.clone();
+                }
                 if let Some(ref t) = tray {
                     t.update_state(state.tray_state(), state.overlay_visible);
                 }
@@ -1964,19 +2431,56 @@ fn main() -> wry::Result<()> {
 
                 match result {
                     Ok(raw) => {
-                        if !raw.trim().is_empty() {
+                        let trimmed = raw.trim().to_string();
+                        let final_text = if !trimmed.is_empty() {
                             handle_transcript(
-                                &raw,
+                                &trimmed,
                                 &mut state,
                                 &webview,
                                 &overlay_webview,
                                 &tray,
                                 &sound_player,
                                 &proxy,
-                            );
-                        }
+                            )
+                        } else {
+                            String::new()
+                        };
+                        state.push_diagnostic(
+                            samples_16k,
+                            duration_sec,
+                            peak_dbfs,
+                            infer_ms,
+                            rtf,
+                            device_name,
+                            engine_label,
+                            trimmed,
+                            final_text,
+                        );
+                        emit(
+                            &webview,
+                            &BackendEvent::DiagnosticsUpdated {
+                                items: state.diagnostic_dtos(),
+                            },
+                        );
                     }
                     Err(err) => {
+                        state.push_diagnostic(
+                            samples_16k,
+                            duration_sec,
+                            peak_dbfs,
+                            infer_ms,
+                            rtf,
+                            device_name,
+                            engine_label,
+                            format!("[エラー] {}", err),
+                            String::new(),
+                        );
+                        emit(
+                            &webview,
+                            &BackendEvent::DiagnosticsUpdated {
+                                items: state.diagnostic_dtos(),
+                            },
+                        );
                         emit(
                             &webview,
                             &BackendEvent::Toast {
@@ -1987,12 +2491,230 @@ fn main() -> wry::Result<()> {
                     }
                 }
             }
+            Event::UserEvent(UserEvent::AbCompareDone {
+                id,
+                engine_label,
+                device_name,
+                infer_ms,
+                rtf,
+                result,
+            }) => match result {
+                Ok(text) => {
+                    emit(
+                        &webview,
+                        &BackendEvent::AbCompareResult {
+                            id,
+                            ok: true,
+                            engine_label,
+                            device_name,
+                            infer_ms,
+                            rtf,
+                            text,
+                            error: None,
+                        },
+                    );
+                }
+                Err(err) => {
+                    emit(
+                        &webview,
+                        &BackendEvent::AbCompareResult {
+                            id,
+                            ok: false,
+                            engine_label,
+                            device_name,
+                            infer_ms,
+                            rtf,
+                            text: String::new(),
+                            error: Some(err),
+                        },
+                    );
+                }
+            },
+            Event::UserEvent(UserEvent::SendCountdownTick {
+                id,
+                remaining_ms,
+                total_ms,
+            }) => {
+                if let Some(ref pending) = state.pending_countdown {
+                    if pending.id == id {
+                        let preview: String = pending.text.chars().take(60).collect();
+                        emit_all(
+                            &webview,
+                            &overlay_webview,
+                            &BackendEvent::SendCountdown {
+                                active: true,
+                                remaining_ms,
+                                total_ms,
+                                preview_text: preview,
+                            },
+                        );
+                    }
+                }
+            }
+            Event::UserEvent(UserEvent::SendCountdownFire { id }) => {
+                let matches_id = state
+                    .pending_countdown
+                    .as_ref()
+                    .map(|p| p.id == id)
+                    .unwrap_or(false);
+                if matches_id {
+                    if let Some(pending) = state.pending_countdown.take() {
+                        emit_all(
+                            &webview,
+                            &overlay_webview,
+                            &BackendEvent::SendCountdown {
+                                active: false,
+                                remaining_ms: 0,
+                                total_ms: 0,
+                                preview_text: String::new(),
+                            },
+                        );
+                        spawn_send_for_state(
+                            pending.text,
+                            pending.press_enter,
+                            pending.action,
+                            &state,
+                            proxy.clone(),
+                        );
+                    }
+                }
+            }
+            Event::UserEvent(UserEvent::SendCountdownCancelEsc { id }) => {
+                let matches_id = state
+                    .pending_countdown
+                    .as_ref()
+                    .map(|p| p.id == id)
+                    .unwrap_or(false);
+                if matches_id {
+                    cancel_send_countdown(
+                        &mut state,
+                        &webview,
+                        &overlay_webview,
+                        &sound_player,
+                        "Escキーで送信をキャンセルしました",
+                    );
+                }
+            }
+            Event::UserEvent(UserEvent::ModelDownloadProgress {
+                model_id,
+                progress,
+                message,
+                done,
+                ok,
+            }) => {
+                emit(
+                    &webview,
+                    &BackendEvent::ModelDownloadProgress {
+                        model_id,
+                        progress,
+                        message: message.clone(),
+                        done,
+                        ok,
+                    },
+                );
+                if done {
+                    let models = stt::local::list_available_ggml_models(
+                        &state.config.stt,
+                        state.runtime_dir.as_deref(),
+                    );
+                    let qwen3_installed = stt::local::has_qwen3_asr_model(
+                        &state.config.stt,
+                        state.runtime_dir.as_deref(),
+                    );
+                    emit(
+                        &webview,
+                        &BackendEvent::SttModels {
+                            models,
+                            selected: state.config.stt.model_file.clone(),
+                            qwen3_installed,
+                        },
+                    );
+                    emit(
+                        &webview,
+                        &BackendEvent::Toast {
+                            level: if ok { "ok" } else { "error" }.into(),
+                            message,
+                        },
+                    );
+                }
+            }
+            Event::UserEvent(UserEvent::HttpAsrHealthDone(res)) => match res {
+                Ok(msg) => {
+                    emit(
+                        &webview,
+                        &BackendEvent::HttpAsrHealthResult {
+                            ok: true,
+                            message: msg.clone(),
+                        },
+                    );
+                    emit(
+                        &webview,
+                        &BackendEvent::Toast {
+                            level: "ok".into(),
+                            message: msg,
+                        },
+                    );
+                }
+                Err(err) => {
+                    emit(
+                        &webview,
+                        &BackendEvent::HttpAsrHealthResult {
+                            ok: false,
+                            message: err.clone(),
+                        },
+                    );
+                    emit(
+                        &webview,
+                        &BackendEvent::Toast {
+                            level: "error".into(),
+                            message: err,
+                        },
+                    );
+                }
+            },
             Event::UserEvent(UserEvent::ActiveWindowChanged {
                 process,
                 target_active,
             }) => {
-                state.active_process = process;
+                state.active_process = process.clone();
                 state.target_active = target_active;
+                let prev_profile = state.active_game_profile_id.clone();
+                if let Some(matched) =
+                    find_matching_game_profile(&process, &state.config.game_profiles)
+                {
+                    state.active_game_profile_id = Some(matched.id.clone());
+                } else if !target_active {
+                    state.active_game_profile_id = None;
+                }
+                if state.active_game_profile_id != prev_profile {
+                    state.sync_guard();
+                    let hints = build_stt_prompt_hints(&state.config, state.active_profile());
+                    let _ = stt_tx.send(SttWorkerMsg::UpdatePromptHints(hints));
+                    if let Some(p) = state.active_profile().cloned() {
+                        if let (Some(x), Some(y)) = (p.overlay_x, p.overlay_y) {
+                            overlay_window.set_outer_position(LogicalPosition::new(x as f64, y as f64));
+                        }
+                        if let Some(op) = p.overlay_opacity {
+                            emit(
+                                &overlay_webview,
+                                &BackendEvent::OverlayStyle {
+                                    opacity: op.clamp(0.2, 1.0),
+                                },
+                            );
+                        }
+                    } else {
+                        overlay_window.set_outer_position(LogicalPosition::new(
+                            state.config.overlay.x as f64,
+                            state.config.overlay.y as f64,
+                        ));
+                        emit(
+                            &overlay_webview,
+                            &BackendEvent::OverlayStyle {
+                                opacity: state.config.overlay.opacity.clamp(0.2, 1.0),
+                            },
+                        );
+                    }
+                }
                 emit_all(&webview, &overlay_webview, &state.status_event());
             }
             Event::UserEvent(UserEvent::DiscordUrlCopied {
@@ -2377,6 +3099,9 @@ fn main() -> wry::Result<()> {
                     if state.config.discord_tts.voicevox.stop_on_exit {
                         tts::launcher::stop_if_started_by_us();
                     }
+                    if state.config.stt.http_asr.stop_on_exit {
+                        stt::http_asr::stop_http_asr_if_started_by_us();
+                    }
                     audio_ctrl.shutdown();
                     let _ = stt_tx.send(SttWorkerMsg::Shutdown);
                     *control_flow = ControlFlow::Exit;
@@ -2391,6 +3116,18 @@ fn main() -> wry::Result<()> {
                             &BackendEvent::ConfigLoaded {
                                 config: state.config.clone(),
                                 config_path: state.config_path.display().to_string(),
+                            },
+                        );
+                        emit(
+                            &webview,
+                            &BackendEvent::DiagnosticsUpdated {
+                                items: state.diagnostic_dtos(),
+                            },
+                        );
+                        emit(
+                            &overlay_webview,
+                            &BackendEvent::OverlayStyle {
+                                opacity: state.config.overlay.opacity.clamp(0.2, 1.0),
                             },
                         );
                         emit_all(&webview, &overlay_webview, &state.status_event());
@@ -2408,9 +3145,23 @@ fn main() -> wry::Result<()> {
                         }
                     }
                     ClientCommand::SaveConfig { config } => {
-                        let stt_changed = state.config.stt != config.stt;
+                        let stt_changed = state.config.stt.engine != config.stt.engine
+                            || state.config.stt.model_dir != config.stt.model_dir
+                            || state.config.stt.model_file != config.stt.model_file
+                            || state.config.stt.cli_path != config.stt.cli_path
+                            || state.config.stt.language != config.stt.language
+                            || state.config.stt.threads != config.stt.threads
+                            || state.config.stt.http_asr != config.stt.http_asr;
                         let hotkeys_changed = state.config.hotkeys != config.hotkeys;
                         let autostart_changed = state.config.auto_start != config.auto_start;
+                        let should_launch_http_asr = config.stt.engine.eq_ignore_ascii_case("local-http")
+                            && config.stt.http_asr.auto_launch
+                            && (!state.config.stt.engine.eq_ignore_ascii_case("local-http")
+                                || !state.config.stt.http_asr.auto_launch
+                                || state.config.stt.http_asr.server_exe_path
+                                    != config.stt.http_asr.server_exe_path
+                                || state.config.stt.http_asr.base_url
+                                    != config.stt.http_asr.base_url);
                         let should_launch_voicevox = config.discord_tts.enabled
                             && config.discord_tts.voicevox.auto_launch
                             && (!state.config.discord_tts.enabled
@@ -2424,6 +3175,17 @@ fn main() -> wry::Result<()> {
                         overlay_window.set_visible(state.overlay_visible);
                         let _ = overlay_window
                             .set_ignore_cursor_events(state.config.overlay.click_through);
+                        emit(
+                            &overlay_webview,
+                            &BackendEvent::OverlayStyle {
+                                opacity: state.config.overlay.opacity.clamp(0.2, 1.0),
+                            },
+                        );
+                        state.active_game_profile_id = find_matching_game_profile(
+                            &state.active_process,
+                            &state.config.game_profiles,
+                        )
+                        .map(|p| p.id.clone());
                         state.sync_guard();
                         state.clipboard_watch_flag.store(
                             state.config.discord_integration.clipboard_url_watch,
@@ -2440,6 +3202,9 @@ fn main() -> wry::Result<()> {
                                 state.config.discord_tts.voicevox.exe_path.clone(),
                                 proxy.clone(),
                             );
+                        }
+                        if should_launch_http_asr {
+                            spawn_http_asr_autostart(state.config.stt.http_asr.clone(), proxy.clone());
                         }
 
                         if autostart_changed {
@@ -2464,7 +3229,8 @@ fn main() -> wry::Result<()> {
                                 proxy.clone(),
                             );
                         } else {
-                            let hints = build_stt_prompt_hints(&state.config);
+                            let hints =
+                                build_stt_prompt_hints(&state.config, state.active_profile());
                             let _ = stt_tx.send(SttWorkerMsg::UpdatePromptHints(hints));
                         }
 
@@ -2509,6 +3275,21 @@ fn main() -> wry::Result<()> {
                                     },
                                 );
                             }
+                        }
+                        if state.config.activation_mode == ActivationMode::PushToTalk
+                            && !state.ptt_active
+                            && state.listening
+                        {
+                            set_listening_state(
+                                false,
+                                false,
+                                &mut state,
+                                &audio_ctrl,
+                                &sound_player,
+                                &webview,
+                                &overlay_webview,
+                                &tray,
+                            );
                         }
                         if let Some(ref t) = tray {
                             t.update_state(state.tray_state(), state.overlay_visible);
@@ -2735,7 +3516,21 @@ fn main() -> wry::Result<()> {
                                     is_final: true,
                                 },
                             );
-                            spawn_send_for_state(text, true, "send_draft", &state, proxy.clone());
+                            if state.config.send_countdown.enabled
+                                && state.config.send_countdown.duration_ms >= 300
+                            {
+                                start_send_countdown(
+                                    text,
+                                    true,
+                                    "send_draft",
+                                    &mut state,
+                                    &webview,
+                                    &overlay_webview,
+                                    proxy.clone(),
+                                );
+                            } else {
+                                spawn_send_for_state(text, true, "send_draft", &state, proxy.clone());
+                            }
                         }
                     }
                     ClientCommand::CalibrateVad => {
@@ -2897,13 +3692,239 @@ fn main() -> wry::Result<()> {
                             &state.config.stt,
                             state.runtime_dir.as_deref(),
                         );
+                        let qwen3_installed = stt::local::has_qwen3_asr_model(
+                            &state.config.stt,
+                            state.runtime_dir.as_deref(),
+                        );
                         emit(
                             &webview,
                             &BackendEvent::SttModels {
                                 models,
                                 selected: state.config.stt.model_file.clone(),
+                                qwen3_installed,
                             },
                         );
+                    }
+                    ClientCommand::ReplayUtterance { id } => {
+                        if let Some(entry) = state.recent_utterances.iter().find(|u| u.id == id) {
+                            let wav = stt::local::encode_wav_16k_mono(&entry.samples_16k);
+                            sound_player.play_wav_bytes(wav, 1.0);
+                        } else {
+                            emit(
+                                &webview,
+                                &BackendEvent::Toast {
+                                    level: "info".into(),
+                                    message: "指定された音声データはメモリにありません".into(),
+                                },
+                            );
+                        }
+                    }
+                    ClientCommand::AbCompareUtterance {
+                        id,
+                        engine,
+                        model_file,
+                    } => {
+                        if let Some(entry) = state.recent_utterances.iter().find(|u| u.id == id) {
+                            let samples = entry.samples_16k.clone();
+                            let duration_sec = entry.duration_sec;
+                            let mut ab_cfg = state.config.stt.clone();
+                            ab_cfg.engine = engine.clone();
+                            ab_cfg.model_file = model_file.clone();
+                            let rt_dir = state.runtime_dir.clone();
+                            let hints =
+                                build_stt_prompt_hints(&state.config, state.active_profile());
+                            let ctx = TranscribeContext {
+                                language: ab_cfg.language.clone(),
+                                hotwords_prompt: if hints.is_empty() {
+                                    None
+                                } else {
+                                    Some(hints.clone())
+                                },
+                                preset: ab_cfg.preset,
+                                radio_clarity: state.config.noise_cancel.radio_clarity_mode,
+                            };
+                            let p = proxy.clone();
+                            thread::spawn(move || {
+                                let cache_key = format!(
+                                    "{}|{}|{}|{}|{}",
+                                    ab_cfg.engine,
+                                    ab_cfg.model_file,
+                                    ab_cfg.model_dir,
+                                    ab_cfg.language,
+                                    ab_cfg.http_asr.base_url
+                                );
+                                let eng = {
+                                    let mut cache = AB_ENGINE_CACHE.lock().ok();
+                                    let hit = cache
+                                        .as_ref()
+                                        .and_then(|g| g.as_ref())
+                                        .filter(|(k, _)| k == &cache_key)
+                                        .map(|(_, e)| e.clone());
+                                    if let Some(e) = hit {
+                                        e
+                                    } else {
+                                        let created = stt::create_engine(&ab_cfg, rt_dir.as_deref());
+                                        if let Some(ref mut g) = cache {
+                                            **g = Some((cache_key, created.clone()));
+                                        }
+                                        created
+                                    }
+                                };
+                                eng.set_prompt_hints(&hints);
+                                let engine_label = eng.name();
+                                let device_name = eng.device_name();
+                                let t0 = Instant::now();
+                                let res = eng.transcribe_with_context(&samples, &ctx);
+                                let infer_ms = t0.elapsed().as_millis() as u64;
+                                let rtf = if duration_sec > 0.01 {
+                                    (infer_ms as f32 / 1000.0) / duration_sec
+                                } else {
+                                    0.0
+                                };
+                                let _ = p.send_event(UserEvent::AbCompareDone {
+                                    id,
+                                    engine_label,
+                                    device_name,
+                                    infer_ms,
+                                    rtf,
+                                    result: res,
+                                });
+                            });
+                        }
+                    }
+                    ClientCommand::ClearDiagnostics => {
+                        state.recent_utterances.clear();
+                        emit(
+                            &webview,
+                            &BackendEvent::DiagnosticsUpdated { items: Vec::new() },
+                        );
+                    }
+                    ClientCommand::QuickLearnCorrection { from, to } => {
+                        let f = from.trim().to_string();
+                        let t = to.trim().to_string();
+                        if f.is_empty() || t.is_empty() {
+                            emit(
+                                &webview,
+                                &BackendEvent::Toast {
+                                    level: "error".into(),
+                                    message: "誤認識語句と正しい表記の両方を入力してください".into(),
+                                },
+                            );
+                        } else {
+                            if let Some(existing) = state
+                                .config
+                                .filter
+                                .dictionary
+                                .iter_mut()
+                                .find(|e| e.from.trim() == f)
+                            {
+                                existing.to = t.clone();
+                            } else {
+                                state.config.filter.dictionary.push(DictionaryEntry {
+                                    from: f.clone(),
+                                    to: t.clone(),
+                                });
+                            }
+                            let _ = state.config.save_to(&state.config_path);
+                            let hints =
+                                build_stt_prompt_hints(&state.config, state.active_profile());
+                            let _ = stt_tx.send(SttWorkerMsg::UpdatePromptHints(hints));
+                            emit(
+                                &webview,
+                                &BackendEvent::ConfigLoaded {
+                                    config: state.config.clone(),
+                                    config_path: state.config_path.display().to_string(),
+                                },
+                            );
+                            emit(
+                                &webview,
+                                &BackendEvent::Toast {
+                                    level: "ok".into(),
+                                    message: format!("辞書＆ヒントに登録しました: 「{}」→「{}」", f, t),
+                                },
+                            );
+                        }
+                    }
+                    ClientCommand::CancelSendCountdown => {
+                        cancel_send_countdown(
+                            &mut state,
+                            &webview,
+                            &overlay_webview,
+                            &sound_player,
+                            "送信前カウントダウンを中止しました",
+                        );
+                    }
+                    ClientCommand::DownloadModel {
+                        model_id,
+                        custom_url,
+                        custom_filename,
+                    } => {
+                        let target_dir = stt::local::resolve_download_model_dir(
+                            &state.config.stt.model_dir,
+                            state.runtime_dir.as_deref(),
+                        );
+                        let p = proxy.clone();
+                        thread::spawn(move || {
+                            let res = stt::downloader::download_model_into(
+                                &model_id,
+                                custom_url.as_deref(),
+                                custom_filename.as_deref(),
+                                &target_dir,
+                                |mid, pct, msg| {
+                                    let _ = p.send_event(UserEvent::ModelDownloadProgress {
+                                        model_id: mid.to_string(),
+                                        progress: pct,
+                                        message: msg.to_string(),
+                                        done: false,
+                                        ok: true,
+                                    });
+                                },
+                            );
+                            match res {
+                                Ok(path) => {
+                                    let _ = p.send_event(UserEvent::ModelDownloadProgress {
+                                        model_id,
+                                        progress: 100,
+                                        message: format!(
+                                            "モデル保存完了: {}",
+                                            path.display()
+                                        ),
+                                        done: true,
+                                        ok: true,
+                                    });
+                                }
+                                Err(err) => {
+                                    let _ = p.send_event(UserEvent::ModelDownloadProgress {
+                                        model_id,
+                                        progress: 0,
+                                        message: err,
+                                        done: true,
+                                        ok: false,
+                                    });
+                                }
+                            }
+                        });
+                    }
+                    ClientCommand::TestHttpAsr { base_url } => {
+                        let mut cfg = state.config.stt.http_asr.clone();
+                        if let Some(u) = base_url {
+                            if !u.trim().is_empty() {
+                                cfg.base_url = u.trim().to_string();
+                            }
+                        }
+                        let p = proxy.clone();
+                        thread::spawn(move || {
+                            let res = stt::http_asr::check_http_asr_health(&cfg);
+                            let _ = p.send_event(UserEvent::HttpAsrHealthDone(res));
+                        });
+                    }
+                    ClientCommand::LaunchHttpAsr => {
+                        let cfg = state.config.stt.http_asr.clone();
+                        let p = proxy.clone();
+                        thread::spawn(move || {
+                            let res = stt::http_asr::ensure_http_asr_running(&cfg);
+                            let _ = p.send_event(UserEvent::HttpAsrHealthDone(res));
+                        });
                     }
                     ClientCommand::ToggleOverlay => {
                         state.overlay_visible = !state.overlay_visible;
@@ -3052,4 +4073,36 @@ fn main() -> wry::Result<()> {
             _ => {}
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn computes_peak_dbfs_and_matches_game_profiles() {
+        assert!((compute_peak_dbfs(&[0.0, 0.0]) - (-96.0)).abs() < 1e-4);
+        assert!((compute_peak_dbfs(&[0.5, -0.25]) - (-6.0206)).abs() < 0.05);
+
+        let profiles = vec![GameProfile {
+            id: "ow2".into(),
+            name: "Overwatch 2".into(),
+            enabled: true,
+            process_names: vec!["Overwatch.exe".into()],
+            dictionary: vec![DictionaryEntry {
+                from: "うると".into(),
+                to: "ウルト".into(),
+            }],
+            send_method: Some(config::SendMethod::SafeWhenGameActive),
+            ..Default::default()
+        }];
+
+        let matched = find_matching_game_profile("overwatch.exe", &profiles).unwrap();
+        assert_eq!(matched.id, "ow2");
+        assert!(find_matching_game_profile("Discord.exe", &profiles).is_none());
+
+        let base_filter = TextFilterConfig::default();
+        let merged = merge_profile_filter(&base_filter, Some(matched));
+        assert!(merged.dictionary.iter().any(|d| d.to == "ウルト"));
+    }
 }

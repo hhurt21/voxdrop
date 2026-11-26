@@ -1,5 +1,19 @@
-use crate::config::{AppConfig, InputMode};
+use crate::config::{ActivationMode, AppConfig, InputMode};
 use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UtteranceDiagnosticDto {
+    pub id: u64,
+    pub timestamp: String,
+    pub duration_sec: f32,
+    pub peak_dbfs: f32,
+    pub infer_ms: u64,
+    pub rtf: f32,
+    pub device_name: String,
+    pub engine_label: String,
+    pub raw_text: String,
+    pub final_text: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScannedChannelDto {
@@ -28,6 +42,18 @@ pub enum ClientCommand {
     ListAudioDevices,
     ListSttModels,
     CalibrateVad,
+    ReplayUtterance { id: u64 },
+    AbCompareUtterance { id: u64, engine: String, model_file: String },
+    ClearDiagnostics,
+    QuickLearnCorrection { from: String, to: String },
+    CancelSendCountdown,
+    DownloadModel {
+        model_id: String,
+        custom_url: Option<String>,
+        custom_filename: Option<String>,
+    },
+    TestHttpAsr { base_url: Option<String> },
+    LaunchHttpAsr,
     ToggleOverlay,
     SetOverlayClickThrough { click_through: bool },
     DragOverlay,
@@ -121,12 +147,17 @@ pub enum BackendEvent {
         target_active: bool,
         active_process: String,
         input_mode: InputMode,
+        activation_mode: ActivationMode,
         overlay_visible: bool,
         stt_ready: bool,
         stt_engine: String,
+        stt_device: String,
+        last_infer_ms: u64,
+        last_rtf: f32,
         rnnoise_enabled: bool,
         active_discord_target_id: Option<String>,
         active_discord_target_label: String,
+        active_profile: Option<String>,
     },
     AudioDevices {
         devices: Vec<String>,
@@ -135,6 +166,40 @@ pub enum BackendEvent {
     SttModels {
         models: Vec<String>,
         selected: String,
+        qwen3_installed: bool,
+    },
+    DiagnosticsUpdated {
+        items: Vec<UtteranceDiagnosticDto>,
+    },
+    AbCompareResult {
+        id: u64,
+        ok: bool,
+        engine_label: String,
+        device_name: String,
+        infer_ms: u64,
+        rtf: f32,
+        text: String,
+        error: Option<String>,
+    },
+    SendCountdown {
+        active: bool,
+        remaining_ms: u64,
+        total_ms: u64,
+        preview_text: String,
+    },
+    ModelDownloadProgress {
+        model_id: String,
+        progress: u8,
+        message: String,
+        done: bool,
+        ok: bool,
+    },
+    HttpAsrHealthResult {
+        ok: bool,
+        message: String,
+    },
+    OverlayStyle {
+        opacity: f32,
     },
     Toast {
         level: String,

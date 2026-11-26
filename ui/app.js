@@ -8,6 +8,116 @@
   const history = [];
   const toastDebugLogs = [];
   let voicevoxSpeakers = [];
+  let gameProfiles = [];
+  let diagnosticsItems = [];
+  const phraseEditors = {};
+
+  function ensurePhraseEditor(id) {
+    if (phraseEditors[id]) return phraseEditors[id];
+    const root = $(id);
+    if (!root) return null;
+    const placeholder = root.dataset.placeholder || "新しいワードを入力";
+    root.innerHTML = "";
+
+    const chipsEl = document.createElement("div");
+    chipsEl.className = "phrase-chips";
+
+    const addRow = document.createElement("div");
+    addRow.className = "phrase-add-row";
+    const inp = document.createElement("input");
+    inp.type = "text";
+    inp.className = "input grow";
+    inp.placeholder = placeholder;
+    const addBtn = document.createElement("button");
+    addBtn.type = "button";
+    addBtn.className = "btn-secondary btn-sm";
+    addBtn.textContent = "＋ 追加";
+
+    const state = { items: [], chipsEl, inp };
+    phraseEditors[id] = state;
+
+    const commit = () => {
+      const val = inp.value.trim();
+      if (!val) return;
+      if (!state.items.includes(val)) {
+        state.items.push(val);
+        renderPhraseEditor(id);
+        saveNow();
+      } else {
+        showToast(`「${val}」はすでに登録されています`, "info");
+      }
+      inp.value = "";
+      inp.focus();
+    };
+
+    addBtn.addEventListener("click", commit);
+    inp.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        commit();
+      }
+    });
+
+    addRow.appendChild(inp);
+    addRow.appendChild(addBtn);
+    root.appendChild(chipsEl);
+    root.appendChild(addRow);
+    renderPhraseEditor(id);
+    return state;
+  }
+
+  function renderPhraseEditor(id) {
+    const st = phraseEditors[id];
+    if (!st) return;
+    st.chipsEl.innerHTML = "";
+    if (!st.items.length) {
+      const empty = document.createElement("span");
+      empty.className = "phrase-empty";
+      empty.textContent = "未登録（下の欄から1つずつ追加できます）";
+      st.chipsEl.appendChild(empty);
+      return;
+    }
+    st.items.forEach((word, idx) => {
+      const chip = document.createElement("span");
+      chip.className = "phrase-chip";
+      const lbl = document.createElement("span");
+      lbl.textContent = word;
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "phrase-chip-del";
+      del.title = "削除";
+      del.textContent = "×";
+      del.addEventListener("click", () => {
+        st.items.splice(idx, 1);
+        renderPhraseEditor(id);
+        saveNow();
+      });
+      chip.appendChild(lbl);
+      chip.appendChild(del);
+      st.chipsEl.appendChild(chip);
+    });
+  }
+
+  function setPhraseList(id, arr) {
+    const st = ensurePhraseEditor(id);
+    if (!st) return;
+    st.items = Array.isArray(arr)
+      ? arr.map((x) => String(x).trim()).filter(Boolean)
+      : [];
+    renderPhraseEditor(id);
+  }
+
+  function getPhraseList(id) {
+    const st = ensurePhraseEditor(id);
+    if (!st) return [];
+    const pending = st.inp.value.trim();
+    if (pending && !st.items.includes(pending)) {
+      st.items.push(pending);
+      st.inp.value = "";
+      renderPhraseEditor(id);
+    }
+    return [...st.items];
+  }
 
   function send(msg) {
     if (window.ipc && typeof window.ipc.postMessage === "function") {
@@ -497,6 +607,8 @@
     }
 
     updateModeButtons(cfg.input_mode);
+    updateActivationButtons(cfg.activation_mode || "vad");
+    updatePresetButtons((cfg.stt && cfg.stt.preset) || "normal");
     $("vadThreshold").value = cfg.vad.threshold;
     $("vadThresholdVal").textContent = Number(cfg.vad.threshold).toFixed(3);
     $("chkVadAutoAdjust").checked = cfg.vad.auto_adjust !== false;
@@ -519,9 +631,9 @@
     $("ncVadProbThreshold").value = nc.vad_prob_threshold;
 
     const dt = cfg.discord_targets || {};
-    $("targetPrefixes").value = joinCsv(dt.switch_prefixes);
-    $("targetSuffixes").value = joinCsv(dt.switch_suffixes);
-    $("targetResets").value = joinCsv(dt.reset_phrases);
+    setPhraseList("peTargetPrefixes", dt.switch_prefixes);
+    setPhraseList("peTargetSuffixes", dt.switch_suffixes);
+    setPhraseList("peTargetResets", dt.reset_phrases);
     $("targetNavDelay").value = dt.navigate_delay_ms || 420;
     $("chkTargetAutoNavSwitch").checked = !!dt.auto_navigate_on_switch;
     $("chkTargetAutoNavSend").checked = !!dt.auto_navigate_on_send;
@@ -541,12 +653,12 @@
     $("chkBotSend").checked = !!di.use_bot_for_send;
     $("chkClipboardWatch").checked = di.clipboard_url_watch !== false;
 
-    $("cmdSend").value = joinCsv(cfg.commands.send);
-    $("cmdClearAll").value = joinCsv(cfg.commands.clear_all);
-    $("cmdUndo").value = joinCsv(cfg.commands.undo);
-    $("cmdNewline").value = joinCsv(cfg.commands.newline);
-    $("cmdMute").value = joinCsv(cfg.commands.mute);
-    $("cmdResume").value = joinCsv(cfg.commands.resume);
+    setPhraseList("peCmdSend", cfg.commands.send);
+    setPhraseList("peCmdClearAll", cfg.commands.clear_all);
+    setPhraseList("peCmdUndo", cfg.commands.undo);
+    setPhraseList("peCmdNewline", cfg.commands.newline);
+    setPhraseList("peCmdMute", cfg.commands.mute);
+    setPhraseList("peCmdResume", cfg.commands.resume);
 
     $("chkRemoveFillers").checked = !!cfg.filter.remove_fillers;
     $("chkAutoPunct").checked = cfg.filter.auto_punctuation !== false;
@@ -583,6 +695,25 @@
     $("sttLanguage").value = cfg.stt.language || "ja";
     $("vadSilenceMs").value = cfg.vad.silence_ms;
     $("vadMinSpeechMs").value = cfg.vad.min_speech_ms;
+
+    const ha = (cfg.stt && cfg.stt.http_asr) || {};
+    $("httpAsrBaseUrl").value = ha.base_url || "http://127.0.0.1:8080";
+    $("httpAsrEndpoint").value = ha.endpoint_path || "/v1/audio/transcriptions";
+    $("httpAsrModel").value = ha.model || "qwen3-asr-1.7b";
+    $("httpAsrApiKey").value = ha.api_key || "";
+    $("chkHttpAsrAutoLaunch").checked = !!ha.auto_launch;
+    $("httpAsrExePath").value = ha.server_exe_path || "";
+    $("httpAsrArgs").value = ha.server_args || "";
+    $("chkHttpAsrStopExit").checked = ha.stop_on_exit !== false;
+
+    const sc = cfg.send_countdown || { enabled: false, duration_ms: 1500 };
+    $("chkCountdownEnabled").checked = !!sc.enabled;
+    $("countdownMs").value = sc.duration_ms != null ? sc.duration_ms : 1500;
+
+    gameProfiles = Array.isArray(cfg.game_profiles)
+      ? JSON.parse(JSON.stringify(cfg.game_profiles))
+      : [];
+    renderGameProfiles();
 
     const tts = cfg.discord_tts || {};
     const vv = tts.voicevox || {};
@@ -687,21 +818,31 @@
     const selectedDevice = $("audioDeviceSelect").value;
     const activeModeBtn = document.querySelector("#modeSegmented .seg-btn.active");
     const mode = activeModeBtn ? activeModeBtn.dataset.mode : currentConfig.input_mode;
+    const activeActBtn = document.querySelector("#activationSegmented .seg-btn.active");
+    const activationMode = activeActBtn
+      ? activeActBtn.dataset.activation
+      : currentConfig.activation_mode || "vad";
 
     return {
       ...currentConfig,
       input_mode: mode,
+      activation_mode: activationMode,
       audio_device: selectedDevice ? selectedDevice : null,
       auto_start: $("chkAutoStart").checked,
       start_minimized: $("chkStartMinimized").checked,
+      send_countdown: {
+        enabled: $("chkCountdownEnabled").checked,
+        duration_ms: Math.max(300, Math.min(5000, parseInt($("countdownMs").value, 10) || 1500)),
+      },
+      game_profiles: gameProfiles,
       commands: {
         ...currentConfig.commands,
-        send: splitCsv($("cmdSend").value),
-        clear_all: splitCsv($("cmdClearAll").value),
-        undo: splitCsv($("cmdUndo").value),
-        newline: splitCsv($("cmdNewline").value),
-        mute: splitCsv($("cmdMute").value),
-        resume: splitCsv($("cmdResume").value),
+        send: getPhraseList("peCmdSend"),
+        clear_all: getPhraseList("peCmdClearAll"),
+        undo: getPhraseList("peCmdUndo"),
+        newline: getPhraseList("peCmdNewline"),
+        mute: getPhraseList("peCmdMute"),
+        resume: getPhraseList("peCmdResume"),
       },
       filter: {
         dictionary: dict,
@@ -730,9 +871,9 @@
       },
       discord_targets: {
         active_target_id: validActive,
-        switch_prefixes: splitCsv($("targetPrefixes").value),
-        switch_suffixes: splitCsv($("targetSuffixes").value),
-        reset_phrases: splitCsv($("targetResets").value),
+        switch_prefixes: getPhraseList("peTargetPrefixes"),
+        switch_suffixes: getPhraseList("peTargetSuffixes"),
+        reset_phrases: getPhraseList("peTargetResets"),
         allow_standalone_passphrase: $("chkTargetStandalone").checked,
         use_quick_switcher_for_unknown: $("chkTargetQuickSwitcher").checked,
         auto_navigate_on_switch: $("chkTargetAutoNavSwitch").checked,
@@ -802,6 +943,17 @@
         model_dir: $("sttModelDir").value.trim(),
         cli_path: $("sttCliPath").value.trim(),
         language: $("sttLanguage").value.trim() || "ja",
+        preset: (currentConfig.stt && currentConfig.stt.preset) || "normal",
+        http_asr: {
+          base_url: $("httpAsrBaseUrl").value.trim() || "http://127.0.0.1:8080",
+          endpoint_path: $("httpAsrEndpoint").value.trim() || "/v1/audio/transcriptions",
+          model: $("httpAsrModel").value.trim() || "qwen3-asr-1.7b",
+          api_key: $("httpAsrApiKey").value.trim(),
+          auto_launch: $("chkHttpAsrAutoLaunch").checked,
+          server_exe_path: $("httpAsrExePath").value.trim(),
+          server_args: $("httpAsrArgs").value.trim(),
+          stop_on_exit: $("chkHttpAsrStopExit").checked,
+        },
       },
     };
   }
@@ -821,9 +973,70 @@
         : "発話が確定するたびに、カーソル位置へ即座にペーストします。";
   }
 
+  function updateActivationButtons(mode) {
+    const val = mode || "vad";
+    document.querySelectorAll("#activationSegmented .seg-btn").forEach((b) => {
+      b.classList.toggle("active", b.dataset.activation === val);
+    });
+  }
+
+  function updatePresetButtons(preset) {
+    const val = preset || "normal";
+    document.querySelectorAll("[data-vad-preset]").forEach((b) => {
+      b.classList.toggle("active", b.dataset.vadPreset === val);
+    });
+  }
+
   function updateThresholdMarker(th) {
     const pct = Math.min(100, Math.max(0, (th / 0.2) * 100));
     $("meterThreshold").style.left = pct + "%";
+  }
+
+  function buildQuickLearnRow(initialFrom, onSubmitted) {
+    const form = document.createElement("div");
+    form.className = "quick-learn-row";
+    form.style.display = "none";
+    form.addEventListener("click", (e) => e.stopPropagation());
+
+    const fromInp = document.createElement("input");
+    fromInp.type = "text";
+    fromInp.className = "input";
+    fromInp.style.width = "160px";
+    fromInp.placeholder = "誤認識ワード";
+    fromInp.value = initialFrom || "";
+
+    const arrow = document.createElement("span");
+    arrow.className = "small-label";
+    arrow.textContent = "→";
+
+    const toInp = document.createElement("input");
+    toInp.type = "text";
+    toInp.className = "input";
+    toInp.style.width = "160px";
+    toInp.placeholder = "正しい表記";
+
+    const saveBtn = document.createElement("button");
+    saveBtn.type = "button";
+    saveBtn.className = "btn-success btn-sm";
+    saveBtn.textContent = "辞書に登録";
+    saveBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const from = fromInp.value.trim();
+      const to = toInp.value.trim();
+      if (!from || !to) {
+        showToast("誤認識ワードと正しい表記の両方を入力してください", "error");
+        return;
+      }
+      send({ type: "QuickLearnCorrection", from, to });
+      form.style.display = "none";
+      if (onSubmitted) onSubmitted(from, to);
+    });
+
+    form.appendChild(fromInp);
+    form.appendChild(arrow);
+    form.appendChild(toInp);
+    form.appendChild(saveBtn);
+    return { form, fromInp, toInp };
   }
 
   function addHistoryItem(text) {
@@ -845,13 +1058,38 @@
     history.forEach((item) => {
       const div = document.createElement("div");
       div.className = "history-item";
+      div.style.flexDirection = "column";
+      div.style.alignItems = "stretch";
+
+      const topRow = document.createElement("div");
+      topRow.className = "row space-between";
       const spanText = document.createElement("span");
+      spanText.className = "grow";
       spanText.textContent = item.text;
+      const actions = document.createElement("div");
+      actions.className = "row gap-sm";
+      const learnBtn = document.createElement("button");
+      learnBtn.type = "button";
+      learnBtn.className = "btn-secondary btn-sm";
+      learnBtn.textContent = "修正＆辞書登録";
       const spanTime = document.createElement("span");
       spanTime.className = "history-time";
       spanTime.textContent = item.time;
-      div.appendChild(spanText);
-      div.appendChild(spanTime);
+      actions.appendChild(learnBtn);
+      actions.appendChild(spanTime);
+      topRow.appendChild(spanText);
+      topRow.appendChild(actions);
+
+      const { form, toInp } = buildQuickLearnRow(item.text);
+      learnBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const showing = form.style.display !== "none";
+        form.style.display = showing ? "none" : "flex";
+        if (!showing) toInp.focus();
+      });
+
+      div.appendChild(topRow);
+      div.appendChild(form);
       div.addEventListener("click", () => {
         if (navigator.clipboard) {
           navigator.clipboard.writeText(item.text).then(() => {
@@ -860,6 +1098,203 @@
         }
       });
       list.appendChild(div);
+    });
+  }
+
+  function renderDiagnostics(items) {
+    const list = $("diagnosticsList");
+    if (!items || !items.length) {
+      list.innerHTML =
+        '<div class="empty-state">まだ診断データがありません。発話するとここに録音時間・ピークdBFS・推論時間・RTFが表示されます。</div>';
+      return;
+    }
+    list.innerHTML = "";
+    items.forEach((item) => {
+      const card = document.createElement("div");
+      card.className = "diag-item";
+
+      const stats = document.createElement("div");
+      stats.className = "diag-stats";
+      [
+        item.timestamp,
+        `長さ: ${Number(item.duration_sec || 0).toFixed(2)}s`,
+        `ピーク: ${Number(item.peak_dbfs || 0).toFixed(1)} dBFS`,
+        `推論: ${item.infer_ms}ms`,
+        `RTF: ${Number(item.rtf || 0).toFixed(2)}`,
+        `デバイス: ${item.device_name || "-"}`,
+        `エンジン: ${item.engine_label || "-"}`,
+      ].forEach((txt) => {
+        const sp = document.createElement("span");
+        sp.className = "pill";
+        sp.textContent = txt;
+        stats.appendChild(sp);
+      });
+
+      const rawRow = document.createElement("div");
+      rawRow.className = "diag-text-row";
+      rawRow.textContent = `生認識: ${item.raw_text || "(空)"}`;
+
+      const finalRow = document.createElement("div");
+      finalRow.className = "diag-text-row";
+      finalRow.textContent = `整形後: ${item.final_text || "(なし)"}`;
+
+      const btnRow = document.createElement("div");
+      btnRow.className = "row gap-sm";
+      btnRow.style.marginTop = "6px";
+      btnRow.style.flexWrap = "wrap";
+
+      const playBtn = document.createElement("button");
+      playBtn.type = "button";
+      playBtn.className = "btn-secondary btn-sm";
+      playBtn.textContent = "▶ 再生";
+      playBtn.addEventListener("click", () => {
+        send({ type: "ReplayUtterance", id: item.id });
+      });
+
+      const abBtn = document.createElement("button");
+      abBtn.type = "button";
+      abBtn.className = "btn-primary btn-sm";
+      abBtn.textContent = "⚖ A/B再推論";
+      abBtn.addEventListener("click", () => {
+        const resBox = $("ab-result-" + item.id);
+        if (resBox) {
+          resBox.className = "ab-result show";
+          resBox.textContent = "A/B 再推論を実行中...";
+        }
+        send({
+          type: "AbCompareUtterance",
+          id: item.id,
+          engine: $("abEngine").value,
+          model_file: $("abModelFile").value || "",
+        });
+      });
+
+      const learnBtn = document.createElement("button");
+      learnBtn.type = "button";
+      learnBtn.className = "btn-secondary btn-sm";
+      learnBtn.textContent = "誤認識を学習";
+
+      const { form, toInp } = buildQuickLearnRow(item.raw_text || item.final_text || "");
+      learnBtn.addEventListener("click", () => {
+        const showing = form.style.display !== "none";
+        form.style.display = showing ? "none" : "flex";
+        if (!showing) toInp.focus();
+      });
+
+      const abResult = document.createElement("div");
+      abResult.id = "ab-result-" + item.id;
+      abResult.className = "ab-result";
+
+      btnRow.appendChild(playBtn);
+      btnRow.appendChild(abBtn);
+      btnRow.appendChild(learnBtn);
+
+      card.appendChild(stats);
+      card.appendChild(rawRow);
+      card.appendChild(finalRow);
+      card.appendChild(btnRow);
+      card.appendChild(form);
+      card.appendChild(abResult);
+      list.appendChild(card);
+    });
+  }
+
+  function formatProfileDictText(dict) {
+    return (dict || []).map((d) => `${d.from}=${d.to}`).join("\n");
+  }
+
+  function parseProfileDictText(txt) {
+    return (txt || "")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => {
+        const idx = line.indexOf("=");
+        if (idx <= 0) return null;
+        return {
+          from: line.slice(0, idx).trim(),
+          to: line.slice(idx + 1).trim(),
+        };
+      })
+      .filter((x) => x && x.from);
+  }
+
+  function resetGameProfileForm() {
+    $("gpEditId").value = "";
+    $("gpName").value = "";
+    $("gpProcesses").value = "";
+    $("gpSendMethod").value = "";
+    $("gpOverlayX").value = "";
+    $("gpOverlayY").value = "";
+    $("gpOverlayOpacity").value = "";
+    $("gpDictText").value = "";
+    $("btnGpSave").textContent = "プロファイル保存";
+  }
+
+  function renderGameProfiles() {
+    const list = $("gameProfileList");
+    if (!gameProfiles.length) {
+      list.innerHTML = '<div class="empty-state">ゲームプロファイルはまだ登録されていません</div>';
+      return;
+    }
+    list.innerHTML = "";
+    gameProfiles.forEach((gp) => {
+      const card = document.createElement("div");
+      card.className = "profile-item row space-between";
+
+      const info = document.createElement("div");
+      const title = document.createElement("strong");
+      title.textContent = gp.name || "(無名)";
+      const sub = document.createElement("div");
+      sub.className = "small-label";
+      sub.textContent = `プロセス: ${(gp.process_names || []).join(", ") || "-"} | 辞書: ${(gp.dictionary || []).length}件${gp.send_method ? " | 送信: " + gp.send_method : ""}`;
+      info.appendChild(title);
+      info.appendChild(sub);
+
+      const btns = document.createElement("div");
+      btns.className = "row gap-sm";
+
+      const chk = document.createElement("input");
+      chk.type = "checkbox";
+      chk.checked = gp.enabled !== false;
+      chk.title = "有効/無効";
+      chk.addEventListener("change", () => {
+        gp.enabled = chk.checked;
+        saveNow();
+      });
+
+      const editBtn = document.createElement("button");
+      editBtn.type = "button";
+      editBtn.className = "btn-secondary btn-sm";
+      editBtn.textContent = "編集";
+      editBtn.addEventListener("click", () => {
+        $("gpEditId").value = gp.id;
+        $("gpName").value = gp.name || "";
+        $("gpProcesses").value = (gp.process_names || []).join(", ");
+        $("gpSendMethod").value = gp.send_method || "";
+        $("gpOverlayX").value = gp.overlay_x != null ? gp.overlay_x : "";
+        $("gpOverlayY").value = gp.overlay_y != null ? gp.overlay_y : "";
+        $("gpOverlayOpacity").value = gp.overlay_opacity != null ? gp.overlay_opacity : "";
+        $("gpDictText").value = formatProfileDictText(gp.dictionary);
+        $("btnGpSave").textContent = "更新保存";
+      });
+
+      const delBtn = document.createElement("button");
+      delBtn.type = "button";
+      delBtn.className = "btn-danger btn-sm";
+      delBtn.textContent = "削除";
+      delBtn.addEventListener("click", () => {
+        gameProfiles = gameProfiles.filter((x) => x.id !== gp.id);
+        renderGameProfiles();
+        saveNow();
+      });
+
+      btns.appendChild(chk);
+      btns.appendChild(editBtn);
+      btns.appendChild(delBtn);
+      card.appendChild(info);
+      card.appendChild(btns);
+      list.appendChild(card);
     });
   }
 
@@ -1250,6 +1685,95 @@
   $("sttModelFile").addEventListener("change", saveNow);
   $("sttEngine").addEventListener("change", saveNow);
 
+  document.querySelectorAll("#activationSegmented .seg-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      updateActivationButtons(btn.dataset.activation);
+      saveNow();
+    });
+  });
+
+  $("btnCancelCountdown").addEventListener("click", () => {
+    send({ type: "CancelSendCountdown" });
+  });
+  $("chkCountdownEnabled").addEventListener("change", saveNow);
+  $("countdownMs").addEventListener("change", saveNow);
+
+  $("btnClearDiagnostics").addEventListener("click", () => {
+    send({ type: "ClearDiagnostics" });
+  });
+
+  $("chkHttpAsrAutoLaunch").addEventListener("change", saveNow);
+  $("chkHttpAsrStopExit").addEventListener("change", saveNow);
+  $("btnTestHttpAsr").addEventListener("click", () => {
+    const baseUrl = $("httpAsrBaseUrl").value.trim() || null;
+    send({ type: "TestHttpAsr", base_url: baseUrl });
+  });
+  $("btnLaunchHttpAsr").addEventListener("click", () => {
+    saveNow();
+    send({ type: "LaunchHttpAsr" });
+  });
+
+  document.querySelectorAll("[data-download-model]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      send({
+        type: "DownloadModel",
+        model_id: btn.dataset.downloadModel,
+        custom_url: null,
+        custom_filename: null,
+      });
+    });
+  });
+
+  $("btnDownloadCustomModel").addEventListener("click", () => {
+    const customUrl = $("customModelUrl").value.trim();
+    const customFilename = $("customModelFilename").value.trim();
+    if (!customUrl) {
+      showToast("カスタムURLを入力してください", "error");
+      return;
+    }
+    send({
+      type: "DownloadModel",
+      model_id: "custom",
+      custom_url: customUrl,
+      custom_filename: customFilename || null,
+    });
+  });
+
+  $("btnGpSave").addEventListener("click", () => {
+    const name = $("gpName").value.trim();
+    const processes = splitCsv($("gpProcesses").value);
+    if (!name || !processes.length) {
+      showToast("プロファイル名と対象プロセス名を入力してください", "error");
+      return;
+    }
+    const editId = $("gpEditId").value;
+    const xRaw = $("gpOverlayX").value.trim();
+    const yRaw = $("gpOverlayY").value.trim();
+    const opRaw = $("gpOverlayOpacity").value.trim();
+    const gpObj = {
+      id: editId || genId("gp"),
+      name,
+      enabled: true,
+      process_names: processes,
+      dictionary: parseProfileDictText($("gpDictText").value),
+      send_method: $("gpSendMethod").value || null,
+      overlay_x: xRaw !== "" ? parseInt(xRaw, 10) : null,
+      overlay_y: yRaw !== "" ? parseInt(yRaw, 10) : null,
+      overlay_opacity: opRaw !== "" ? Math.max(0.2, Math.min(1.0, parseFloat(opRaw))) : null,
+    };
+    const idx = gameProfiles.findIndex((x) => x.id === gpObj.id);
+    if (idx >= 0) {
+      gpObj.enabled = gameProfiles[idx].enabled !== false;
+      gameProfiles[idx] = gpObj;
+    } else {
+      gameProfiles.push(gpObj);
+    }
+    resetGameProfileForm();
+    renderGameProfiles();
+    saveNow();
+  });
+  $("btnGpCancelEdit").addEventListener("click", resetGameProfileForm);
+
   const VAD_PRESETS = {
     normal: {
       label: "通常会話（推奨）",
@@ -1282,6 +1806,8 @@
       const p = VAD_PRESETS[btn.dataset.vadPreset];
       if (!p || !currentConfig) return;
       currentConfig.vad.pre_roll_ms = p.pre_roll_ms;
+      currentConfig.stt.preset = btn.dataset.vadPreset;
+      updatePresetButtons(btn.dataset.vadPreset);
       $("vadThreshold").value = p.threshold;
       $("vadThresholdVal").textContent = p.threshold.toFixed(3);
       updateThresholdMarker(p.threshold);
@@ -1467,7 +1993,29 @@
         pillStt.textContent = "STT: " + ev.stt_engine + (ev.stt_ready ? " (準備完了)" : " (待機)");
         pillStt.className = "pill " + (ev.stt_ready ? "ok" : "");
 
+        const pillDev = $("pillSttDevice");
+        const devLabel = ev.stt_device || "-";
+        const latStr = ev.last_infer_ms
+          ? ` (${ev.last_infer_ms}ms / RTF ${Number(ev.last_rtf || 0).toFixed(2)})`
+          : "";
+        pillDev.textContent = "推論: " + devLabel + latStr;
+        pillDev.className = "pill " + (devLabel.includes("Vulkan") || devLabel.includes("DirectML") ? "ok" : "");
+
+        $("diagEngine").textContent = "エンジン: " + (ev.stt_engine || "-");
+        $("diagDevice").textContent = "デバイス: " + devLabel;
+        $("diagLastMs").textContent = "遅延: " + (ev.last_infer_ms ? ev.last_infer_ms + "ms" : "-");
+        $("diagLastRtf").textContent = "RTF: " + (ev.last_infer_ms ? Number(ev.last_rtf || 0).toFixed(2) : "-");
+
+        const pillGp = $("pillGameProfile");
+        if (ev.active_profile) {
+          pillGp.textContent = "プロファイル: " + ev.active_profile;
+          pillGp.style.display = "inline-block";
+        } else {
+          pillGp.style.display = "none";
+        }
+
         updateModeButtons(ev.input_mode);
+        updateActivationButtons(ev.activation_mode || "vad");
         $("chkOverlayEnabled").checked = !!ev.overlay_visible;
         break;
       }
@@ -1486,15 +2034,24 @@
       }
       case "SttModels": {
         const sel = $("sttModelFile");
+        const abSel = $("abModelFile");
         const prev = ev.selected != null ? ev.selected : sel.value || "";
+        const abPrev = abSel.value || "";
         sel.innerHTML = '<option value="">自動（最高精度モデルを優先）</option>';
+        abSel.innerHTML = '<option value="">自動</option>';
         (ev.models || []).forEach((name) => {
           const opt = document.createElement("option");
           opt.value = name;
           opt.textContent = name;
           sel.appendChild(opt);
+          abSel.appendChild(opt.cloneNode(true));
         });
         sel.value = prev;
+        abSel.value = abPrev;
+
+        const qBadge = $("qwen3StatusBadge");
+        qBadge.textContent = ev.qwen3_installed ? "Qwen3-ASR: 導入済み" : "Qwen3-ASR: 未導入";
+        qBadge.className = "pill " + (ev.qwen3_installed ? "ok" : "");
         break;
       }
       case "Toast":
@@ -1564,6 +2121,55 @@
       case "ToastDebugLog":
         addToastDebugLog(ev.text);
         break;
+      case "DiagnosticsUpdated":
+        diagnosticsItems = ev.items || [];
+        renderDiagnostics(diagnosticsItems);
+        break;
+      case "AbCompareResult": {
+        const box = $("ab-result-" + ev.id);
+        if (box) {
+          box.className = "ab-result show" + (ev.ok ? "" : " err");
+          box.textContent = ev.ok
+            ? `[${ev.engine_label} | ${ev.device_name} | ${ev.infer_ms}ms | RTF ${Number(ev.rtf || 0).toFixed(2)}] ${ev.text || "(空)"}`
+            : `エラー (${ev.engine_label}): ${ev.error || "推論失敗"}`;
+        }
+        break;
+      }
+      case "SendCountdown": {
+        const banner = $("countdownBanner");
+        if (ev.active) {
+          const sec = (Math.max(0, ev.remaining_ms || 0) / 1000).toFixed(1);
+          const pct = Math.min(
+            100,
+            Math.max(0, ((ev.remaining_ms || 0) / Math.max(1, ev.total_ms || 1)) * 100)
+          );
+          $("countdownText").textContent = `送信まで ${sec}秒（「待って」/「取り消し」/ Esc で中止）: ${ev.preview_text || ""}`;
+          $("countdownProgress").style.width = pct + "%";
+          banner.style.display = "flex";
+        } else {
+          banner.style.display = "none";
+        }
+        break;
+      }
+      case "ModelDownloadProgress": {
+        $("dlProgressWrap").style.display = "block";
+        $("dlProgressText").textContent = `[${ev.model_id}] ${ev.message || ""}`;
+        $("dlProgressBar").style.width = Math.min(100, Math.max(0, ev.progress || 0)) + "%";
+        if (ev.done) {
+          showToast(ev.message || (ev.ok ? "モデル取得完了" : "取得失敗"), ev.ok ? "ok" : "error");
+          if (ev.ok) {
+            send({ type: "ListSttModels" });
+          }
+        }
+        break;
+      }
+      case "HttpAsrHealthResult": {
+        const badge = $("httpAsrStatusBadge");
+        badge.textContent = ev.ok ? "HTTP ASR: 接続OK" : "HTTP ASR: 未接続";
+        badge.className = "pill " + (ev.ok ? "ok" : "warn");
+        showToast(ev.message, ev.ok ? "ok" : "error");
+        break;
+      }
     }
   };
 

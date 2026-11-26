@@ -27,6 +27,7 @@
           <button class="nav-btn" data-tab="discord-link">Discord 連携・リモコン</button>
           <button class="nav-btn" data-tab="dm-tts">DM読み上げ (VOICEVOX)</button>
           <div class="nav-section">カスタマイズ</div>
+          <button class="nav-btn" data-tab="diagnostics">音声診断・モデル比較</button>
           <button class="nav-btn" data-tab="commands">合言葉・音声コマンド</button>
           <button class="nav-btn" data-tab="dictionary">辞書・整形</button>
           <button class="nav-btn" data-tab="guard">安全ガード・自動化</button>
@@ -57,6 +58,8 @@
             <span class="pill" id="pillDiscordTarget">宛先: 現在の画面</span>
             <span class="pill" id="pillTarget">ガード: 待機</span>
             <span class="pill" id="pillStt">STT: 読み込み中...</span>
+            <span class="pill" id="pillSttDevice">推論: -</span>
+            <span class="pill ok" id="pillGameProfile" style="display: none"></span>
           </div>
           <div class="topbar-actions">
             <button class="btn-secondary btn-sm" id="btnToggleOverlay">ミニHUD切替</button>
@@ -89,6 +92,16 @@
             </div>
           </div>
 
+          <div id="countdownBanner" class="countdown-banner" style="display: none">
+            <div class="grow">
+              <strong id="countdownText">送信カウントダウン...</strong>
+              <div class="countdown-track">
+                <div id="countdownProgress" class="countdown-fill"></div>
+              </div>
+            </div>
+            <button class="btn-danger btn-sm" id="btnCancelCountdown">送信中止 (Esc)</button>
+          </div>
+
           <div class="grid-2">
             <div class="card">
               <h3>入力モード &amp; 送信先（喋る相手）</h3>
@@ -102,6 +115,18 @@
               </div>
               <p class="hint" id="modeHint">
                 認識テキストを下書きに溜め、「送信して」の発話で一括ペースト＆送信します。
+              </p>
+
+              <div class="segmented" id="activationSegmented" style="margin-top: 8px">
+                <button type="button" class="seg-btn active" data-activation="vad">
+                  VAD 常時待機
+                </button>
+                <button type="button" class="seg-btn" data-activation="push_to_talk">
+                  Push-to-Talk (押下中のみ)
+                </button>
+              </div>
+              <p class="hint" id="activationHint">
+                Push-to-Talk を選ぶとホットキーまたはマウスサイドボタン (Mouse4/Mouse5) を押している間だけ録音します。
               </p>
 
               <div class="quick-dest-section">
@@ -572,14 +597,14 @@
               例: <b>「合言葉 雑談」</b> / <b>「たろうにDM」</b> / <b>「たなかを開いて」</b>。似た名前の候補が複数ある場合は自動で「この人で合っていますか？」と確認します（<b>「はい」</b>で確定、<b>「違う・次」</b>で別の候補へ）。
             </p>
             <div class="form-grid">
-              <label>合言葉プレフィックス（カンマ区切り）
-                <input type="text" id="targetPrefixes" class="input" />
+              <label>合言葉プレフィックス
+                <div class="phrase-editor" id="peTargetPrefixes" data-placeholder="例: 合言葉 / チャンネル"></div>
               </label>
-              <label>合言葉サフィックス（カンマ区切り）
-                <input type="text" id="targetSuffixes" class="input" />
+              <label>合言葉サフィックス
+                <div class="phrase-editor" id="peTargetSuffixes" data-placeholder="例: にDM / を開いて"></div>
               </label>
-              <label>宛先解除コマンド（カンマ区切り）
-                <input type="text" id="targetResets" class="input" />
+              <label>宛先解除コマンド
+                <div class="phrase-editor" id="peTargetResets" data-placeholder="例: 宛先リセット"></div>
               </label>
               <label>チャンネル移動後の待機時間 (ms)
                 <input type="number" id="targetNavDelay" class="input" min="120" max="3000" />
@@ -606,28 +631,28 @@
           </div>
 
           <div class="card">
-            <h3>基本音声コマンド設定（カンマ区切りで複数登録可能）</h3>
+            <h3>基本音声コマンド設定（1語ずつ簡単追加・削除）</h3>
             <p class="hint">
-              認識テキストの末尾、または単独発話でコマンドを判定し、コマンド語句自体は自動除去します。
+              下の入力欄に話しかけたい言葉を入れて <b>「＋ 追加」</b>（または Enter）を押すだけで追加できます。認識テキストの末尾や単独発話でコマンドを判定し、コマンド語句自体は自動除去します。
             </p>
             <div class="form-grid">
               <label>送信 (ペースト + Enter)
-                <input type="text" id="cmdSend" class="input" />
+                <div class="phrase-editor" id="peCmdSend" data-placeholder="例: 送信して / お願い"></div>
               </label>
               <label>全文削除 (ドラフト消去 / Ctrl+A→BS)
-                <input type="text" id="cmdClearAll" class="input" />
+                <div class="phrase-editor" id="peCmdClearAll" data-placeholder="例: 全文削除 / やり直し"></div>
               </label>
               <label>直前取り消し (Undo)
-                <input type="text" id="cmdUndo" class="input" />
+                <div class="phrase-editor" id="peCmdUndo" data-placeholder="例: ひとつ戻して"></div>
               </label>
               <label>改行 (Shift+Enter)
-                <input type="text" id="cmdNewline" class="input" />
+                <div class="phrase-editor" id="peCmdNewline" data-placeholder="例: 改行 / 次の行"></div>
               </label>
               <label>認識一時停止 (スリープ)
-                <input type="text" id="cmdMute" class="input" />
+                <div class="phrase-editor" id="peCmdMute" data-placeholder="例: ミュートして"></div>
               </label>
               <label>認識再開
-                <input type="text" id="cmdResume" class="input" />
+                <div class="phrase-editor" id="peCmdResume" data-placeholder="例: 認識再開"></div>
               </label>
             </div>
           </div>
@@ -741,6 +766,66 @@
               <button class="btn-secondary btn-sm" id="btnTestUndo">Ctrl+Z テスト</button>
             </div>
           </div>
+
+          <div class="card">
+            <h3>送信前カウントダウン（誤爆防止）</h3>
+            <p class="hint">
+              「送信して」確定後、指定時間だけ待ってから送信します。待機中に「待って」「取り消し」「キャンセル」または <code>Esc</code> キーで送信を中止できます。
+            </p>
+            <div class="row gap-sm" style="margin-top: 8px; flex-wrap: wrap">
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkCountdownEnabled" />
+                <span>送信前カウントダウンを有効にする</span>
+              </label>
+              <label class="small-label">待機時間 (ms):
+                <input type="number" id="countdownMs" class="input" style="width: 110px" min="300" max="5000" step="100" value="1500" />
+              </label>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3>ゲーム別自動プロファイル切替</h3>
+            <p class="hint">
+              最前面ゲームのプロセス名に応じて、専用辞書・送信方式・ミニHUD位置/透明度を自動で切り替えます（OS公式プロセス取得のみ使用）。
+            </p>
+            <input type="hidden" id="gpEditId" />
+            <div class="form-grid" style="margin-top: 8px">
+              <label>プロファイル名
+                <input type="text" id="gpName" class="input" placeholder="例: VALORANT / VRChat" />
+              </label>
+              <label>対象プロセス名（カンマ区切り）
+                <input type="text" id="gpProcesses" class="input" placeholder="例: VALORANT-Win64-Shipping.exe, vrchat.exe" />
+              </label>
+              <label>送信方式上書き
+                <select id="gpSendMethod" class="input">
+                  <option value="">デフォルト設定を使用</option>
+                  <option value="auto_paste">標準 (SendInput 貼り付け)</option>
+                  <option value="window_message">ウィンドウメッセージ送信 (DirectInput干渉回避)</option>
+                  <option value="safe_when_game_active">Discord最前面時のみ自動送信</option>
+                  <option value="no_send_input">自動キー送信なし (クリップボードのみ)</option>
+                </select>
+              </label>
+              <div class="row gap-sm">
+                <label class="grow">HUD X:
+                  <input type="number" id="gpOverlayX" class="input" placeholder="任意" />
+                </label>
+                <label class="grow">HUD Y:
+                  <input type="number" id="gpOverlayY" class="input" placeholder="任意" />
+                </label>
+                <label class="grow">透明度 (0.2〜1.0):
+                  <input type="number" id="gpOverlayOpacity" class="input" min="0.2" max="1" step="0.05" placeholder="任意" />
+                </label>
+              </div>
+            </div>
+            <label style="display: block; margin-top: 8px">ゲーム固有辞書（1行につき <code>誤認識=正しい表記</code>）
+              <textarea id="gpDictText" class="draft-area" rows="3" placeholder="ばんだる=ヴァンダル&#10;えこら=エコラウンド"></textarea>
+            </label>
+            <div class="row gap-sm" style="margin-top: 8px">
+              <button type="button" class="btn-primary btn-sm" id="btnGpSave">プロファイル保存</button>
+              <button type="button" class="btn-secondary btn-sm" id="btnGpCancelEdit">入力リセット</button>
+            </div>
+            <div id="gameProfileList" class="diag-list" style="margin-top: 10px"></div>
+          </div>
         </section>
 
         <!-- Settings Tab -->
@@ -753,7 +838,7 @@
                   <input type="text" id="hkToggle" class="input" placeholder="F8 / Ctrl+Shift+M" />
                 </label>
                 <label>Push-to-Talk（任意）
-                  <input type="text" id="hkPtt" class="input" placeholder="例: F9（空欄で無効）" />
+                  <input type="text" id="hkPtt" class="input" placeholder="例: F9 / Mouse4 / Mouse5（空欄で無効）" />
                 </label>
                 <label>緊急ドラフトクリア
                   <input type="text" id="hkClear" class="input" placeholder="Ctrl+Shift+X" />
@@ -805,8 +890,11 @@
             <div class="form-grid">
               <label>STT エンジン
                 <select id="sttEngine" class="input">
-                  <option value="auto">自動検出 (Whisper Large-v3-Turbo / Kotoba / sherpa-onnx)</option>
+                  <option value="auto">自動検出 (Whisper / Qwen3-ASR / sherpa-onnx)</option>
+                  <option value="whisper-cpp">whisper.cpp (Vulkan GPU / CPU 常駐)</option>
+                  <option value="sherpa-qwen3">sherpa-onnx Qwen3-ASR (DirectML GPU / CPU)</option>
                   <option value="sherpa-onnx">sherpa-onnx (SenseVoice / Zipformer)</option>
+                  <option value="local-http">Local HTTP ASR (llama-server / OpenAI 互換)</option>
                   <option value="whisper-cli">whisper-cli (ローカルバイナリ)</option>
                   <option value="mock">モック（テスト用）</option>
                 </select>
@@ -836,6 +924,119 @@
               </label>
             </div>
             <p class="hint" id="configPathHint" style="margin-top: 10px">設定ファイル: 読み込み中...</p>
+          </div>
+
+          <div class="card">
+            <div class="row space-between">
+              <h3>Local HTTP ASR 設定（Qwen3-ASR-1.7B / llama-server 等）</h3>
+              <span class="pill" id="httpAsrStatusBadge">未接続確認</span>
+            </div>
+            <div class="form-grid" style="margin-top: 8px">
+              <label>Base URL
+                <input type="text" id="httpAsrBaseUrl" class="input" placeholder="http://127.0.0.1:8080" />
+              </label>
+              <label>Endpoint Path
+                <input type="text" id="httpAsrEndpoint" class="input" placeholder="/v1/audio/transcriptions" />
+              </label>
+              <label>モデル名
+                <input type="text" id="httpAsrModel" class="input" placeholder="qwen3-asr-1.7b" />
+              </label>
+              <label>API Key（任意）
+                <input type="password" id="httpAsrApiKey" class="input" placeholder="空欄可" />
+              </label>
+              <label>ローカルサーバー実行ファイル（任意・Vulkan llama-server 等）
+                <input type="text" id="httpAsrExePath" class="input" placeholder="例: C:\tools\llama-server.exe" />
+              </label>
+              <label>起動引数
+                <input type="text" id="httpAsrArgs" class="input" placeholder="例: -m models\qwen3-asr.gguf --port 8080" />
+              </label>
+            </div>
+            <div class="row gap-sm" style="margin-top: 8px; flex-wrap: wrap">
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkHttpAsrAutoLaunch" />
+                <span>local-http 選択時にヘッドレス自動起動</span>
+              </label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkHttpAsrStopExit" />
+                <span>終了時に自動停止</span>
+              </label>
+              <button type="button" class="btn-secondary btn-sm" id="btnTestHttpAsr">接続テスト</button>
+              <button type="button" class="btn-primary btn-sm" id="btnLaunchHttpAsr">サーバー起動</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="row space-between">
+              <h3>外部モデルダウンローダー（オンデマンド・models/ 配置）</h3>
+              <span class="pill" id="qwen3StatusBadge">Qwen3-ASR: 未導入</span>
+            </div>
+            <p class="hint">
+              モデル本体は実行ファイルへ同梱せず <code>models/</code> フォルダへ取得します。ダウンロード中は通信が進みます。
+            </p>
+            <div class="row gap-sm" style="margin-top: 8px; flex-wrap: wrap">
+              <button type="button" class="btn-primary btn-sm" data-download-model="qwen3-asr-0.6b-int8">Qwen3-ASR-0.6B int8 (DirectML/CPU)</button>
+              <button type="button" class="btn-secondary btn-sm" data-download-model="whisper-large-v3-q8">Whisper Large-v3 (Q8_0)</button>
+              <button type="button" class="btn-secondary btn-sm" data-download-model="whisper-large-v3-turbo-q8">Whisper Large-v3-Turbo (Q8_0)</button>
+              <button type="button" class="btn-secondary btn-sm" data-download-model="parakeet-ja-int8">Parakeet-JA int8</button>
+            </div>
+            <div class="form-grid" style="margin-top: 10px">
+              <label>カスタム HTTPS URL（.bin / .tar.bz2）
+                <input type="text" id="customModelUrl" class="input" placeholder="https://..." />
+              </label>
+              <label>保存ファイル名（任意・.bin 等）
+                <input type="text" id="customModelFilename" class="input" placeholder="custom-model.bin" />
+              </label>
+            </div>
+            <div class="row gap-sm" style="margin-top: 8px">
+              <button type="button" class="btn-secondary btn-sm" id="btnDownloadCustomModel">カスタムURLから取得</button>
+            </div>
+            <div id="dlProgressWrap" style="display: none; margin-top: 10px">
+              <div class="small-label" id="dlProgressText">準備中...</div>
+              <div class="countdown-track">
+                <div id="dlProgressBar" class="countdown-fill"></div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Diagnostics & A/B Compare Tab -->
+        <section class="tab-panel" id="tab-diagnostics">
+          <div class="card">
+            <div class="row space-between" style="flex-wrap: wrap; gap: 8px">
+              <h3>音声診断・推論デバイス &amp; A/Bモデル比較</h3>
+              <div class="row gap-sm" style="flex-wrap: wrap">
+                <span class="pill" id="diagEngine">エンジン: -</span>
+                <span class="pill" id="diagDevice">デバイス: -</span>
+                <span class="pill" id="diagLastMs">遅延: -</span>
+                <span class="pill" id="diagLastRtf">RTF: -</span>
+              </div>
+            </div>
+            <p class="hint">
+              直近5件の発話音声をメモリに保持し、マイク入力品質の確認・音声再生・他エンジンでのA/B再推論・ワンクリック辞書学習を行えます。
+            </p>
+            <div class="row gap-sm" style="margin-top: 10px; flex-wrap: wrap">
+              <label class="small-label">A/B比較エンジン:
+                <select id="abEngine" class="input" style="width: auto">
+                  <option value="whisper-cpp">whisper.cpp (Vulkan/CPU)</option>
+                  <option value="sherpa-qwen3">sherpa-onnx Qwen3-ASR (DirectML/CPU)</option>
+                  <option value="sherpa-onnx">sherpa-onnx (SenseVoice/Zipformer)</option>
+                  <option value="local-http">Local HTTP ASR</option>
+                </select>
+              </label>
+              <label class="small-label">比較Whisperモデル:
+                <select id="abModelFile" class="input" style="width: auto">
+                  <option value="">自動</option>
+                </select>
+              </label>
+              <button type="button" class="btn-secondary btn-sm" id="btnClearDiagnostics">診断履歴クリア</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3>直近の発話診断 (最大5件)</h3>
+            <div id="diagnosticsList" class="diag-list">
+              <div class="empty-state">まだ診断データがありません。発話するとここに録音時間・ピークdBFS・推論時間・RTFが表示されます。</div>
+            </div>
           </div>
         </section>
       </main>

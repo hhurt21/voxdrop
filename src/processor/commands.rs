@@ -79,6 +79,34 @@ pub enum ConfirmationReply {
     Cancel,
 }
 
+/// Detects spoken cancel phrases during the pre-send countdown window.
+pub fn parse_countdown_cancel(input: &str) -> bool {
+    let s = trim_trailing_punct(input.trim())
+        .trim_matches(|c: char| c.is_whitespace() || matches!(c, '、' | ','))
+        .trim();
+    if s.is_empty() || s.chars().count() > 16 {
+        return false;
+    }
+    let lower = s.to_ascii_lowercase();
+    const PHRASES: &[&str] = &[
+        "取り消し",
+        "とりけし",
+        "待って",
+        "まって",
+        "ちょっと待って",
+        "ちょっとまって",
+        "ストップ",
+        "キャンセル",
+        "やめて",
+        "やめ",
+        "中止",
+        "cancel",
+        "stop",
+        "wait",
+    ];
+    PHRASES.iter().any(|&p| lower == p || s == p)
+}
+
 /// Parses spoken responses while VoxDrop is asking "この人で合っていますか？".
 /// Only matches short standalone confirmation replies so normal conversation is never hijacked.
 pub fn parse_confirmation_reply(input: &str) -> Option<ConfirmationReply> {
@@ -687,5 +715,24 @@ mod tests {
         assert_eq!(parse_confirmation_reply("キャンセル"), Some(ConfirmationReply::Cancel));
         // Long normal utterances containing "そう"/"うん"/"それ" must NOT be mistaken for confirmation
         assert_eq!(parse_confirmation_reply("まあでもこれでよさそうだしテストしてみよう"), None);
+    }
+
+    #[test]
+    fn parses_countdown_cancel_and_v15_edit_commands() {
+        assert!(parse_countdown_cancel("待って"));
+        assert!(parse_countdown_cancel("取り消し！"));
+        assert!(parse_countdown_cancel("キャンセル。"));
+        assert!(parse_countdown_cancel("やめて"));
+        assert!(!parse_countdown_cancel("こんにちは"));
+
+        let cfg = VoiceCommandsConfig::default();
+        assert_eq!(
+            parse_voice_command("ひとつ戻して", &cfg).command,
+            Some(VoiceCommand::Undo)
+        );
+        assert_eq!(
+            parse_voice_command("改行", &cfg).command,
+            Some(VoiceCommand::Newline)
+        );
     }
 }

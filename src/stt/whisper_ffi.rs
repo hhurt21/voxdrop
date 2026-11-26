@@ -200,6 +200,7 @@ impl Drop for ResidentWhisperInner {
 pub struct ResidentWhisperRecognizer {
     inner: Mutex<ResidentWhisperInner>,
     using_gpu: bool,
+    device_name: String,
 }
 
 impl ResidentWhisperRecognizer {
@@ -209,7 +210,7 @@ impl ResidentWhisperRecognizer {
         language: &str,
         threads: u32,
     ) -> Result<Self, String> {
-        let (fns, has_vulkan) = load_whisper_dll(dll_path)?;
+        let (fns, has_vulkan, gpu_desc) = load_whisper_dll(dll_path)?;
         let model_c = CString::new(model_path.to_string_lossy().as_ref())
             .map_err(|_| "モデルパスに不正な文字が含まれています".to_string())?;
         let lang_str = if language.trim().is_empty() {
@@ -220,7 +221,7 @@ impl ResidentWhisperRecognizer {
         let lang_c = CString::new(lang_str)
             .map_err(|_| "言語コードが不正です".to_string())?;
 
-        let ctx = {
+        let (ctx, used_gpu) = {
             let _vk = WHISPER_VULKAN_LOCK.lock();
             unsafe {
                 let cp_ptr = (fns.ctx_default_params_by_ref)();
@@ -229,17 +230,19 @@ impl ResidentWhisperRecognizer {
                 }
                 let mut cparams = *cp_ptr;
                 (fns.free_ctx_params)(cp_ptr);
-                cparams.use_gpu = true;
-                cparams.flash_attn = true;
+                cparams.use_gpu = has_vulkan;
+                cparams.flash_attn = has_vulkan;
 
+                let mut used_gpu = has_vulkan;
                 let mut ptr_ctx = (fns.init_from_file_with_params)(model_c.as_ptr(), cparams);
-                if ptr_ctx.is_null() {
+                if ptr_ctx.is_null() && has_vulkan {
                     // Retry cleanly on CPU if GPU init fails on an unsupported driver
                     cparams.use_gpu = false;
                     cparams.flash_attn = false;
+                    used_gpu = false;
                     ptr_ctx = (fns.init_from_file_with_params)(model_c.as_ptr(), cparams);
                 }
-                ptr_ctx
+                (ptr_ctx, used_gpu)
             }
         };
 
@@ -267,6 +270,15 @@ impl ResidentWhisperRecognizer {
             None
         };
 
+        let device_name = if used_gpu {
+            match gpu_desc {
+                Some(name) if !name.trim().is_empty() => format!("Vulkan: {}", name.trim()),
+                _ => "Vulkan GPU".to_string(),
+            }
+        } else {
+            "CPU (AVX2)".to_string()
+        };
+
         Ok(Self {
             inner: Mutex::new(ResidentWhisperInner {
                 fns,
@@ -277,12 +289,17 @@ impl ResidentWhisperRecognizer {
                 is_kotoba,
                 threads: threads.clamp(1, 16),
             }),
-            using_gpu: has_vulkan,
+            using_gpu: used_gpu,
+            device_name,
         })
     }
 
     pub fn is_gpu_accelerated(&self) -> bool {
         self.using_gpu
+    }
+
+    pub fn device_name(&self) -> &str {
+        &self.device_name
     }
 
     pub fn set_prompt_hints(&self, hints: &str) {
@@ -587,7 +604,72 @@ unsafe fn load_sym<T>(hmodule: HMODULE, name: &'static [u8]) -> Result<T, String
     Ok(std::mem::transmute_copy(&proc))
 }
 
-fn load_whisper_dll(dll_path: &Path) -> Result<(WhisperDllFns, bool), String> {
+type FnGgmlBackendDevCount = unsafe extern "C" fn() -> usize;
+type FnGgmlBackendDevGet = unsafe extern "C" fn(usize) -> *mut c_void;
+type FnGgmlBackendDevType = unsafe extern "C" fn(*mut c_void) -> c_int;
+type FnGgmlBackendDevDesc = unsafe extern "C" fn(*mut c_void) -> *const c_char;
+
+fn detect_vulkan_device_name(bin_dir: &Path) -> Option<String> {
+    let mut handles: Vec<HMODULE> = Vec::new();
+    for dll_name in ["ggml-whisper.dll", "ggml-base-whisper.dll", "ggml.dll"] {
+        let p = bin_dir.join(dll_name);
+        if !p.is_file() {
+            continue;
+        }
+        let wide: Vec<u16> = p.to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
+        if let Ok(h) = unsafe { LoadLibraryExW(PCWSTR(wide.as_ptr()), None, LOAD_WITH_ALTERED_SEARCH_PATH) } {
+            handles.push(h);
+        }
+    }
+    if handles.is_empty() {
+        return None;
+    }
+
+    unsafe {
+        let find_sym = |name: &'static [u8]| -> Option<*mut c_void> {
+            for &h in &handles {
+                let p = GetProcAddress(h, PCSTR(name.as_ptr()));
+                if let Some(addr) = p {
+                    return Some(addr as *mut c_void);
+                }
+            }
+            None
+        };
+
+        let count_ptr = find_sym(b"ggml_backend_dev_count\0")?;
+        let get_ptr = find_sym(b"ggml_backend_dev_get\0")?;
+        let type_ptr = find_sym(b"ggml_backend_dev_type\0")?;
+        let desc_ptr = find_sym(b"ggml_backend_dev_description\0")
+            .or_else(|| find_sym(b"ggml_backend_dev_name\0"))?;
+
+        let cnt_f: FnGgmlBackendDevCount = std::mem::transmute(count_ptr);
+        let get_f: FnGgmlBackendDevGet = std::mem::transmute(get_ptr);
+        let type_f: FnGgmlBackendDevType = std::mem::transmute(type_ptr);
+        let desc_f: FnGgmlBackendDevDesc = std::mem::transmute(desc_ptr);
+
+        let cnt = cnt_f();
+        for i in 0..cnt {
+            let dev = get_f(i);
+            if dev.is_null() {
+                continue;
+            }
+            // ggml_backend_dev_type: 1 = GPU, 2 = IGPU
+            let dt = type_f(dev);
+            if dt == 1 || dt == 2 {
+                let ptr = desc_f(dev);
+                if !ptr.is_null() {
+                    let s = CStr::from_ptr(ptr).to_string_lossy().trim().to_string();
+                    if !s.is_empty() {
+                        return Some(s);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn load_whisper_dll(dll_path: &Path) -> Result<(WhisperDllFns, bool, Option<String>), String> {
     let abs_path = std::fs::canonicalize(dll_path).unwrap_or_else(|_| dll_path.to_path_buf());
     let path_str = abs_path.to_string_lossy();
     let clean_path = path_str.strip_prefix(r"\\?\").unwrap_or(&path_str);
@@ -633,6 +715,12 @@ fn load_whisper_dll(dll_path: &Path) -> Result<(WhisperDllFns, bool), String> {
         }
     });
 
+    let gpu_desc = if has_vulkan {
+        detect_vulkan_device_name(&bin_dir)
+    } else {
+        None
+    };
+
     let wide: Vec<u16> = clean_path.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
         let hmodule = LoadLibraryExW(
@@ -674,7 +762,7 @@ fn load_whisper_dll(dll_path: &Path) -> Result<(WhisperDllFns, bool), String> {
         if res.is_err() {
             let _ = FreeLibrary(hmodule);
         }
-        Ok((res?, has_vulkan))
+        Ok((res?, has_vulkan, gpu_desc))
     }
 }
 
@@ -754,6 +842,10 @@ mod tests {
         let t_load = Instant::now();
         let rec = ResidentWhisperRecognizer::load(dll, model, "ja", 8)
             .expect("load Vulkan Whisper Large-v3-Turbo Q8_0");
+        assert!(!rec.device_name().is_empty());
+        if rec.is_gpu_accelerated() {
+            assert!(rec.device_name().starts_with("Vulkan:"));
+        }
         rec.set_prompt_hints("学校、弁当、パン、送信して");
         let load_ms = t_load.elapsed().as_millis();
 

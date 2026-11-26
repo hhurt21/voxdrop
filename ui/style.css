@@ -953,3 +953,154 @@ input[type="range"] {
 .toast.ok {
   border-left-color: var(--green);
 }
+
+/* v1.5.0: Countdown, Diagnostics, Game Profiles, Quick-Learn */
+.countdown-banner {
+  background: rgba(240, 178, 50, 0.16);
+  border: 1px solid var(--amber);
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.countdown-track {
+  width: 100%;
+  height: 6px;
+  background: var(--bg-darkest);
+  border-radius: 999px;
+  overflow: hidden;
+  margin-top: 6px;
+}
+
+.countdown-fill {
+  height: 100%;
+  width: 100%;
+  background: var(--amber);
+  transition: width 0.08s linear;
+}
+
+.diag-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.diag-item,
+.profile-item {
+  background: var(--bg-darkest);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 10px 12px;
+}
+
+.diag-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+.diag-text-row {
+  font-size: 13px;
+  margin: 3px 0;
+  word-break: break-word;
+}
+
+.ab-result {
+  margin-top: 8px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  background: rgba(88, 101, 242, 0.12);
+  border: 1px solid rgba(88, 101, 242, 0.4);
+  font-size: 12.5px;
+  display: none;
+}
+
+.ab-result.show {
+  display: block;
+}
+
+.ab-result.err {
+  background: rgba(218, 55, 60, 0.14);
+  border-color: rgba(218, 55, 60, 0.45);
+}
+
+.quick-learn-row {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.phrase-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: var(--bg-darkest);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  margin-top: 4px;
+}
+
+.phrase-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 24px;
+  align-items: center;
+}
+
+.phrase-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: rgba(88, 101, 242, 0.22);
+  border: 1px solid rgba(88, 101, 242, 0.55);
+  color: var(--text);
+  border-radius: 999px;
+  padding: 2px 8px 2px 10px;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.phrase-chip-del {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 0 2px;
+  border-radius: 50%;
+}
+
+.phrase-chip-del:hover {
+  color: #fff;
+  background: rgba(218, 55, 60, 0.7);
+}
+
+.phrase-empty {
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.phrase-add-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.phrase-add-row .input {
+  padding: 5px 8px;
+  font-size: 12.5px;
+}
