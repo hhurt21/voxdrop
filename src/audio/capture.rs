@@ -1,9 +1,11 @@
 use crate::audio::denoise::{AudioDenoiser, RNNOISE_SAMPLE_RATE};
+use crate::audio::silero_vad::SileroVadDetector;
 use crate::audio::vad::{VadEvent, VadSegmenter};
 use crate::audio::AudioEvent;
 use crate::config::{NoiseCancelConfig, VadConfig};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, Stream, StreamConfig};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -225,6 +227,7 @@ impl LinearResampler {
 enum ControlMsg {
     SetListening(bool),
     SetDevice(Option<String>),
+    SetRuntimeDir(Option<PathBuf>),
     UpdateVad(VadConfig),
     UpdateNoiseCancel(NoiseCancelConfig),
     CalibrateNoise(u64),
@@ -232,7 +235,7 @@ enum ControlMsg {
     Shutdown,
 }
 
-/// Manages microphone capture + RNNoise denoising + VAD on a dedicated thread.
+/// Manages microphone capture + RNNoise denoising + Silero/Adaptive VAD on a dedicated thread.
 pub struct AudioController {
     tx: mpsc::Sender<ControlMsg>,
 }
@@ -253,8 +256,14 @@ impl AudioController {
         thread::spawn(move || {
             let mut active = false;
             let mut device_name = initial_device;
+            let mut runtime_dir: Option<PathBuf> = None;
+            let mut silero_model_path = initial_vad.silero_model_path.clone();
             let vad_shared = Arc::new(Mutex::new(VadSegmenter::new(initial_vad)));
             let denoiser_shared = Arc::new(Mutex::new(AudioDenoiser::new(initial_nc)));
+            let silero_shared = Arc::new(Mutex::new(SileroVadDetector::discover(
+                &silero_model_path,
+                runtime_dir.as_deref(),
+            )));
             let listening_flag = Arc::new(AtomicBool::new(false));
             let mut active_stream: Option<Stream> = None;
 
@@ -273,10 +282,22 @@ impl AudioController {
                             if let Ok(mut d) = denoiser_shared.lock() {
                                 d.reset();
                             }
+                            if let Ok(mut s) = silero_shared.lock() {
+                                if s.is_none() {
+                                    *s = SileroVadDetector::discover(
+                                        &silero_model_path,
+                                        runtime_dir.as_deref(),
+                                    );
+                                }
+                                if let Some(ref mut det) = *s {
+                                    det.reset();
+                                }
+                            }
                             match start_stream(
                                 device_name.as_deref(),
                                 vad_shared.clone(),
                                 denoiser_shared.clone(),
+                                silero_shared.clone(),
                                 listening_flag.clone(),
                                 callback.clone(),
                             ) {
@@ -295,6 +316,11 @@ impl AudioController {
                                     callback(AudioEvent::Utterance(buf));
                                 }
                                 v.reset();
+                            }
+                            if let Ok(mut s) = silero_shared.lock() {
+                                if let Some(ref mut det) = *s {
+                                    det.reset();
+                                }
                             }
                             drop(active_stream.take());
                             let rn_enabled = denoiser_shared
@@ -324,10 +350,16 @@ impl AudioController {
                             if let Ok(mut d) = denoiser_shared.lock() {
                                 d.reset();
                             }
+                            if let Ok(mut s) = silero_shared.lock() {
+                                if let Some(ref mut det) = *s {
+                                    det.reset();
+                                }
+                            }
                             match start_stream(
                                 device_name.as_deref(),
                                 vad_shared.clone(),
                                 denoiser_shared.clone(),
+                                silero_shared.clone(),
                                 listening_flag.clone(),
                                 callback.clone(),
                             ) {
@@ -336,7 +368,28 @@ impl AudioController {
                             }
                         }
                     }
+                    ControlMsg::SetRuntimeDir(dir) => {
+                        runtime_dir = dir;
+                        if let Ok(mut s) = silero_shared.lock() {
+                            if s.is_none() {
+                                *s = SileroVadDetector::discover(
+                                    &silero_model_path,
+                                    runtime_dir.as_deref(),
+                                );
+                            }
+                        }
+                    }
                     ControlMsg::UpdateVad(cfg) => {
+                        let path_changed = silero_model_path != cfg.silero_model_path;
+                        silero_model_path = cfg.silero_model_path.clone();
+                        if path_changed {
+                            if let Ok(mut s) = silero_shared.lock() {
+                                *s = SileroVadDetector::discover(
+                                    &silero_model_path,
+                                    runtime_dir.as_deref(),
+                                );
+                            }
+                        }
                         if let Ok(mut v) = vad_shared.lock() {
                             v.update_config(cfg);
                         }
@@ -376,6 +429,10 @@ impl AudioController {
 
     pub fn set_device(&self, device: Option<String>) {
         let _ = self.tx.send(ControlMsg::SetDevice(device));
+    }
+
+    pub fn set_runtime_dir(&self, dir: Option<PathBuf>) {
+        let _ = self.tx.send(ControlMsg::SetRuntimeDir(dir));
     }
 
     pub fn update_vad(&self, cfg: VadConfig) {
@@ -418,6 +475,7 @@ fn start_stream<F>(
     preferred_device: Option<&str>,
     vad_shared: Arc<Mutex<VadSegmenter>>,
     denoiser_shared: Arc<Mutex<AudioDenoiser>>,
+    silero_shared: Arc<Mutex<Option<SileroVadDetector>>>,
     listening_flag: Arc<AtomicBool>,
     callback: Arc<F>,
 ) -> Result<Stream, String>
@@ -434,21 +492,25 @@ where
     let channels = stream_config.channels as usize;
     let in_rate = stream_config.sample_rate.0;
 
-    // Pipeline: Mic (in_rate, stereo->smart active channel) -> 48kHz -> RNNoise -> Anti-aliased 16kHz FIR -> Hybrid VAD -> STT
+    // Dual-path pipeline:
+    // Mic -> 48kHz -> RNNoise dual-path -> 16kHz FIR (VAD path + clean STT path) -> Silero+Adaptive VAD -> STT
     let downmixer = Arc::new(Mutex::new(SmartDownmixer::new()));
     let to_48k = Arc::new(Mutex::new(LinearResampler::new(in_rate, RNNOISE_SAMPLE_RATE)));
-    let to_16k = Arc::new(Mutex::new(Decimator48To16::new()));
+    let to_16k_vad = Arc::new(Mutex::new(Decimator48To16::new()));
+    let to_16k_stt = Arc::new(Mutex::new(Decimator48To16::new()));
     let last_meter = Arc::new(Mutex::new(Instant::now() - Duration::from_millis(50)));
     let tts_echo_muted = Arc::new(AtomicBool::new(false));
 
     let process_f32 = {
         let vad_shared = vad_shared.clone();
         let denoiser_shared = denoiser_shared.clone();
+        let silero_shared = silero_shared.clone();
         let listening_flag = listening_flag.clone();
         let callback = callback.clone();
         let downmixer = downmixer.clone();
         let to_48k = to_48k.clone();
-        let to_16k = to_16k.clone();
+        let to_16k_vad = to_16k_vad.clone();
+        let to_16k_stt = to_16k_stt.clone();
         let last_meter = last_meter.clone();
         let tts_echo_muted = tts_echo_muted.clone();
         move |interleaved: &[f32]| {
@@ -461,6 +523,11 @@ where
                 if !tts_echo_muted.swap(true, Ordering::SeqCst) {
                     if let Ok(mut v) = vad_shared.lock() {
                         v.reset();
+                    }
+                    if let Ok(mut s) = silero_shared.lock() {
+                        if let Some(ref mut det) = *s {
+                            det.reset();
+                        }
                     }
                     callback(AudioEvent::SpeechCancelled);
                 }
@@ -482,6 +549,11 @@ where
                 if let Ok(mut v) = vad_shared.lock() {
                     v.reset();
                 }
+                if let Ok(mut s) = silero_shared.lock() {
+                    if let Some(ref mut det) = *s {
+                        det.reset();
+                    }
+                }
             }
             let mono = match downmixer.lock() {
                 Ok(mut dm) => dm.process(interleaved, channels),
@@ -495,29 +567,50 @@ where
                 return;
             }
 
-            let (cleaned_48k, vad_prob, rnnoise_active) = match denoiser_shared.lock() {
-                Ok(mut d) => d.process(&pcm_48k),
+            let (vad_48k, stt_48k, vad_prob, rnnoise_active) = match denoiser_shared.lock() {
+                Ok(mut d) => d.process_dual(&pcm_48k),
                 Err(_) => return,
             };
-            if cleaned_48k.is_empty() {
+            if vad_48k.is_empty() {
                 return;
             }
 
-            let resampled_16k = match to_16k.lock() {
-                Ok(mut r) => r.process(&cleaned_48k),
+            let vad_16k = match to_16k_vad.lock() {
+                Ok(mut r) => r.process(&vad_48k),
                 Err(_) => return,
             };
-            if resampled_16k.is_empty() {
+            let stt_16k = match to_16k_stt.lock() {
+                Ok(mut r) => r.process(&stt_48k),
+                Err(_) => return,
+            };
+            if vad_16k.is_empty() {
                 return;
             }
+
+            let silero_speech = match silero_shared.lock() {
+                Ok(mut guard) => guard.as_mut().map(|det| det.accept_and_detect(&vad_16k)),
+                Err(_) => None,
+            };
 
             let (rms, is_speaking, events, noise_floor, effective_threshold) = match vad_shared.lock()
             {
                 Ok(mut v) => {
-                    let (r, sp, evs) = v.push_frame_with_prob(&resampled_16k, vad_prob, rnnoise_active);
+                    let (r, sp, evs) = v.push_frame_dual(
+                        &vad_16k,
+                        &stt_16k,
+                        vad_prob,
+                        rnnoise_active,
+                        silero_speech,
+                    );
                     (r, sp, evs, v.noise_floor(), v.effective_start_threshold())
                 }
                 Err(_) => return,
+            };
+
+            let display_vad_prob = if silero_speech == Some(true) {
+                vad_prob.max(0.85)
+            } else {
+                vad_prob
             };
 
             // Throttle UI meter updates to ~30 fps (every 33ms)
@@ -527,7 +620,7 @@ where
                     callback(AudioEvent::Level {
                         rms,
                         is_speaking,
-                        vad_prob,
+                        vad_prob: display_vad_prob,
                         rnnoise_active,
                         noise_floor,
                         effective_threshold,

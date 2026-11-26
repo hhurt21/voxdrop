@@ -26,6 +26,7 @@ pub enum ClientCommand {
     ForceSendDraft,
     UpdateDraft { draft: String },
     ListAudioDevices,
+    ListSttModels,
     CalibrateVad,
     ToggleOverlay,
     SetOverlayClickThrough { click_through: bool },
@@ -130,6 +131,10 @@ pub enum BackendEvent {
     AudioDevices {
         devices: Vec<String>,
         selected: Option<String>,
+    },
+    SttModels {
+        models: Vec<String>,
+        selected: String,
     },
     Toast {
         level: String,

@@ -4,6 +4,12 @@ VoxDrop incorporates or interacts with the following third-party open-source sof
 
 ## AI Models & Speech Runtimes
 
+### Whisper Large-v3-Turbo
+- Source: https://huggingface.co/openai/whisper-large-v3-turbo (GGML quantization via https://huggingface.co/ggerganov/whisper.cpp)
+- License: MIT License
+- Copyright (c) 2022-2024 OpenAI
+- See the MIT License text below.
+
 ### Kotoba-Whisper v2.0
 - Source: https://huggingface.co/kotoba-tech/kotoba-whisper-v2.0
 - License: Apache License 2.0
@@ -24,6 +30,12 @@ VoxDrop incorporates or interacts with the following third-party open-source sof
 - Source: https://github.com/snakers4/silero-vad
 - License: MIT License
 - Copyright (c) 2020-2024 Silero Team
+- See the MIT License text below.
+
+### ONNX Runtime
+- Source: https://github.com/microsoft/onnxruntime
+- License: MIT License
+- Copyright (c) Microsoft Corporation
 - See the MIT License text below.
 
 ### nnnoiseless (Rust port of RNNoise)

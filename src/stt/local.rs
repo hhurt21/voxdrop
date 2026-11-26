@@ -90,7 +90,90 @@ enum SherpaModelKind {
     },
 }
 
-/// Ultra-fast Vulkan-GPU / AVX2-CPU resident `whisper.dll` engine (`Kotoba-Whisper v2.0` Japanese).
+/// Lists available GGML Whisper `.bin` model filenames ordered by quality priority.
+pub fn list_available_ggml_models(cfg: &SttConfig, runtime_dir: Option<&Path>) -> Vec<String> {
+    let Some(model_dir) = resolve_model_dir(&cfg.model_dir, runtime_dir) else {
+        return Vec::new();
+    };
+    let mut candidates = collect_ggml_models(&model_dir);
+    candidates.sort_by(|a, b| score_ggml_model(b).cmp(&score_ggml_model(a)));
+    candidates
+        .into_iter()
+        .filter_map(|p| p.file_name().and_then(|s| s.to_str()).map(|s| s.to_string()))
+        .collect()
+}
+
+fn collect_ggml_models(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return found;
+    };
+    let mut subdirs = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                let l = name.to_ascii_lowercase();
+                if l.ends_with(".bin") && (l.contains("kotoba") || l.contains("ggml") || l.contains("whisper")) {
+                    found.push(path);
+                }
+            }
+        } else if path.is_dir() {
+            subdirs.push(path);
+        }
+    }
+    for sub in subdirs {
+        if let Ok(sub_entries) = fs::read_dir(sub) {
+            for entry in sub_entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                        let l = name.to_ascii_lowercase();
+                        if l.ends_with(".bin") && (l.contains("kotoba") || l.contains("ggml") || l.contains("whisper")) {
+                            found.push(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+fn score_ggml_model(path: &Path) -> i32 {
+    let l = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let base = if l.contains("large-v3-turbo") || l.contains("turbo") {
+        1000
+    } else if l.contains("large-v3") {
+        800
+    } else if l.contains("kotoba") {
+        600
+    } else if l.contains("medium") {
+        400
+    } else if l.contains("small") {
+        300
+    } else {
+        200
+    };
+    let quant = if l.contains("f16") {
+        40
+    } else if l.contains("q8_0") || l.contains("q8") {
+        35
+    } else if l.contains("q5_0") || l.contains("q5") {
+        20
+    } else if l.contains("q4") {
+        10
+    } else {
+        0
+    };
+    base + quant
+}
+
+/// Ultra-fast Vulkan-GPU / AVX2-CPU resident `whisper.dll` engine (`Whisper Large-v3-Turbo` / `Kotoba-Whisper v2.0`).
 pub struct WhisperResidentEngine {
     label: String,
     recognizer: ResidentWhisperRecognizer,
@@ -100,17 +183,27 @@ impl WhisperResidentEngine {
     pub fn discover(cfg: &SttConfig, runtime_dir: Option<&Path>) -> Option<Self> {
         let dll_path = find_file_in_search_dirs("", &["whisper.dll"], runtime_dir)?;
         let model_dir = resolve_model_dir(&cfg.model_dir, runtime_dir)?;
-        // Prefer Japanese-specialized Kotoba-Whisper v2.0 first, then any ggml-*.bin model
-        let model_path = find_file_matching(&model_dir, |name| {
-            let l = name.to_ascii_lowercase();
-            l.ends_with(".bin") && l.contains("kotoba")
-        })
-        .or_else(|| {
-            find_file_matching(&model_dir, |name| {
-                let l = name.to_ascii_lowercase();
-                l.ends_with(".bin") && (l.contains("ggml") || l.contains("whisper"))
-            })
-        })?;
+        let mut candidates = collect_ggml_models(&model_dir);
+        if candidates.is_empty() {
+            return None;
+        }
+        candidates.sort_by(|a, b| score_ggml_model(b).cmp(&score_ggml_model(a)));
+
+        let requested = cfg.model_file.trim();
+        let model_path = if !requested.is_empty() {
+            candidates
+                .iter()
+                .find(|p| {
+                    p.file_name()
+                        .and_then(|s| s.to_str())
+                        .map(|n| n.eq_ignore_ascii_case(requested))
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .unwrap_or_else(|| candidates[0].clone())
+        } else {
+            candidates[0].clone()
+        };
 
         let language = if cfg.language.trim().is_empty() {
             "ja"
@@ -123,10 +216,18 @@ impl WhisperResidentEngine {
             .and_then(|s| s.to_str())
             .unwrap_or("whisper")
             .to_ascii_lowercase();
-        let model_title = if model_short.contains("kotoba") {
+        let model_title = if model_short.contains("turbo") {
+            if model_short.contains("q8") {
+                "Whisper Large-v3-Turbo (Q8)"
+            } else if model_short.contains("q5") {
+                "Whisper Large-v3-Turbo (Q5)"
+            } else {
+                "Whisper Large-v3-Turbo"
+            }
+        } else if model_short.contains("kotoba") {
             "Kotoba-Whisper v2.0 日本語特化"
-        } else if model_short.contains("turbo") {
-            "Whisper Large-v3-Turbo"
+        } else if model_short.contains("large-v3") {
+            "Whisper Large-v3"
         } else {
             "Whisper GGML"
         };
@@ -171,6 +272,10 @@ impl SttEngine for WhisperResidentEngine {
     ) -> Result<String, String> {
         self.recognizer
             .transcribe_with_clarity(samples_16k, radio_clarity)
+    }
+
+    fn set_prompt_hints(&self, hints: &str) {
+        self.recognizer.set_prompt_hints(hints);
     }
 }
 

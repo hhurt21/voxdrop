@@ -13,6 +13,7 @@ use windows::Win32::System::LibraryLoader::{
 };
 
 static GGML_BACKEND_INIT: Once = Once::new();
+static WHISPER_VULKAN_LOCK: Mutex<()> = Mutex::new(());
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -172,6 +173,7 @@ struct ResidentWhisperInner {
     fns: WhisperDllFns,
     ctx: *mut c_void,
     language: CString,
+    default_prompt: String,
     prompt: Option<CString>,
     is_kotoba: bool,
     threads: u32,
@@ -181,6 +183,7 @@ unsafe impl Send for ResidentWhisperInner {}
 
 impl Drop for ResidentWhisperInner {
     fn drop(&mut self) {
+        let _vk = WHISPER_VULKAN_LOCK.lock();
         unsafe {
             if !self.ctx.is_null() {
                 (self.fns.free_ctx)(self.ctx);
@@ -217,24 +220,27 @@ impl ResidentWhisperRecognizer {
         let lang_c = CString::new(lang_str)
             .map_err(|_| "言語コードが不正です".to_string())?;
 
-        let ctx = unsafe {
-            let cp_ptr = (fns.ctx_default_params_by_ref)();
-            if cp_ptr.is_null() {
-                return Err("whisper_context_default_params_by_ref に失敗しました".into());
-            }
-            let mut cparams = *cp_ptr;
-            (fns.free_ctx_params)(cp_ptr);
-            cparams.use_gpu = true;
-            cparams.flash_attn = true;
+        let ctx = {
+            let _vk = WHISPER_VULKAN_LOCK.lock();
+            unsafe {
+                let cp_ptr = (fns.ctx_default_params_by_ref)();
+                if cp_ptr.is_null() {
+                    return Err("whisper_context_default_params_by_ref に失敗しました".into());
+                }
+                let mut cparams = *cp_ptr;
+                (fns.free_ctx_params)(cp_ptr);
+                cparams.use_gpu = true;
+                cparams.flash_attn = true;
 
-            let mut ptr_ctx = (fns.init_from_file_with_params)(model_c.as_ptr(), cparams);
-            if ptr_ctx.is_null() {
-                // Retry cleanly on CPU if GPU init fails on an unsupported driver
-                cparams.use_gpu = false;
-                cparams.flash_attn = false;
-                ptr_ctx = (fns.init_from_file_with_params)(model_c.as_ptr(), cparams);
+                let mut ptr_ctx = (fns.init_from_file_with_params)(model_c.as_ptr(), cparams);
+                if ptr_ctx.is_null() {
+                    // Retry cleanly on CPU if GPU init fails on an unsupported driver
+                    cparams.use_gpu = false;
+                    cparams.flash_attn = false;
+                    ptr_ctx = (fns.init_from_file_with_params)(model_c.as_ptr(), cparams);
+                }
+                ptr_ctx
             }
-            ptr_ctx
         };
 
         if ctx.is_null() {
@@ -252,8 +258,11 @@ impl ResidentWhisperRecognizer {
         // Whisper Large-v3-Turbo benefits hugely from a short natural Japanese initial_prompt
         // (locks language to natural Japanese chat & boosts voice commands);
         // Distil-Whisper (Kotoba) is trained without prompts so keep prompt None for Kotoba.
+        let default_prompt =
+            "日本語のカジュアルな会話。Discord、DM、通話、ミュート、テスト、送信して、送って、エンター、キャンセル。"
+                .to_string();
         let prompt = if !is_kotoba && lang_str.eq_ignore_ascii_case("ja") {
-            CString::new("日本語のチャット音声入力。テスト、聞こえますか、聞こえたら、送信して、送って、エンター、キャンセル。").ok()
+            CString::new(default_prompt.as_str()).ok()
         } else {
             None
         };
@@ -263,6 +272,7 @@ impl ResidentWhisperRecognizer {
                 fns,
                 ctx,
                 language: lang_c,
+                default_prompt,
                 prompt,
                 is_kotoba,
                 threads: threads.clamp(1, 16),
@@ -273,6 +283,29 @@ impl ResidentWhisperRecognizer {
 
     pub fn is_gpu_accelerated(&self) -> bool {
         self.using_gpu
+    }
+
+    pub fn set_prompt_hints(&self, hints: &str) {
+        let Ok(mut guard) = self.inner.lock() else {
+            return;
+        };
+        if guard.is_kotoba {
+            guard.prompt = None;
+            return;
+        }
+        let is_ja = guard
+            .language
+            .to_str()
+            .map(|l| l.eq_ignore_ascii_case("ja"))
+            .unwrap_or(false);
+        if !is_ja {
+            return;
+        }
+        let combined = build_whisper_initial_prompt(&guard.default_prompt, hints);
+        let sanitized: String = combined.chars().filter(|&c| c != '\0').collect();
+        if let Ok(cs) = CString::new(sanitized) {
+            guard.prompt = Some(cs);
+        }
     }
 
     pub fn transcribe(&self, samples_16k: &[f32]) -> Result<String, String> {
@@ -288,119 +321,158 @@ impl ResidentWhisperRecognizer {
             return Ok(String::new());
         }
 
-        // Apply Smart Quiet-Mic + Syllabic Consonant AGC, gated 3-7.5kHz sibilant clarity & 80Hz High-Pass
+        let input_rms = {
+            let sq: f32 = samples_16k.iter().map(|&s| s * s).sum();
+            (sq / samples_16k.len() as f32).sqrt()
+        };
+
+        // Apply clean utterance conditioning (DC removal + gentle continuous clarity + uniform AGC + 250ms/350ms pad)
         let conditioned =
             crate::audio::enhance::enhance_utterance_16k(samples_16k, clarity_boost, true);
 
+        let _vk = WHISPER_VULKAN_LOCK
+            .lock()
+            .map_err(|_| "Whisper Vulkan ロックの取得に失敗しました".to_string())?;
         let guard = self
             .inner
             .lock()
             .map_err(|_| "Whisper 認識ロックの取得に失敗しました".to_string())?;
 
-        unsafe {
-            // Use beam_size=3 on Vulkan GPU for stronger Japanese phrasing & kanji accuracy
-            // while staying ~0.55s fast via timestamp-anchored audio_ctx=512!
-            let strategy = if self.using_gpu { 1 } else { 0 };
-            let wp_ptr = (guard.fns.full_default_params_by_ref)(strategy);
-            if wp_ptr.is_null() {
-                return Err("whisper_full_default_params_by_ref に失敗しました".into());
-            }
-            let mut wparams = *wp_ptr;
-            (guard.fns.free_params)(wp_ptr);
-
-            let dur_sec = conditioned.len() as f32 / 16_000.0;
-            // Round dynamic audio_ctx up to multiple of 64 (min 256 = 5.12s, full 1500 if > 14s)
-            let dyn_ctx = if dur_sec > 14.0 {
-                0
-            } else {
-                let raw = ((dur_sec + 1.8) * 50.0).ceil() as i32;
-                let rounded = ((raw + 63) / 64) * 64;
-                rounded.clamp(256, 1500)
-            };
-            wparams.audio_ctx = if guard.is_kotoba {
-                if dur_sec <= 7.5 { 512 } else { 0 }
-            } else {
-                dyn_ctx
-            };
-
-            wparams.n_threads = guard.threads as c_int;
-            wparams.translate = false;
-            wparams.no_context = true;
-            wparams.no_timestamps = false;
-            wparams.single_segment = false;
-            wparams.print_special = false;
-            wparams.print_progress = false;
-            wparams.print_realtime = false;
-            wparams.print_timestamps = false;
-            wparams.language = guard.language.as_ptr();
-            wparams.detect_language = false;
-            if let Some(ref p) = guard.prompt {
-                wparams.initial_prompt = p.as_ptr();
-                wparams.carry_initial_prompt = true;
-            }
-            wparams.suppress_blank = true;
-            wparams.suppress_nst = true;
-            wparams.temperature = 0.0;
-            wparams.temperature_inc = 0.2;
-            // Relax entropy_thold & logprob_thold so fast / slurred Japanese stays in deterministic beam search
-            wparams.entropy_thold = 2.6;
-            wparams.logprob_thold = -1.35;
-            wparams.no_speech_thold = 0.68;
-            // Do not cap at 96 tokens so dense fast speech (80-150+ Japanese chars) never truncates
-            wparams.max_tokens = 0;
-            if self.using_gpu {
-                wparams.beam_search.beam_size = 5;
-            } else {
-                wparams.greedy.best_of = 1;
-            }
-
-            let rc = (guard.fns.full)(
-                guard.ctx,
-                wparams,
-                conditioned.as_ptr(),
-                conditioned.len() as c_int,
-            );
-            if rc != 0 {
-                return Err(format!("whisper_full がエラーを返しました (code={})", rc));
-            }
-
-            let n_seg = (guard.fns.full_n_segments)(guard.ctx);
-            let mut out = String::new();
-            for i in 0..n_seg {
-                // Skip segments Whisper itself believes are pure non-speech / background noise
-                if let Some(nsp_fn) = guard.fns.full_get_segment_no_speech_prob {
-                    if nsp_fn(guard.ctx, i) >= 0.78 {
-                        continue;
-                    }
-                }
-                let ptr_txt = (guard.fns.full_get_segment_text)(guard.ctx, i);
-                if !ptr_txt.is_null() {
-                    let seg = CStr::from_ptr(ptr_txt).to_string_lossy();
-                    let seg_trimmed = seg.trim();
-                    if seg_trimmed.is_empty() {
-                        continue;
-                    }
-                    if !out.is_empty() {
-                        let prev_ends_punct = out.ends_with([
-                            '。', '、', '！', '？', '!', '?', '.', ',', '…', '\n', '」', '）',
-                        ]);
-                        let next_starts_punct = seg_trimmed.starts_with([
-                            '。', '、', '！', '？', '!', '?', '.', ',', '…', '」', '）',
-                        ]);
-                        if !prev_ends_punct && !next_starts_punct {
-                            if crate::processor::japanese_fix::ends_like_complete_sentence(&out) {
-                                out.push('。');
-                            } else {
-                                out.push('、');
-                            }
-                        }
-                    }
-                    out.push_str(seg_trimmed);
-                }
-            }
-
-            Ok(filter_whisper_hallucinations(out.trim()))
+        let text = run_whisper_pass(&guard, &conditioned, self.using_gpu, false)?;
+        if text.is_empty() && input_rms >= 0.015 && samples_16k.len() >= 6400 {
+            // Safety fallback pass: never drop audible speech due to strict thresholds or timestamps
+            return run_whisper_pass(&guard, &conditioned, self.using_gpu, true);
         }
+        Ok(text)
+    }
+}
+
+fn build_whisper_initial_prompt(base: &str, hints: &str) -> String {
+    let trimmed = hints.trim();
+    if trimmed.is_empty() {
+        return base.to_string();
+    }
+    let mut combined = format!("{} {}", base, trimmed);
+    if combined.chars().count() > 180 {
+        combined = combined.chars().take(180).collect();
+    }
+    combined
+}
+
+fn run_whisper_pass(
+    guard: &ResidentWhisperInner,
+    conditioned: &[f32],
+    using_gpu: bool,
+    safety_fallback: bool,
+) -> Result<String, String> {
+    unsafe {
+        // Use beam_size=2 on GPU for high Japanese accuracy with fast decode; greedy on CPU
+        let strategy = if using_gpu { 1 } else { 0 };
+        let wp_ptr = (guard.fns.full_default_params_by_ref)(strategy);
+        if wp_ptr.is_null() {
+            return Err("whisper_full_default_params_by_ref に失敗しました".into());
+        }
+        let mut wparams = *wp_ptr;
+        (guard.fns.free_params)(wp_ptr);
+
+        // Safe generous audio_ctx: 768 (15.36s capacity) for utterances <= 6s (~2-3x faster encoder),
+        // full 1500 (0) for longer speech or Kotoba-Whisper v2.0.
+        let dur_sec = conditioned.len() as f32 / 16_000.0;
+        wparams.audio_ctx = if guard.is_kotoba {
+            0
+        } else if dur_sec <= 6.0 {
+            768
+        } else {
+            0
+        };
+        wparams.n_threads = guard.threads as c_int;
+        wparams.translate = false;
+        wparams.no_context = true;
+        // Kotoba-Whisper v2.0 performs best with no_timestamps=true; Large-v3-Turbo uses normal timestamps
+        wparams.no_timestamps = guard.is_kotoba || safety_fallback;
+        wparams.single_segment = false;
+        wparams.print_special = false;
+        wparams.print_progress = false;
+        wparams.print_realtime = false;
+        wparams.print_timestamps = false;
+        wparams.language = guard.language.as_ptr();
+        wparams.detect_language = false;
+        if let Some(ref p) = guard.prompt {
+            wparams.initial_prompt = p.as_ptr();
+            wparams.carry_initial_prompt = true;
+        }
+        wparams.suppress_blank = true;
+        wparams.suppress_nst = true;
+        wparams.temperature = 0.0;
+        if safety_fallback {
+            wparams.temperature_inc = 0.0;
+            wparams.entropy_thold = 5.0;
+            wparams.logprob_thold = -3.0;
+            wparams.no_speech_thold = 0.99;
+        } else {
+            wparams.temperature_inc = 0.2;
+            // Generous thresholds so fast/casual Japanese stays in deterministic beam search without garbled temp fallback
+            wparams.entropy_thold = 3.4;
+            wparams.logprob_thold = -2.0;
+            wparams.no_speech_thold = 0.85;
+        }
+        wparams.max_tokens = 0;
+        if using_gpu {
+            wparams.beam_search.beam_size = 2;
+            wparams.beam_search.patience = 1.0;
+        } else {
+            wparams.greedy.best_of = 1;
+        }
+
+        let rc = (guard.fns.full)(
+            guard.ctx,
+            wparams,
+            conditioned.as_ptr(),
+            conditioned.len() as c_int,
+        );
+        if rc != 0 {
+            return Err(format!("whisper_full がエラーを返しました (code={})", rc));
+        }
+
+        let n_seg = (guard.fns.full_n_segments)(guard.ctx);
+        let mut out = String::new();
+        for i in 0..n_seg {
+            let ptr_txt = (guard.fns.full_get_segment_text)(guard.ctx, i);
+            if ptr_txt.is_null() {
+                continue;
+            }
+            let seg = CStr::from_ptr(ptr_txt).to_string_lossy();
+            let seg_trimmed = seg.trim();
+            if seg_trimmed.is_empty() {
+                continue;
+            }
+            if !safety_fallback {
+                if let Some(nsp_fn) = guard.fns.full_get_segment_no_speech_prob {
+                    let nsp = nsp_fn(guard.ctx, i);
+                    if nsp >= 0.97 || (nsp >= 0.94 && seg_trimmed.chars().count() <= 4) {
+                        continue;
+                    }
+                }
+            }
+            if !out.is_empty() {
+                let prev_ends_punct = out.ends_with([
+                    '。', '、', '！', '？', '!', '?', '.', ',', '…', '\n', '」', '）',
+                ]);
+                let next_starts_punct = seg_trimmed.starts_with([
+                    '。', '、', '！', '？', '!', '?', '.', ',', '…', '」', '）',
+                ]);
+                if !prev_ends_punct && !next_starts_punct {
+                    if crate::processor::japanese_fix::ends_like_complete_sentence(&out) {
+                        out.push('。');
+                    } else {
+                        out.push('、');
+                    }
+                }
+            }
+            out.push_str(seg_trimmed);
+        }
+
+        Ok(filter_whisper_hallucinations(out.trim()))
     }
 }
 
@@ -418,7 +490,6 @@ pub fn filter_whisper_hallucinations(raw: &str) -> String {
         "ご視聴ありがとうございます",
         "チャンネル登録お願いします",
         "チャンネル登録よろしくお願いします",
-        "お疲れ様でした",
         "字幕",
         "thank you",
         "thank you for watching",
@@ -431,7 +502,50 @@ pub fn filter_whisper_hallucinations(raw: &str) -> String {
     if HALLUCINATIONS.iter().any(|&h| clean == h) {
         return String::new();
     }
-    dedup_trailing_repetition(trimmed)
+    let deduped = dedup_inline_triple_repetition(trimmed);
+    dedup_trailing_repetition(&deduped)
+}
+
+/// Collapses 3+ consecutive repetitions of 2..=6 char phrases (e.g. "一度一度一度" -> "一度"),
+/// while leaving 1-char elongations ("あああ", "おおお", "www") untouched.
+fn dedup_inline_triple_repetition(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() < 6 {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let mut collapsed = false;
+        for len in (2..=6).rev() {
+            if i + len * 3 <= chars.len() {
+                let pat = &chars[i..i + len];
+                // Skip if all chars in pat are identical (e.g. "ああ", "ww")
+                if pat.iter().all(|&c| c == pat[0]) {
+                    continue;
+                }
+                let mut reps = 1;
+                while i + (reps + 1) * len <= chars.len()
+                    && &chars[i + reps * len..i + (reps + 1) * len] == pat
+                {
+                    reps += 1;
+                }
+                if reps >= 3 {
+                    for &c in pat {
+                        out.push(c);
+                    }
+                    i += reps * len;
+                    collapsed = true;
+                    break;
+                }
+            }
+        }
+        if !collapsed {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Removes trailing exact-phrase echo occasionally produced by Whisper on ultra-fast speech
@@ -584,6 +698,112 @@ mod tests {
             filter_whisper_hallucinations("テストでこれもテストで"),
             "テストでこれもテストで"
         );
+        // Normal conversational "お疲れ様でした" must be preserved, while 3+ inline phrase loop is collapsed
+        assert_eq!(filter_whisper_hallucinations("お疲れ様でした。"), "お疲れ様でした。");
+        assert_eq!(
+            filter_whisper_hallucinations("なあえた、一度一度一度、おい！"),
+            "なあえた、一度、おい！"
+        );
+        // 1-char elongations / laughs remain intact
+        assert_eq!(filter_whisper_hallucinations("あああああ"), "あああああ");
+    }
+
+    #[test]
+    fn vulkan_large_v3_turbo_transcribes_normal_fast_slow_and_quiet() {
+        let dll = Path::new("bin/whisper.dll");
+        let model = Path::new("models/ggml-large-v3-turbo-q8_0.bin");
+        let wav = Path::new(
+            "models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17/test_wavs/ja.wav",
+        );
+        if !dll.is_file() || !model.is_file() || !wav.is_file() {
+            return;
+        }
+
+        let read_wav_f32 = |p: &Path| -> Vec<f32> {
+            let bytes = std::fs::read(p).unwrap();
+            let mut pos = 12usize;
+            while pos + 8 < bytes.len() {
+                let id = &bytes[pos..pos + 4];
+                let sz = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
+                if id == b"data" {
+                    pos += 8;
+                    break;
+                }
+                pos += 8 + sz;
+            }
+            bytes[pos..]
+                .chunks_exact(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+                .collect()
+        };
+
+        let resample_speed = |samples: &[f32], speed: f64| -> Vec<f32> {
+            let out_len = ((samples.len() as f64) / speed).floor() as usize;
+            let mut out = Vec::with_capacity(out_len);
+            for i in 0..out_len {
+                let pos = i as f64 * speed;
+                let idx = pos.floor() as usize;
+                let frac = (pos - idx as f64) as f32;
+                let a = samples[idx];
+                let b = samples.get(idx + 1).copied().unwrap_or(a);
+                out.push(a + (b - a) * frac);
+            }
+            out
+        };
+
+        let t_load = Instant::now();
+        let rec = ResidentWhisperRecognizer::load(dll, model, "ja", 8)
+            .expect("load Vulkan Whisper Large-v3-Turbo Q8_0");
+        rec.set_prompt_hints("学校、弁当、パン、送信して");
+        let load_ms = t_load.elapsed().as_millis();
+
+        let normal = read_wav_f32(wav);
+        let fast = resample_speed(&normal, 1.35);
+        let slow = resample_speed(&normal, 0.75);
+        let quiet: Vec<f32> = normal.iter().map(|&s| s * 0.15).collect();
+        let chat_3_5s = &normal[..normal.len().min(56_000)];
+
+        // Warmup / normal
+        let t1 = Instant::now();
+        let txt_norm = rec.transcribe(&normal).expect("normal");
+        let ms1 = t1.elapsed().as_millis();
+
+        // Warm 3.5s chat utterance
+        let t_chat = Instant::now();
+        let txt_chat = rec.transcribe(chat_3_5s).expect("chat 3.5s");
+        let ms_chat = t_chat.elapsed().as_millis();
+
+        // Second warm call (fast 1.35x)
+        let t2 = Instant::now();
+        let txt_fast = rec.transcribe(&fast).expect("fast 1.35x");
+        let ms2 = t2.elapsed().as_millis();
+
+        // Slow 0.75x
+        let t3 = Instant::now();
+        let txt_slow = rec.transcribe(&slow).expect("slow 0.75x");
+        let ms3 = t3.elapsed().as_millis();
+
+        // Quiet 0.15x
+        let t4 = Instant::now();
+        let txt_quiet = rec.transcribe(&quiet).expect("quiet 0.15x");
+        let ms4 = t4.elapsed().as_millis();
+
+        eprintln!(
+            "[Vulkan={} Large-v3-Turbo-Q8] load={}ms\n  normal7.2s({}ms): '{}'\n  chat3.5s({}ms): '{}'\n  fast1.35x({}ms): '{}'\n  slow0.75x({}ms): '{}'\n  quiet0.15x({}ms): '{}'",
+            rec.is_gpu_accelerated(),
+            load_ms,
+            ms1, txt_norm,
+            ms_chat, txt_chat,
+            ms2, txt_fast,
+            ms3, txt_slow,
+            ms4, txt_quiet
+        );
+
+        assert!(txt_norm.contains("弁当") && txt_norm.contains("パン"));
+        assert!(txt_chat.contains("弁当"));
+        assert!(txt_fast.contains("弁当") && txt_fast.contains("パン"));
+        assert!(txt_slow.contains("弁当") && txt_slow.contains("パン"));
+        assert!(txt_quiet.contains("弁当") && txt_quiet.contains("パン"));
     }
 
     #[test]

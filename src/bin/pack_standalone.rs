@@ -39,6 +39,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let fname = model_dir.file_name().unwrap().to_string_lossy().into_owned();
         files.push((format!("models/{}", fname), model_dir.clone()));
+
+        // Optionally bundle Silero VAD + sherpa-onnx C API DLLs so standalone EXE also gets Silero VAD!
+        if let Some(model_parent) = model_dir.parent() {
+            let silero = model_parent.join("silero_vad.onnx");
+            if silero.is_file() {
+                let mut has_vad_dlls = true;
+                for vad_dll in [
+                    "onnxruntime.dll",
+                    "onnxruntime_providers_shared.dll",
+                    "sherpa-onnx-c-api.dll",
+                ] {
+                    if !bin_dir.join(vad_dll).is_file() {
+                        has_vad_dlls = false;
+                        break;
+                    }
+                }
+                if has_vad_dlls {
+                    for vad_dll in [
+                        "onnxruntime.dll",
+                        "onnxruntime_providers_shared.dll",
+                        "sherpa-onnx-c-api.dll",
+                    ] {
+                        files.push((format!("bin/{}", vad_dll), bin_dir.join(vad_dll)));
+                    }
+                    files.push(("models/silero_vad.onnx".into(), silero));
+                }
+            }
+        }
     } else {
         for dll in [
             "onnxruntime.dll",

@@ -413,11 +413,19 @@ pub fn parse_voice_command(input: &str, cfg: &VoiceCommandsConfig) -> CommandPar
             "そうしん",
             "送信って",
             "送信する",
+            "送信し",
+            "そうしんし",
+            "ソーシーして",
+            "そーしーして",
+            "そうしーして",
+            "そっしんして",
+            "率進して",
             "送信",
             "通信って",
             "応戦して",
             "送進して",
             "送ってて",
+            "送っって",
             "おくってて",
             "送って",
             "おくって",
@@ -603,6 +611,14 @@ mod tests {
         let r3 = parse_voice_command("どうですか？応戦して。", &cfg);
         assert_eq!(r3.remaining_text, "どうですか？");
         assert_eq!(r3.command, Some(VoiceCommand::Send));
+
+        let r3b = parse_voice_command("おい！ソーシーして", &cfg);
+        assert_eq!(r3b.remaining_text, "おい！");
+        assert_eq!(r3b.command, Some(VoiceCommand::Send));
+
+        let r3c = parse_voice_command("テストーストを、率進して", &cfg);
+        assert_eq!(r3c.remaining_text, "テストーストを");
+        assert_eq!(r3c.command, Some(VoiceCommand::Send));
 
         let r4 = parse_voice_command("おはようえんたー", &cfg);
         assert_eq!(r4.remaining_text, "おはよう");

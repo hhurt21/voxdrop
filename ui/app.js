@@ -504,7 +504,7 @@
 
     const nc = cfg.noise_cancel || {
       enabled: true,
-      strength: 0.7,
+      strength: 0.2,
       highpass_enabled: true,
       noise_gate_enabled: false,
       vad_prob_threshold: 0.3,
@@ -577,6 +577,7 @@
     $("soundVolVal").textContent = Math.round(cfg.sound.volume * 100) + "%";
 
     $("sttEngine").value = cfg.stt.engine || "auto";
+    $("sttModelFile").value = cfg.stt.model_file || "";
     $("sttModelDir").value = cfg.stt.model_dir || "models";
     $("sttCliPath").value = cfg.stt.cli_path || "";
     $("sttLanguage").value = cfg.stt.language || "ja";
@@ -714,9 +715,9 @@
       },
       vad: {
         ...currentConfig.vad,
-        threshold: parseFloat($("vadThreshold").value) || 0.025,
-        silence_ms: parseInt($("vadSilenceMs").value, 10) || 320,
-        min_speech_ms: parseInt($("vadMinSpeechMs").value, 10) || 140,
+        threshold: parseFloat($("vadThreshold").value) || 0.012,
+        silence_ms: parseInt($("vadSilenceMs").value, 10) || 620,
+        min_speech_ms: parseInt($("vadMinSpeechMs").value, 10) || 100,
         auto_adjust: $("chkVadAutoAdjust").checked,
       },
       noise_cancel: {
@@ -797,6 +798,7 @@
       stt: {
         ...currentConfig.stt,
         engine: $("sttEngine").value,
+        model_file: $("sttModelFile").value || "",
         model_dir: $("sttModelDir").value.trim(),
         cli_path: $("sttCliPath").value.trim(),
         language: $("sttLanguage").value.trim() || "ja",
@@ -1245,6 +1247,51 @@
     const cfg = collectConfigFromUi();
     if (cfg) send({ type: "SaveConfig", config: cfg });
   });
+  $("sttModelFile").addEventListener("change", saveNow);
+  $("sttEngine").addEventListener("change", saveNow);
+
+  const VAD_PRESETS = {
+    normal: {
+      label: "通常会話（推奨）",
+      threshold: 0.012,
+      silence_ms: 620,
+      min_speech_ms: 100,
+      pre_roll_ms: 500,
+      auto_adjust: true,
+    },
+    fast: {
+      label: "早口・連続",
+      threshold: 0.010,
+      silence_ms: 750,
+      min_speech_ms: 80,
+      pre_roll_ms: 520,
+      auto_adjust: true,
+    },
+    slow: {
+      label: "ゆっくり・小声",
+      threshold: 0.007,
+      silence_ms: 850,
+      min_speech_ms: 100,
+      pre_roll_ms: 600,
+      auto_adjust: true,
+    },
+  };
+
+  document.querySelectorAll("[data-vad-preset]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const p = VAD_PRESETS[btn.dataset.vadPreset];
+      if (!p || !currentConfig) return;
+      currentConfig.vad.pre_roll_ms = p.pre_roll_ms;
+      $("vadThreshold").value = p.threshold;
+      $("vadThresholdVal").textContent = p.threshold.toFixed(3);
+      updateThresholdMarker(p.threshold);
+      $("vadSilenceMs").value = p.silence_ms;
+      $("vadMinSpeechMs").value = p.min_speech_ms;
+      $("chkVadAutoAdjust").checked = p.auto_adjust;
+      saveNow();
+      showToast(`会話プリセット「${p.label}」を適用しました`, "ok");
+    });
+  });
 
   $("btnCheckActive").addEventListener("click", () => send({ type: "GetActiveWindow" }));
   $("btnTestPaste").addEventListener("click", () => {
@@ -1437,6 +1484,19 @@
         sel.value = prev;
         break;
       }
+      case "SttModels": {
+        const sel = $("sttModelFile");
+        const prev = ev.selected != null ? ev.selected : sel.value || "";
+        sel.innerHTML = '<option value="">自動（最高精度モデルを優先）</option>';
+        (ev.models || []).forEach((name) => {
+          const opt = document.createElement("option");
+          opt.value = name;
+          opt.textContent = name;
+          sel.appendChild(opt);
+        });
+        sel.value = prev;
+        break;
+      }
       case "Toast":
         showToast(ev.message, ev.level);
         break;
@@ -1509,4 +1569,5 @@
 
   send({ type: "GetConfig" });
   send({ type: "ListAudioDevices" });
+  send({ type: "ListSttModels" });
 })();

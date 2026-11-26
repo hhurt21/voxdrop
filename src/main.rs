@@ -109,7 +109,57 @@ enum SttWorkerMsg {
         radio_clarity: bool,
     },
     ReloadEngine(Arc<dyn SttEngine>),
+    UpdatePromptHints(String),
     Shutdown,
+}
+
+fn build_stt_prompt_hints(cfg: &AppConfig) -> String {
+    let mut terms: Vec<String> = Vec::new();
+    let mut push_term = |s: &str| {
+        let t = s.trim();
+        if t.is_empty() || t.starts_with(':') && t.ends_with(':') {
+            return;
+        }
+        if !terms.iter().any(|existing| existing == t) {
+            terms.push(t.to_string());
+        }
+    };
+
+    for s in ["Discord", "DM", "通話", "ミュート", "テスト"] {
+        push_term(s);
+    }
+    for s in cfg
+        .commands
+        .send
+        .iter()
+        .chain(cfg.commands.clear_all.iter())
+        .chain(cfg.commands.undo.iter())
+        .chain(cfg.commands.newline.iter())
+    {
+        push_term(s);
+    }
+    for d in &cfg.filter.dictionary {
+        push_term(&d.to);
+    }
+    for tgt in cfg.discord_targets.targets.iter().take(6) {
+        push_term(&tgt.name);
+        if let Some(p) = tgt.passphrases.first() {
+            push_term(p);
+        }
+    }
+
+    let mut out = String::new();
+    for term in terms {
+        let add_len = term.chars().count() + if out.is_empty() { 0 } else { 1 };
+        if out.chars().count() + add_len > 150 {
+            break;
+        }
+        if !out.is_empty() {
+            out.push('、');
+        }
+        out.push_str(&term);
+    }
+    out
 }
 
 #[derive(Debug, Clone)]
@@ -367,6 +417,9 @@ fn spawn_stt_worker(
                 }
                 SttWorkerMsg::ReloadEngine(new_engine) => {
                     engine = new_engine;
+                }
+                SttWorkerMsg::UpdatePromptHints(hints) => {
+                    engine.set_prompt_hints(&hints);
                 }
                 SttWorkerMsg::Shutdown => break,
             }
@@ -1783,10 +1836,22 @@ fn main() -> wry::Result<()> {
             }) => {
                 if runtime_dir.is_some() {
                     state.runtime_dir = runtime_dir;
+                    audio_ctrl.set_runtime_dir(state.runtime_dir.clone());
                 }
+                let hints = build_stt_prompt_hints(&state.config);
+                engine.set_prompt_hints(&hints);
                 state.stt_ready = engine.is_ready();
                 state.stt_engine_name = engine.name();
                 let _ = stt_tx.send(SttWorkerMsg::ReloadEngine(engine));
+                let models =
+                    stt::local::list_available_ggml_models(&state.config.stt, state.runtime_dir.as_deref());
+                emit(
+                    &webview,
+                    &BackendEvent::SttModels {
+                        models,
+                        selected: state.config.stt.model_file.clone(),
+                    },
+                );
                 emit_all(&webview, &overlay_webview, &state.status_event());
                 if let Some(err) = error {
                     emit(
@@ -2398,6 +2463,9 @@ fn main() -> wry::Result<()> {
                                 state.runtime_dir.clone(),
                                 proxy.clone(),
                             );
+                        } else {
+                            let hints = build_stt_prompt_hints(&state.config);
+                            let _ = stt_tx.send(SttWorkerMsg::UpdatePromptHints(hints));
                         }
 
                         if hotkeys_changed {
@@ -2821,6 +2889,19 @@ fn main() -> wry::Result<()> {
                             &BackendEvent::AudioDevices {
                                 devices,
                                 selected: state.config.audio_device.clone(),
+                            },
+                        );
+                    }
+                    ClientCommand::ListSttModels => {
+                        let models = stt::local::list_available_ggml_models(
+                            &state.config.stt,
+                            state.runtime_dir.as_deref(),
+                        );
+                        emit(
+                            &webview,
+                            &BackendEvent::SttModels {
+                                models,
+                                selected: state.config.stt.model_file.clone(),
                             },
                         );
                     }

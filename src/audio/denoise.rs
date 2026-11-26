@@ -56,10 +56,28 @@ impl AudioDenoiser {
     }
 
     /// Processes mono 48 kHz `f32` (-1.0..=1.0) samples.
-    /// Returns `(processed_48k_samples, latest_neural_vad_prob, rnnoise_active)`.
+    /// Returns `(processed_48k_samples, max_neural_vad_prob, rnnoise_active)`.
     pub fn process(&mut self, samples_48k: &[f32]) -> (Vec<f32>, f32, bool) {
+        let (vad_48k, _stt_48k, prob, active) = self.process_internal(samples_48k, false);
+        (vad_48k, prob, active)
+    }
+
+    /// Dual-path 48 kHz processing:
+    /// - `vad_48k`: RNNoise + optional gate (for clean VAD / Silero speech boundary detection)
+    /// - `stt_48k`: Natural waveform with at most light RNNoise blend (<= 20%) and NO noise gate
+    ///   so Whisper receives unmangled consonants, slow quiet speech, and fast speech!
+    /// Returns `(vad_48k, stt_48k, max_neural_vad_prob, rnnoise_active)`.
+    pub fn process_dual(&mut self, samples_48k: &[f32]) -> (Vec<f32>, Vec<f32>, f32, bool) {
+        self.process_internal(samples_48k, true)
+    }
+
+    fn process_internal(
+        &mut self,
+        samples_48k: &[f32],
+        produce_stt: bool,
+    ) -> (Vec<f32>, Vec<f32>, f32, bool) {
         if samples_48k.is_empty() {
-            return (Vec::new(), self.last_vad_prob, self.config.enabled);
+            return (Vec::new(), Vec::new(), self.last_vad_prob, self.config.enabled);
         }
 
         let mut stage1 = Vec::with_capacity(samples_48k.len());
@@ -77,14 +95,22 @@ impl AudioDenoiser {
 
         if !self.config.enabled {
             self.last_vad_prob = 0.0;
-            return (stage1, 0.0, false);
+            let stt = if produce_stt { stage1.clone() } else { Vec::new() };
+            return (stage1, stt, 0.0, false);
         }
 
         self.input_buf.extend_from_slice(&stage1);
-        let mut output = Vec::with_capacity(self.input_buf.len());
+        let mut vad_output = Vec::with_capacity(self.input_buf.len());
+        let mut stt_output = if produce_stt {
+            Vec::with_capacity(self.input_buf.len())
+        } else {
+            Vec::new()
+        };
         let strength = self.config.strength.clamp(0.0, 1.0);
+        let stt_strength = (strength * 0.25).min(0.20);
         let gate_enabled = self.config.noise_gate_enabled;
         let vad_th = self.config.vad_prob_threshold.clamp(0.05, 0.95);
+        let mut max_vad_prob = 0.0f32;
 
         let mut in_frame = [0.0f32; FRAME_SIZE];
         let mut out_frame = [0.0f32; FRAME_SIZE];
@@ -110,6 +136,9 @@ impl AudioDenoiser {
 
             let vad_prob = self.rnnoise.process_frame(&mut out_frame, &in_frame);
             self.last_vad_prob = vad_prob;
+            if vad_prob > max_vad_prob {
+                max_vad_prob = vad_prob;
+            }
 
             if vad_prob < 0.18 && self.hangover_frames == 0 {
                 self.hf_noise_floor = (self.hf_noise_floor * 0.90 + frame_rms * 0.10).clamp(0.0005, 0.08);
@@ -152,13 +181,22 @@ impl AudioDenoiser {
                 let dry = self.input_buf[i];
                 let wet = (out_frame[i] / PCM16_SCALE).clamp(-1.0, 1.0);
                 let mixed = dry * (1.0 - eff_strength) + wet * eff_strength;
-                output.push((mixed * self.gate_gain).clamp(-1.0, 1.0));
+                vad_output.push((mixed * self.gate_gain).clamp(-1.0, 1.0));
+                if produce_stt {
+                    let stt_sample = dry * (1.0 - stt_strength) + wet * stt_strength;
+                    stt_output.push(stt_sample.clamp(-1.0, 1.0));
+                }
             }
 
             self.input_buf.drain(0..FRAME_SIZE);
         }
 
-        (output, self.last_vad_prob, true)
+        let returned_prob = if max_vad_prob > 0.0 {
+            max_vad_prob
+        } else {
+            self.last_vad_prob
+        };
+        (vad_output, stt_output, returned_prob, true)
     }
 }
 

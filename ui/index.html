@@ -136,16 +136,22 @@
                 <div class="meter-threshold" id="meterThreshold"></div>
               </div>
               <div class="row space-between">
-                <label class="small-label">VAD しきい値: <strong id="vadThresholdVal">0.025</strong> <span id="vadNoiseFloorHint" class="hint-inline"></span></label>
+                <label class="small-label">VAD しきい値: <strong id="vadThresholdVal">0.012</strong> <span id="vadNoiseFloorHint" class="hint-inline"></span></label>
                 <span class="speaking-badge" id="speakingBadge">無音</span>
               </div>
-              <input type="range" id="vadThreshold" min="0.002" max="0.20" step="0.001" value="0.025" />
+              <input type="range" id="vadThreshold" min="0.002" max="0.20" step="0.001" value="0.012" />
               <div class="row space-between" style="margin-top: 6px; margin-bottom: 4px">
                 <label class="checkbox-row small-check">
                   <input type="checkbox" id="chkVadAutoAdjust" />
                   <span>自動調整（声とノイズを自動判別）</span>
                 </label>
                 <button type="button" class="btn-secondary btn-sm" id="btnCalibrateVad">ノイズ2秒測定</button>
+              </div>
+              <div class="row gap-xs" style="margin-top: 6px; flex-wrap: wrap; align-items: center">
+                <span class="small-label">会話プリセット:</span>
+                <button type="button" class="btn-secondary btn-sm" data-vad-preset="normal">通常会話（推奨）</button>
+                <button type="button" class="btn-secondary btn-sm" data-vad-preset="fast">早口・連続</button>
+                <button type="button" class="btn-secondary btn-sm" data-vad-preset="slow">ゆっくり・小声</button>
               </div>
 
               <div class="nc-box">
@@ -799,10 +805,15 @@
             <div class="form-grid">
               <label>STT エンジン
                 <select id="sttEngine" class="input">
-                  <option value="auto">自動検出 (常駐 sherpa-onnx / whisper-cli / mock)</option>
+                  <option value="auto">自動検出 (Whisper Large-v3-Turbo / Kotoba / sherpa-onnx)</option>
                   <option value="sherpa-onnx">sherpa-onnx (SenseVoice / Zipformer)</option>
                   <option value="whisper-cli">whisper-cli (ローカルバイナリ)</option>
                   <option value="mock">モック（テスト用）</option>
+                </select>
+              </label>
+              <label>Whisper モデル選択
+                <select id="sttModelFile" class="input">
+                  <option value="">自動（最高精度モデルを優先）</option>
                 </select>
               </label>
               <label>モデルディレクトリ

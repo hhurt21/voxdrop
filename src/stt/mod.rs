@@ -25,6 +25,9 @@ pub trait SttEngine: Send + Sync {
     ) -> Result<String, String> {
         self.transcribe(samples_16k)
     }
+
+    /// Updates dynamic prompt hints (voice commands, custom dictionary, friend/channel names).
+    fn set_prompt_hints(&self, _hints: &str) {}
 }
 
 pub fn create_engine(cfg: &SttConfig, runtime_dir: Option<&Path>) -> Arc<dyn SttEngine> {

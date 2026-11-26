@@ -215,11 +215,11 @@ pub struct VadConfig {
 impl Default for VadConfig {
     fn default() -> Self {
         Self {
-            threshold: 0.025,
-            silence_ms: 420,
-            min_speech_ms: 140,
-            pre_roll_ms: 360,
-            max_utterance_ms: 15000,
+            threshold: 0.012,
+            silence_ms: 620,
+            min_speech_ms: 100,
+            pre_roll_ms: 500,
+            max_utterance_ms: 22000,
             silero_model_path: String::new(),
             auto_adjust: true,
         }
@@ -516,6 +516,8 @@ pub struct SttConfig {
     /// "auto" | "sherpa-onnx" | "whisper-cli" | "mock"
     pub engine: String,
     pub model_dir: String,
+    /// Optional explicit GGML model filename (empty = auto highest-accuracy model)
+    pub model_file: String,
     pub cli_path: String,
     pub language: String,
     pub threads: u32,
@@ -526,6 +528,7 @@ impl Default for SttConfig {
         Self {
             engine: "auto".into(),
             model_dir: "models".into(),
+            model_file: String::new(),
             cli_path: String::new(),
             language: "ja".into(),
             threads: 8,
@@ -630,9 +633,15 @@ impl Default for DiscordTtsConfig {
     }
 }
 
+fn default_legacy_config_version() -> u32 {
+    0
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
+    #[serde(default = "default_legacy_config_version")]
+    pub config_version: u32,
     pub input_mode: InputMode,
     pub audio_device: Option<String>,
     /// Windows起動時に自動起動する（デフォルト: false / OFF）
@@ -655,6 +664,7 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            config_version: 2,
             input_mode: InputMode::Draft,
             audio_device: None,
             auto_start: false,
@@ -676,6 +686,35 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    /// Migrates older config versions (< 2) to conversational VAD & clean STT defaults
+    /// while preserving all user targets, commands, dictionary, and VOICEVOX settings.
+    pub fn migrate(&mut self) -> bool {
+        if self.config_version >= 2 {
+            return false;
+        }
+        if self.vad.silence_ms < 550 {
+            self.vad.silence_ms = 620;
+        }
+        if self.vad.pre_roll_ms < 450 {
+            self.vad.pre_roll_ms = 500;
+        }
+        if self.vad.min_speech_ms > 120 {
+            self.vad.min_speech_ms = 100;
+        }
+        if self.vad.max_utterance_ms < 20000 {
+            self.vad.max_utterance_ms = 22000;
+        }
+        if self.vad.threshold > 0.015 {
+            self.vad.threshold = 0.012;
+        }
+        if self.noise_cancel.strength > 0.35 {
+            self.noise_cancel.strength = 0.20;
+        }
+        self.noise_cancel.noise_gate_enabled = false;
+        self.config_version = 2;
+        true
+    }
+
     /// Returns the default configuration file path (`%APPDATA%\VoxDrop\config.json`).
     pub fn default_path() -> PathBuf {
         if let Ok(appdata) = std::env::var("APPDATA") {
@@ -690,7 +729,12 @@ impl AppConfig {
     pub fn load_or_default() -> (Self, PathBuf) {
         let path = Self::default_path();
         match Self::load_from(&path) {
-            Ok(cfg) => (cfg, path),
+            Ok(mut cfg) => {
+                if cfg.migrate() {
+                    let _ = cfg.save_to(&path);
+                }
+                (cfg, path)
+            }
             Err(_) => {
                 let cfg = Self::default();
                 let _ = cfg.save_to(&path);
@@ -703,8 +747,10 @@ impl AppConfig {
         let content = fs::read_to_string(path).map_err(|e| {
             format!("設定ファイルの読み込みに失敗しました ({}): {}", path.display(), e)
         })?;
-        serde_json::from_str::<Self>(&content)
-            .map_err(|e| format!("設定JSONの解析に失敗しました ({}): {}", path.display(), e))
+        let mut cfg = serde_json::from_str::<Self>(&content)
+            .map_err(|e| format!("設定JSONの解析に失敗しました ({}): {}", path.display(), e))?;
+        cfg.migrate();
+        Ok(cfg)
     }
 
     pub fn save_to(&self, path: &Path) -> Result<(), String> {
@@ -797,5 +843,29 @@ mod tests {
         let loaded = AppConfig::load_from(&path).expect("load");
         assert_eq!(cfg, loaded);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrates_v0_config_safely_while_preserving_user_data() {
+        let legacy_json = r#"{
+            "input_mode": "direct",
+            "vad": { "threshold": 0.025, "silence_ms": 320, "min_speech_ms": 140, "pre_roll_ms": 300, "max_utterance_ms": 15000, "auto_adjust": true },
+            "noise_cancel": { "enabled": true, "strength": 0.85, "noise_gate_enabled": true },
+            "filter": { "dictionary": [{ "from": "テスト", "to": "TEST" }] }
+        }"#;
+        let mut cfg: AppConfig = serde_json::from_str(legacy_json).expect("parse legacy");
+        assert_eq!(cfg.config_version, 0);
+        assert!(cfg.migrate());
+        assert_eq!(cfg.config_version, 2);
+        assert_eq!(cfg.vad.silence_ms, 620);
+        assert_eq!(cfg.vad.pre_roll_ms, 500);
+        assert_eq!(cfg.vad.min_speech_ms, 100);
+        assert_eq!(cfg.vad.max_utterance_ms, 22000);
+        assert!((cfg.vad.threshold - 0.012).abs() < 1e-6);
+        assert!((cfg.noise_cancel.strength - 0.20).abs() < 1e-6);
+        assert!(!cfg.noise_cancel.noise_gate_enabled);
+        assert_eq!(cfg.filter.dictionary.len(), 1);
+        assert_eq!(cfg.filter.dictionary[0].to, "TEST");
+        assert!(!cfg.migrate());
     }
 }
