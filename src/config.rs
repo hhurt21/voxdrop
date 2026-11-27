@@ -255,18 +255,22 @@ impl Default for VadConfig {
 
 /// beast-tools / v1.6.0 相当の高性能ノイズキャンセリング（DPDFNet / GTCRN / RNNoise / HPF 経路独立切替）設定。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
 pub enum NoiseEngineKind {
-    #[serde(alias = "dpdfnet_16k")]
+    #[serde(rename = "dpdfnet-16k", alias = "dpdf-net16k", alias = "dpdfnet_16k")]
     DpdfNet16k,
-    #[serde(alias = "dpdfnet_48k")]
+    #[serde(rename = "dpdfnet-48k", alias = "dpdf-net48k", alias = "dpdfnet_48k")]
     DpdfNet48k,
-    #[serde(alias = "gtcrn_16k")]
+    #[serde(rename = "gtcrn-16k", alias = "gtcrn16k", alias = "gtcrn_16k")]
     Gtcrn16k,
-    #[serde(alias = "deepfilternet3")]
+    #[serde(
+        rename = "deepfilternet3",
+        alias = "deep-filter-net3",
+        alias = "deep_filter_net3"
+    )]
     DeepFilterNet3,
+    #[serde(rename = "rnnoise")]
     Rnnoise,
-    #[serde(alias = "off_hpf", alias = "off")]
+    #[serde(rename = "off-hpf", alias = "off_hpf", alias = "off")]
     OffHpf,
 }
 
@@ -1368,5 +1372,34 @@ mod tests {
         assert!(back.migrate());
         assert_eq!(back.noise_cancel.dpdfnet_attenuation_limit_db, 18.0);
         assert_eq!(back.hotkeys.panic_mute, "");
+    }
+
+    #[test]
+    fn noise_engine_kind_serializes_to_as_str_and_accepts_ui_and_legacy_aliases() {
+        for kind in [
+            NoiseEngineKind::DpdfNet16k,
+            NoiseEngineKind::DpdfNet48k,
+            NoiseEngineKind::Gtcrn16k,
+            NoiseEngineKind::DeepFilterNet3,
+            NoiseEngineKind::Rnnoise,
+            NoiseEngineKind::OffHpf,
+        ] {
+            let serialized = serde_json::to_string(&kind).unwrap();
+            assert_eq!(serialized, format!("\"{}\"", kind.as_str()));
+            let parsed: NoiseEngineKind = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(parsed, kind);
+        }
+        assert_eq!(
+            serde_json::from_str::<NoiseEngineKind>("\"dpdfnet-16k\"").unwrap(),
+            NoiseEngineKind::DpdfNet16k
+        );
+        assert_eq!(
+            serde_json::from_str::<NoiseEngineKind>("\"dpdf-net16k\"").unwrap(),
+            NoiseEngineKind::DpdfNet16k
+        );
+        assert_eq!(
+            serde_json::from_str::<NoiseEngineKind>("\"gtcrn16k\"").unwrap(),
+            NoiseEngineKind::Gtcrn16k
+        );
     }
 }
