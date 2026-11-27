@@ -10,6 +10,9 @@
   let voicevoxSpeakers = [];
   let gameProfiles = [];
   let diagnosticsItems = [];
+  let isPanicMode = false;
+  let lastCatalogInventory = null;
+  let benchmarkCases = [];
   const phraseEditors = {};
 
   function ensurePhraseEditor(id) {
@@ -599,6 +602,97 @@
     });
   }
 
+  function renderPairList(containerId, items, fromKey, toKey, fromPh, toPh) {
+    const wrap = $(containerId);
+    if (!wrap) return;
+    wrap.innerHTML = "";
+    (items || []).forEach((item) => {
+      const row = document.createElement("div");
+      row.className = "dict-row";
+      row.innerHTML = `
+        <input type="text" class="input pair-from" placeholder="${fromPh}" />
+        <span class="dict-arrow">→</span>
+        <input type="text" class="input pair-to" placeholder="${toPh}" />
+        <button type="button" class="btn-danger btn-sm pair-del">削除</button>
+      `;
+      row.querySelector(".pair-from").value = item[fromKey] || "";
+      row.querySelector(".pair-to").value = item[toKey] || "";
+      row.querySelector(".pair-del").addEventListener("click", () => row.remove());
+      wrap.appendChild(row);
+    });
+  }
+
+  function collectPairList(containerId, fromKey, toKey) {
+    const out = [];
+    document.querySelectorAll(`#${containerId} .dict-row`).forEach((row) => {
+      const f = row.querySelector(".pair-from").value.trim();
+      const t = row.querySelector(".pair-to").value;
+      if (f) {
+        const obj = {};
+        obj[fromKey] = f;
+        obj[toKey] = t;
+        out.push(obj);
+      }
+    });
+    return out;
+  }
+
+  function renderCarefulTargetsCheckboxes(selectedIds) {
+    const box = $("carefulTargetsBox");
+    if (!box) return;
+    const set = new Set(selectedIds || []);
+    const targets = getTargets();
+    box.innerHTML = "";
+    if (!targets.length) {
+      box.innerHTML = '<span class="small-label">登録済みフレンド/チャンネルがありません</span>';
+      return;
+    }
+    targets.forEach((t) => {
+      const lbl = document.createElement("label");
+      lbl.className = "checkbox-row small-check";
+      const chk = document.createElement("input");
+      chk.type = "checkbox";
+      chk.className = "careful-target-chk";
+      chk.value = t.id;
+      chk.checked = set.has(t.id);
+      const sp = document.createElement("span");
+      sp.textContent = targetDisplayName(t);
+      lbl.appendChild(chk);
+      lbl.appendChild(sp);
+      box.appendChild(lbl);
+    });
+  }
+
+  function renderSpeechHabits(habits) {
+    const box = $("speechHabitsList");
+    if (!box) return;
+    box.innerHTML = "";
+    if (!habits || !habits.length) {
+      box.innerHTML = '<div class="empty-state">まだ学習された言い直し癖はありません</div>';
+      return;
+    }
+    habits.forEach((h, idx) => {
+      const row = document.createElement("div");
+      row.className = "dict-row";
+      row.innerHTML = `
+        <input type="text" class="input habit-from" />
+        <span class="dict-arrow">→</span>
+        <input type="text" class="input habit-to" />
+        <button type="button" class="btn-danger btn-sm habit-del">削除</button>
+      `;
+      row.querySelector(".habit-from").value = h.from || "";
+      row.querySelector(".habit-to").value = h.to || "";
+      row.querySelector(".habit-del").addEventListener("click", () => {
+        if (currentConfig && Array.isArray(currentConfig.speech_habits)) {
+          currentConfig.speech_habits.splice(idx, 1);
+          renderSpeechHabits(currentConfig.speech_habits);
+          saveNow();
+        }
+      });
+      box.appendChild(row);
+    });
+  }
+
   function applyConfigToUi(cfg, configPath) {
     currentConfig = cfg;
     activeTargetId = (cfg.discord_targets && cfg.discord_targets.active_target_id) || null;
@@ -629,6 +723,14 @@
     $("chkNcHighpass").checked = !!nc.highpass_enabled;
     $("chkNcGate").checked = !!nc.noise_gate_enabled;
     $("ncVadProbThreshold").value = nc.vad_prob_threshold;
+    $("ncVadEngine").value = nc.vad_engine || "gtcrn-16k";
+    $("ncSttEngine").value = nc.stt_engine || "dpdfnet-16k";
+    const dpdfLim = nc.dpdfnet_attenuation_limit_db != null ? nc.dpdfnet_attenuation_limit_db : -18;
+    $("ncDpdfLimit").value = dpdfLim;
+    $("ncDpdfLimitVal").textContent = dpdfLim;
+    const eqVal = nc.presence_eq_strength != null ? nc.presence_eq_strength : 0.55;
+    $("ncPresenceEq").value = eqVal;
+    $("ncPresenceEqVal").textContent = Math.round(eqVal * 100) + "%";
 
     const dt = cfg.discord_targets || {};
     setPhraseList("peTargetPrefixes", dt.switch_prefixes);
@@ -670,12 +772,66 @@
     $("fillersInput").value = joinCsv(cfg.filter.fillers);
     renderDictionary(cfg.filter.dictionary);
 
+    const acc = (cfg.stt && cfg.stt.accuracy) || {};
+    $("chkStutterCleanup").checked = acc.stutter_cleanup !== false;
+    $("chkPhoneticFuzzy").checked = acc.phonetic_fuzzy_matching !== false;
+    $("chkAutoLearnRespeak").checked = acc.auto_learn_respeak !== false;
+    $("chkWsolaEnabled").checked = acc.wsola_enabled !== false;
+    $("chkWsolaAutoFast").checked = acc.wsola_auto_fast !== false;
+    const wRate = acc.wsola_rate != null ? acc.wsola_rate : 0.84;
+    $("wsolaRate").value = wRate;
+    $("wsolaRateVal").textContent = Number(wRate).toFixed(2) + "x";
+    $("headPadMs").value = acc.head_silence_pad_ms != null ? acc.head_silence_pad_ms : 220;
+    $("tailPadMs").value = acc.tail_silence_pad_ms != null ? acc.tail_silence_pad_ms : 300;
+    $("chkOverlapEnabled").checked = acc.overlap_chunking_enabled !== false;
+    $("overlapThresholdSec").value = acc.overlap_threshold_sec != null ? acc.overlap_threshold_sec : 12;
+    $("overlapSec").value = acc.overlap_sec != null ? acc.overlap_sec : 1.5;
+    $("beamSize").value = acc.beam_size != null ? acc.beam_size : 3;
+    $("chkTempFallback").checked = acc.temperature_fallback !== false;
+    $("chkTwoPassRescue").checked = acc.two_pass_rescue !== false;
+    $("chkUltimateEnsemble").checked = !!acc.ultimate_ensemble;
+    $("secondaryEngine").value = acc.secondary_engine || "sherpa-qwen3";
+    $("chkContextPrompt").checked = acc.context_prompt_injection !== false;
+    $("chkStreamingPreview").checked = acc.streaming_preview_enabled !== false;
+    $("streamingIntervalMs").value = acc.streaming_interval_ms != null ? acc.streaming_interval_ms : 1700;
+
+    const llm = acc.llm || {};
+    $("chkLlmEnabled").checked = !!llm.enabled;
+    $("llmBaseUrl").value = llm.base_url || "http://127.0.0.1:8081";
+    $("llmEndpointPath").value = llm.endpoint_path || "/v1/chat/completions";
+    $("llmModel").value = llm.model || "qwen3-1.7b";
+    $("llmStyle").value = llm.style || "normal";
+    $("llmExePath").value = llm.server_exe_path || "";
+    $("llmArgs").value = llm.server_args || "";
+    $("llmTimeoutMs").value = llm.timeout_ms != null ? llm.timeout_ms : 1800;
+    $("llmApiKey").value = llm.api_key || "";
+    $("chkLlmAutoLaunch").checked = !!llm.auto_launch;
+    $("chkLlmStopExit").checked = llm.stop_on_exit !== false;
+
+    renderPairList("snippetRows", cfg.snippets || [], "trigger", "expansion", "呼び出しトリガー", "展開する定型文");
+    renderPairList("emojiAliasRows", cfg.emoji_aliases || [], "spoken", "emoji", "発話ワード (例: くさ)", "絵文字 (例: 😂)");
+    renderSpeechHabits(cfg.speech_habits || []);
+
+    $("audioFallbacksInput").value = joinCsv(cfg.audio_device_fallbacks || []);
+    const nm = cfg.night_mode || {};
+    $("chkNightEnabled").checked = !!nm.enabled;
+    $("nightStartHour").value = nm.start_hour != null ? nm.start_hour : 23;
+    $("nightEndHour").value = nm.end_hour != null ? nm.end_hour : 6;
+    $("nightTtsScale").value = nm.tts_volume_scale != null ? nm.tts_volume_scale : 0.45;
+    const pe = cfg.power_eco || {};
+    $("chkVramWatchdog").checked = pe.vram_watchdog_enabled !== false;
+    $("vramThresholdPct").value = pe.vram_threshold_pct != null ? pe.vram_threshold_pct : 88;
+    $("chkBatteryEco").checked = pe.auto_battery_eco !== false;
+    $("ecoThreads").value = pe.eco_threads != null ? pe.eco_threads : 2;
+
     $("chkGuardEnabled").checked = !!cfg.guard.enabled;
     $("chkGuardAutoFocus").checked = cfg.guard.auto_focus_discord !== false;
     $("chkGuardRestoreWindow").checked = cfg.guard.restore_previous_window !== false;
     $("guardSendMethod").value = cfg.guard.send_method || "auto_paste";
     $("allowedProcesses").value = joinCsv(cfg.guard.allowed_processes);
     $("clipboardDelay").value = cfg.guard.clipboard_restore_delay_ms;
+    $("chkTargetLocked").checked = !!cfg.guard.target_locked;
+    renderCarefulTargetsCheckboxes(cfg.guard.careful_target_ids || []);
 
     $("hkToggle").value = cfg.hotkeys.toggle_listening || "";
     $("hkPtt").value = cfg.hotkeys.push_to_talk || "";
@@ -868,6 +1024,38 @@
         noise_gate_enabled: $("chkNcGate").checked,
         vad_prob_threshold: parseFloat($("ncVadProbThreshold").value) || 0.3,
         radio_clarity_mode: $("chkNcRadioClarity").checked,
+        vad_engine: $("ncVadEngine").value || "gtcrn-16k",
+        stt_engine: $("ncSttEngine").value || "dpdfnet-16k",
+        dpdfnet_attenuation_limit_db: parseFloat($("ncDpdfLimit").value) || -18,
+        presence_eq_strength: parseFloat($("ncPresenceEq").value) || 0.55,
+      },
+      audio_device_fallbacks: splitCsv($("audioFallbacksInput").value),
+      snippets: collectPairList("snippetRows", "trigger", "expansion").map((s, i) => ({
+        id: "snip_" + i,
+        trigger: s.trigger,
+        expansion: s.expansion,
+      })),
+      emoji_aliases: collectPairList("emojiAliasRows", "spoken", "emoji"),
+      speech_habits: (() => {
+        const list = [];
+        document.querySelectorAll("#speechHabitsList .dict-row").forEach((r) => {
+          const from = r.querySelector(".habit-from").value.trim();
+          const to = r.querySelector(".habit-to").value.trim();
+          if (from && to) list.push({ from, to });
+        });
+        return list;
+      })(),
+      night_mode: {
+        enabled: $("chkNightEnabled").checked,
+        start_hour: Math.max(0, Math.min(23, parseInt($("nightStartHour").value, 10) || 23)),
+        end_hour: Math.max(0, Math.min(23, parseInt($("nightEndHour").value, 10) || 6)),
+        tts_volume_scale: Math.max(0.1, Math.min(1.0, parseFloat($("nightTtsScale").value) || 0.45)),
+      },
+      power_eco: {
+        vram_watchdog_enabled: $("chkVramWatchdog").checked,
+        vram_threshold_pct: Math.max(50, Math.min(99, parseInt($("vramThresholdPct").value, 10) || 88)),
+        auto_battery_eco: $("chkBatteryEco").checked,
+        eco_threads: Math.max(1, Math.min(16, parseInt($("ecoThreads").value, 10) || 2)),
       },
       discord_targets: {
         active_target_id: validActive,
@@ -920,6 +1108,8 @@
         send_method: $("guardSendMethod").value || "auto_paste",
         allowed_processes: splitCsv($("allowedProcesses").value),
         clipboard_restore_delay_ms: parseInt($("clipboardDelay").value, 10) || 80,
+        target_locked: $("chkTargetLocked").checked,
+        careful_target_ids: Array.from(document.querySelectorAll(".careful-target-chk:checked")).map((c) => c.value),
       },
       hotkeys: {
         toggle_listening: $("hkToggle").value.trim(),
@@ -944,6 +1134,41 @@
         cli_path: $("sttCliPath").value.trim(),
         language: $("sttLanguage").value.trim() || "ja",
         preset: (currentConfig.stt && currentConfig.stt.preset) || "normal",
+        accuracy: {
+          wsola_enabled: $("chkWsolaEnabled").checked,
+          wsola_rate: parseFloat($("wsolaRate").value) || 0.84,
+          wsola_auto_fast: $("chkWsolaAutoFast").checked,
+          head_silence_pad_ms: parseInt($("headPadMs").value, 10) || 220,
+          tail_silence_pad_ms: parseInt($("tailPadMs").value, 10) || 300,
+          overlap_chunking_enabled: $("chkOverlapEnabled").checked,
+          overlap_threshold_sec: parseFloat($("overlapThresholdSec").value) || 12,
+          overlap_sec: parseFloat($("overlapSec").value) || 1.5,
+          beam_size: Math.max(1, Math.min(5, parseInt($("beamSize").value, 10) || 3)),
+          temperature_fallback: $("chkTempFallback").checked,
+          two_pass_rescue: $("chkTwoPassRescue").checked,
+          ultimate_ensemble: $("chkUltimateEnsemble").checked,
+          secondary_engine: $("secondaryEngine").value || "sherpa-qwen3",
+          context_prompt_injection: $("chkContextPrompt").checked,
+          streaming_preview_enabled: $("chkStreamingPreview").checked,
+          streaming_interval_ms: parseInt($("streamingIntervalMs").value, 10) || 1700,
+          phonetic_fuzzy_matching: $("chkPhoneticFuzzy").checked,
+          stutter_cleanup: $("chkStutterCleanup").checked,
+          auto_learn_respeak: $("chkAutoLearnRespeak").checked,
+          llm: {
+            enabled: $("chkLlmEnabled").checked,
+            base_url: $("llmBaseUrl").value.trim() || "http://127.0.0.1:8081",
+            endpoint_path: $("llmEndpointPath").value.trim() || "/v1/chat/completions",
+            model: $("llmModel").value.trim() || "qwen3-1.7b",
+            model_file: ((currentConfig.stt && currentConfig.stt.accuracy && currentConfig.stt.accuracy.llm && currentConfig.stt.accuracy.llm.model_file) || ""),
+            api_key: $("llmApiKey").value.trim(),
+            server_exe_path: $("llmExePath").value.trim(),
+            server_args: $("llmArgs").value.trim(),
+            auto_launch: $("chkLlmAutoLaunch").checked,
+            stop_on_exit: $("chkLlmStopExit").checked,
+            timeout_ms: parseInt($("llmTimeoutMs").value, 10) || 1800,
+            style: $("llmStyle").value || "normal",
+          },
+        },
         http_asr: {
           base_url: $("httpAsrBaseUrl").value.trim() || "http://127.0.0.1:8080",
           endpoint_path: $("httpAsrEndpoint").value.trim() || "/v1/audio/transcriptions",
@@ -1049,6 +1274,10 @@
   }
 
   function renderHistory() {
+    const historyCard = $("historyList");
+    if (historyCard) {
+      historyCard.classList.toggle("panic-masked", isPanicMode);
+    }
     const list = $("historyList");
     if (!history.length) {
       list.innerHTML = '<div class="empty-state">まだ認識履歴はありません</div>';
@@ -1181,6 +1410,17 @@
         if (!showing) toInp.focus();
       });
 
+      const benchBtn = document.createElement("button");
+      benchBtn.type = "button";
+      benchBtn.className = "btn-secondary btn-sm";
+      benchBtn.textContent = "ベンチ保存";
+      benchBtn.addEventListener("click", () => {
+        const exp = window.prompt("正解テキスト（期待する文字起こし結果）を入力してください:", item.final_text || item.raw_text || "");
+        if (exp && exp.trim()) {
+          send({ type: "SaveBenchmarkCase", diag_id: item.id, expected_text: exp.trim() });
+        }
+      });
+
       const abResult = document.createElement("div");
       abResult.id = "ab-result-" + item.id;
       abResult.className = "ab-result";
@@ -1188,6 +1428,7 @@
       btnRow.appendChild(playBtn);
       btnRow.appendChild(abBtn);
       btnRow.appendChild(learnBtn);
+      btnRow.appendChild(benchBtn);
 
       card.appendChild(stats);
       card.appendChild(rawRow);
@@ -1224,6 +1465,7 @@
     $("gpName").value = "";
     $("gpProcesses").value = "";
     $("gpSendMethod").value = "";
+    $("gpSpeechStyle").value = "";
     $("gpOverlayX").value = "";
     $("gpOverlayY").value = "";
     $("gpOverlayOpacity").value = "";
@@ -1272,6 +1514,7 @@
         $("gpName").value = gp.name || "";
         $("gpProcesses").value = (gp.process_names || []).join(", ");
         $("gpSendMethod").value = gp.send_method || "";
+        $("gpSpeechStyle").value = gp.speech_style || "";
         $("gpOverlayX").value = gp.overlay_x != null ? gp.overlay_x : "";
         $("gpOverlayY").value = gp.overlay_y != null ? gp.overlay_y : "";
         $("gpOverlayOpacity").value = gp.overlay_opacity != null ? gp.overlay_opacity : "";
@@ -1618,6 +1861,20 @@
   $("chkNcRadioClarity").addEventListener("change", saveNow);
   $("chkNcHighpass").addEventListener("change", saveNow);
   $("chkNcGate").addEventListener("change", saveNow);
+  $("ncVadEngine").addEventListener("change", saveNow);
+  $("ncSttEngine").addEventListener("change", saveNow);
+  $("ncDpdfLimit").addEventListener("input", (e) => {
+    $("ncDpdfLimitVal").textContent = e.target.value;
+  });
+  $("ncDpdfLimit").addEventListener("change", saveNow);
+  $("ncPresenceEq").addEventListener("input", (e) => {
+    $("ncPresenceEqVal").textContent = Math.round(parseFloat(e.target.value) * 100) + "%";
+  });
+  $("ncPresenceEq").addEventListener("change", saveNow);
+  $("wsolaRate").addEventListener("input", (e) => {
+    $("wsolaRateVal").textContent = Number(e.target.value).toFixed(2) + "x";
+  });
+  $("wsolaRate").addEventListener("change", saveNow);
   $("ncStrength").addEventListener("input", (e) => {
     $("ncStrengthVal").textContent = Math.round(parseFloat(e.target.value) * 100) + "%";
   });
@@ -1659,6 +1916,73 @@
     });
     list.push({ from: "", to: "" });
     renderDictionary(list);
+  });
+
+  $("btnAddSnippet").addEventListener("click", () => {
+    const list = collectPairList("snippetRows", "trigger", "expansion");
+    list.push({ trigger: "", expansion: "" });
+    renderPairList("snippetRows", list, "trigger", "expansion", "呼び出しトリガー", "展開する定型文");
+  });
+  $("btnAddEmojiAlias").addEventListener("click", () => {
+    const list = collectPairList("emojiAliasRows", "spoken", "emoji");
+    list.push({ spoken: "", emoji: "" });
+    renderPairList("emojiAliasRows", list, "spoken", "emoji", "発話ワード (例: くさ)", "絵文字 (例: 😂)");
+  });
+
+  $("btnTargetLock").addEventListener("click", () => send({ type: "ToggleTargetLock" }));
+  $("chkTargetLocked").addEventListener("change", saveNow);
+  $("btnPanicMute").addEventListener("click", () => send({ type: "TogglePanicSafeMode" }));
+  $("btnDismissUpdate").addEventListener("click", () => {
+    $("updateBanner").style.display = "none";
+  });
+
+  $("btnTestLlm").addEventListener("click", () => {
+    send({ type: "TestLlmCorrector", base_url: $("llmBaseUrl").value.trim() || null });
+  });
+  $("btnLaunchLlm").addEventListener("click", () => {
+    saveNow();
+    send({ type: "LaunchLlmServer" });
+  });
+
+  $("btnRefreshCatalog").addEventListener("click", () => send({ type: "GetCatalogInventory" }));
+  $("btnApplyWizard").addEventListener("click", () => send({ type: "ApplyWizardRecommendation" }));
+  $("btnStartCalibrationWizard").addEventListener("click", () => {
+    const box = $("calibrationResultBox");
+    box.className = "ab-result show";
+    box.textContent = "15秒滑舌診断を開始します。お好きな文章を普段のスピードで話してください...";
+    send({ type: "StartCalibrationWizard" });
+  });
+
+  $("btnExportBackup").addEventListener("click", () => send({ type: "ExportBackup" }));
+  $("btnImportBackup").addEventListener("click", () => $("backupFileInput").click());
+  $("backupFileInput").addEventListener("change", (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === "string") {
+        send({ type: "ImportBackup", json: reader.result });
+      }
+    };
+    reader.readAsText(file, "utf-8");
+    e.target.value = "";
+  });
+
+  $("btnRunBenchmark").addEventListener("click", () => {
+    $("benchResultBox").className = "ab-result show";
+    $("benchResultBox").textContent = "ベンチマーク一括テストを実行中...";
+    send({ type: "RunBenchmarkSuite" });
+  });
+  $("btnRunAutoTuner").addEventListener("click", () => {
+    $("autoTunerProposalBox").className = "ab-result show";
+    $("autoTunerProposalBox").textContent = "最適パラメータを探索中...";
+    send({ type: "RunAutoTuner" });
+  });
+  $("btnRefreshStats").addEventListener("click", () => send({ type: "GetStats" }));
+  $("btnResetStats").addEventListener("click", () => {
+    if (window.confirm("認識統計データをリセットしますか？")) {
+      send({ type: "ResetStats" });
+    }
   });
 
   $("chkOverlayClickThrough").addEventListener("change", (e) => {
@@ -1757,6 +2081,7 @@
       process_names: processes,
       dictionary: parseProfileDictText($("gpDictText").value),
       send_method: $("gpSendMethod").value || null,
+      speech_style: $("gpSpeechStyle").value || null,
       overlay_x: xRaw !== "" ? parseInt(xRaw, 10) : null,
       overlay_y: yRaw !== "" ? parseInt(yRaw, 10) : null,
       overlay_opacity: opRaw !== "" ? Math.max(0.2, Math.min(1.0, parseFloat(opRaw))) : null,
@@ -1847,6 +2172,199 @@
     send({ type: "TestKeyAction", action: "undo", delay_ms: delaySec * 1000 });
   });
 
+  function renderCatalogInventory(payload) {
+    if (!payload) return;
+    lastCatalogInventory = payload;
+    const hw = payload.hardware || {};
+    $("hwGpuName").textContent = `${hw.gpu_name || "CPU"} (${hw.gpu_vendor || "CPU"} | VRAM ${Number(hw.vram_gb || 0).toFixed(1)} GB${hw.vram_usage_pct != null ? " / 使用率 " + hw.vram_usage_pct + "%" : ""} | CPU ${hw.cpu_cores || "-"}コア)`;
+    $("hwSummaryNote").textContent = `${hw.summary_note || ""} | 推奨: ${hw.recommended_stt_engine} / ${hw.recommended_stt_model || "標準"} | VAD=${hw.recommended_vad_noise} / STT=${hw.recommended_stt_noise}`;
+
+    const container = $("modelCatalogContainer");
+    if (!container) return;
+    container.innerHTML = "";
+    const categories = [
+      ["stt", "音声認識 (STT) モデル"],
+      ["noise_suppression", "AIノイズ抑制モデル"],
+      ["llm_correction", "文脈誤字補正 (ローカルLLM)"],
+      ["vad", "発話区間検出 (VAD)"],
+    ];
+    const items = payload.items || [];
+    categories.forEach(([catKey, catTitle]) => {
+      const group = items.filter((m) => m.category === catKey);
+      if (!group.length) return;
+      const h = document.createElement("div");
+      h.className = "catalog-category-title";
+      h.textContent = catTitle;
+      container.appendChild(h);
+
+      const grid = document.createElement("div");
+      grid.className = "catalog-grid";
+      group.forEach((m) => {
+        const card = document.createElement("div");
+        card.className = "model-card" + (m.in_use ? " in-use" : "");
+
+        const top = document.createElement("div");
+        top.className = "row space-between";
+        const title = document.createElement("strong");
+        title.textContent = m.display_name || m.id;
+        const badgeWrap = document.createElement("div");
+        badgeWrap.className = "model-meta-row";
+        if (m.in_use) {
+          const b = document.createElement("span");
+          b.className = "pill ok";
+          b.textContent = "使用中";
+          badgeWrap.appendChild(b);
+        }
+        const fit = document.createElement("span");
+        fit.className = "pill " + ((m.pc_fit_badge || "").includes("推奨") || (m.pc_fit_badge || "").includes("最適") ? "ok" : "");
+        fit.textContent = m.pc_fit_badge || m.runtime;
+        badgeWrap.appendChild(fit);
+        top.appendChild(title);
+        top.appendChild(badgeWrap);
+
+        const meta = document.createElement("div");
+        meta.className = "small-label";
+        meta.textContent = `方式: ${m.runtime} | 状態: ${m.installed ? "導入済み (" + m.disk_size_label + ")" : "未取得 (~" + m.download_size_mb + " MB)"}`;
+
+        const ul = document.createElement("ul");
+        ul.className = "model-benefits";
+        (m.benefits || []).forEach((b) => {
+          const li = document.createElement("li");
+          li.textContent = b;
+          ul.appendChild(li);
+        });
+
+        const best = document.createElement("div");
+        best.className = "small-label";
+        best.textContent = `得意: ${m.best_for || "-"} / 注意: ${m.caution || "-"}`;
+
+        const sc = m.scores || {};
+        const bars = document.createElement("div");
+        bars.className = "score-bars";
+        bars.innerHTML = `<span>精度:${sc.accuracy || 0}/5</span><span>耐騒音:${sc.noise_resilience || 0}/5</span><span>速度:${sc.speed || 0}/5</span><span>軽量:${sc.lightness || 0}/5</span>`;
+
+        const actions = document.createElement("div");
+        actions.className = "row gap-sm";
+        actions.style.marginTop = "4px";
+        actions.style.flexWrap = "wrap";
+
+        if (!m.installed && m.downloadable) {
+          const dlBtn = document.createElement("button");
+          dlBtn.type = "button";
+          dlBtn.className = "btn-primary btn-sm";
+          dlBtn.textContent = `取得 (~${m.download_size_mb}MB)`;
+          dlBtn.addEventListener("click", () => {
+            send({ type: "DownloadModel", model_id: m.id, custom_url: null, custom_filename: null });
+          });
+          actions.appendChild(dlBtn);
+        }
+
+        if (m.installed && !m.in_use) {
+          const useBtn = document.createElement("button");
+          useBtn.type = "button";
+          useBtn.className = "btn-secondary btn-sm";
+          useBtn.textContent = "使用する";
+          useBtn.addEventListener("click", () => {
+            if (m.category === "noise_suppression") {
+              $("ncSttEngine").value = m.id;
+              saveNow();
+            } else if (m.id.startsWith("ggml-") || m.id.startsWith("whisper-")) {
+              $("sttEngine").value = "whisper-cpp";
+              if (m.id.endsWith(".bin")) $("sttModelFile").value = m.id;
+              saveNow();
+            } else if (m.id === "qwen3-asr-0.6b-int8") {
+              $("sttEngine").value = "sherpa-qwen3";
+              saveNow();
+            } else if (m.id === "qwen3-asr-1.7b-gguf") {
+              $("sttEngine").value = "local-http";
+              saveNow();
+            } else if (m.id === "parakeet-ja-int8") {
+              $("sttEngine").value = "sherpa-onnx";
+              saveNow();
+            } else if (m.category === "llm_correction") {
+              $("chkLlmEnabled").checked = true;
+              saveNow();
+            }
+          });
+          actions.appendChild(useBtn);
+        }
+
+        if (m.can_delete) {
+          const delBtn = document.createElement("button");
+          delBtn.type = "button";
+          delBtn.className = "btn-danger btn-sm";
+          delBtn.textContent = "削除";
+          delBtn.addEventListener("click", () => {
+            if (m.in_use) {
+              if (!window.confirm(`「${m.display_name}」は現在使用中です。安全にアンロードしてディスクから削除しますか？`)) {
+                return;
+              }
+            } else if (!window.confirm(`「${m.display_name}」(${m.disk_size_label}) をディスクから削除しますか？`)) {
+              return;
+            }
+            send({ type: "DeleteModel", model_id: m.id });
+          });
+          actions.appendChild(delBtn);
+        } else if (m.bundled_default) {
+          const lockBadge = document.createElement("span");
+          lockBadge.className = "pill";
+          lockBadge.textContent = "同梱（削除不可）";
+          actions.appendChild(lockBadge);
+        }
+
+        card.appendChild(top);
+        card.appendChild(meta);
+        card.appendChild(ul);
+        card.appendChild(best);
+        card.appendChild(bars);
+        card.appendChild(actions);
+        grid.appendChild(card);
+      });
+      container.appendChild(grid);
+    });
+  }
+
+  function renderBenchmarkCases(cases) {
+    benchmarkCases = cases || [];
+    const box = $("benchCasesList");
+    if (!box) return;
+    box.innerHTML = "";
+    if (!benchmarkCases.length) {
+      box.innerHTML = '<div class="empty-state">保存されたベンチマーク音声はありません</div>';
+      return;
+    }
+    benchmarkCases.forEach((c) => {
+      const row = document.createElement("div");
+      row.className = "bench-item row space-between";
+      const left = document.createElement("div");
+      left.innerHTML = `<strong>${c.label}</strong> <span class="small-label">(${Number(c.duration_sec || 0).toFixed(2)}s)</span><div class="small-label">期待: ${c.expected_text}</div>`;
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "btn-danger btn-sm";
+      del.textContent = "削除";
+      del.addEventListener("click", () => send({ type: "DeleteBenchmarkCase", id: c.id }));
+      row.appendChild(left);
+      row.appendChild(del);
+      box.appendChild(row);
+    });
+  }
+
+  function renderStatsSummary(s) {
+    const box = $("statsSummaryBox");
+    if (!box || !s) return;
+    const engines = (s.engines || []).map(([k, v]) => `${k} (${v.device}): ${v.utterances}回 / 平均${v.utterances ? Math.round(v.total_infer_ms / v.utterances) : 0}ms`).join("<br>");
+    const tops = (s.top_misrecognitions || []).map(([lbl, cnt]) => `${lbl} (${cnt}回)`).join(" / ") || "なし";
+    box.innerHTML = `
+      <div class="stats-grid">
+        <div class="stat-kpi"><div class="small-label">総発話回数</div><div class="kpi-val">${s.total_utterances || 0}</div></div>
+        <div class="stat-kpi"><div class="small-label">取り消し率</div><div class="kpi-val">${Number(s.cancel_rate_pct || 0).toFixed(1)}%</div></div>
+        <div class="stat-kpi"><div class="small-label">平均推論時間</div><div class="kpi-val">${s.avg_infer_ms || 0} ms</div></div>
+      </div>
+      <div class="small-label" style="margin-top:8px"><b>エンジン別統計:</b><br>${engines || "-"}</div>
+      <div class="small-label" style="margin-top:6px"><b>よくある修正ワード:</b> ${tops}</div>
+    `;
+  }
+
   // Backend event handler
   window.onBackendEvent = function (ev) {
     if (!ev || !ev.type) return;
@@ -1884,6 +2402,10 @@
         break;
       }
       case "TranscriptUpdate":
+        if ($("streamingPreviewLine")) {
+          $("streamingPreviewLine").classList.remove("show");
+          $("streamingPreviewLine").textContent = "";
+        }
         if (typeof ev.draft === "string") {
           $("draftBox").value = ev.draft;
         }
@@ -1891,6 +2413,14 @@
           addHistoryItem(ev.text);
         }
         break;
+      case "StreamingPreview": {
+        const line = $("streamingPreviewLine");
+        if (line && ev.draft) {
+          line.textContent = "⏳ 認識中プレビュー: " + ev.draft;
+          line.classList.add("show");
+        }
+        break;
+      }
       case "CommandExecuted":
         showToast("コマンド実行: " + ev.detail, "ok");
         break;
@@ -1970,14 +2500,57 @@
         }
 
         const pillRn = $("pillRnnoise");
-        pillRn.textContent = ev.rnnoise_enabled ? "RNNoise: ON" : "RNNoise: OFF";
+        pillRn.textContent = ev.rnnoise_enabled
+          ? `ノイズ抑制: ${ev.noise_stt_engine || "ON"}`
+          : "ノイズ抑制: OFF";
         pillRn.className = "pill " + (ev.rnnoise_enabled ? "ok" : "");
 
+        isPanicMode = !!ev.panic_mode;
+        const panicBtn = $("btnPanicMute");
+        if (panicBtn) {
+          panicBtn.textContent = isPanicMode ? "🛡 セーフ中 (解除)" : "🛡 配信セーフ";
+          panicBtn.className = "btn-secondary btn-sm" + (isPanicMode ? " btn-panic-on" : "");
+        }
+        renderHistory();
+
+        const lockBtn = $("btnTargetLock");
+        if (lockBtn) {
+          lockBtn.textContent = ev.target_locked ? "🔒 宛先ロック中" : "🔓 宛先ロック";
+          lockBtn.className = "btn-secondary btn-sm" + (ev.target_locked ? " btn-warning" : "");
+        }
+        if ($("chkTargetLocked")) $("chkTargetLocked").checked = !!ev.target_locked;
+
+        const pillPhase = $("pillPhase");
+        if (pillPhase) {
+          const ph = ev.phase || "idle";
+          pillPhase.textContent =
+            isPanicMode ? "セーフ停止" :
+            ph === "rescuing" ? "2パス救済" :
+            ph === "countdown" ? "送信カウント" :
+            ph === "recognizing" ? "推論中" :
+            ph === "listening" ? "収音待機" : "待機";
+          pillPhase.className = "pill " + (isPanicMode ? "warn" : ph === "recognizing" || ph === "rescuing" ? "active" : ph === "listening" ? "ok" : "");
+        }
+
+        const envModes = [];
+        if (ev.night_mode_active) envModes.push("🌙夜間");
+        if (ev.eco_mode_active) envModes.push("🔋Eco");
+        if (ev.portable_mode) envModes.push("💾Portable");
+        const pillEnv = $("pillEnvMode");
+        if (pillEnv) {
+          if (envModes.length) {
+            pillEnv.textContent = envModes.join(" ");
+            pillEnv.style.display = "inline-block";
+          } else {
+            pillEnv.style.display = "none";
+          }
+        }
+
         activeTargetId = ev.active_discord_target_id || null;
-        const tgtLabel = ev.active_discord_target_label || "現在の画面（未指定）";
+        const tgtLabel = isPanicMode ? "*** (非表示)" : (ev.active_discord_target_label || "現在の画面（未指定）");
         $("sidebarDiscordTarget").textContent = tgtLabel;
         const pillDt = $("pillDiscordTarget");
-        pillDt.textContent = "宛先: " + tgtLabel;
+        pillDt.textContent = (ev.target_locked ? "🔒 宛先: " : "宛先: ") + tgtLabel;
         pillDt.className = "pill " + (activeTargetId ? "active" : "");
         renderAllTargets();
 
@@ -2159,6 +2732,7 @@
           showToast(ev.message || (ev.ok ? "モデル取得完了" : "取得失敗"), ev.ok ? "ok" : "error");
           if (ev.ok) {
             send({ type: "ListSttModels" });
+            send({ type: "GetCatalogInventory" });
           }
         }
         break;
@@ -2170,10 +2744,95 @@
         showToast(ev.message, ev.ok ? "ok" : "error");
         break;
       }
+      case "CatalogInventory":
+        renderCatalogInventory(ev);
+        break;
+      case "StatsUpdated":
+        renderStatsSummary(ev.summary);
+        break;
+      case "BenchmarkCasesUpdated":
+        renderBenchmarkCases(ev.cases);
+        break;
+      case "BenchmarkSuiteResult": {
+        const box = $("benchResultBox");
+        if (box) {
+          box.className = "ab-result show";
+          const rows = (ev.results || []).map((r) => `・${r.label}: 一致 ${(r.similarity * 100).toFixed(1)}% (${r.infer_ms}ms) → 「${r.actual_text}」`).join("\n");
+          box.textContent = `平均一致率: ${(Number(ev.avg_similarity || 0) * 100).toFixed(1)}%\n` + rows;
+        }
+        break;
+      }
+      case "AutoTunerResult": {
+        const p = ev.proposal || {};
+        const box = $("autoTunerProposalBox");
+        if (box) {
+          box.className = "ab-result show";
+          box.innerHTML = `提案 (${p.tested_cases || 0}件評価 / 一致 ${(Number(p.avg_similarity || 0) * 100).toFixed(1)}%): EQ=${Number(p.best_eq_strength || 0).toFixed(2)}, WSOLA=${Number(p.best_wsola_rate || 1).toFixed(2)}x, Beam=${p.best_beam_size || 3} <button type="button" class="btn-primary btn-sm" id="btnApplyTuner">この設定を適用</button>`;
+          const b = $("btnApplyTuner");
+          if (b) {
+            b.addEventListener("click", () => {
+              send({
+                type: "ApplyAutoTuner",
+                eq_strength: p.best_eq_strength,
+                wsola_rate: p.best_wsola_rate,
+                beam_size: p.best_beam_size,
+              });
+            });
+          }
+        }
+        break;
+      }
+      case "CalibrationWizardResult": {
+        const box = $("calibrationResultBox");
+        if (box) {
+          box.className = "ab-result show";
+          box.textContent = `${ev.score_note} | 推奨VAD=${Number(ev.recommended_vad || 0.012).toFixed(3)}, EQ=${Number(ev.recommended_eq || 0.55).toFixed(2)}, WSOLA=${ev.recommended_wsola ? "ON" : "OFF"}`;
+        }
+        showToast("15秒滑舌診断が完了しました", "ok");
+        break;
+      }
+      case "BackupExported": {
+        const blob = new Blob([ev.json || "{}"], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "voxdrop-backup-v1.6.json";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        showToast("設定と辞書のバックアップJSONをダウンロードしました", "ok");
+        break;
+      }
+      case "AppUpdateAvailable": {
+        const ban = $("updateBanner");
+        if (ban) {
+          $("updateTitle").textContent = `VoxDrop ${ev.latest_tag} が利用可能です（現在: ${ev.current_tag}）`;
+          $("updateSub").textContent = ev.url || "";
+          $("updateOpenLink").href = ev.url || "https://github.com/hhurt21/voxdrop/releases";
+          ban.style.display = "flex";
+        }
+        break;
+      }
+      case "LlmHealthResult": {
+        const badge = $("llmStatusBadge");
+        if (badge) {
+          badge.textContent = ev.ok ? "LLM: 接続OK" : "LLM: 未接続";
+          badge.className = "pill " + (ev.ok ? "ok" : "warn");
+        }
+        showToast(ev.message, ev.ok ? "ok" : "error");
+        break;
+      }
+      case "PostSendError":
+        showToast(`[PostMessage送信失敗: ${ev.code}] ${ev.detail}`, "error");
+        break;
     }
   };
 
   send({ type: "GetConfig" });
   send({ type: "ListAudioDevices" });
   send({ type: "ListSttModels" });
+  send({ type: "GetCatalogInventory" });
+  send({ type: "GetStats" });
+  send({ type: "CheckAppUpdate" });
 })();

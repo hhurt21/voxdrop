@@ -23,14 +23,14 @@ static HTTP_ASR_PROC: Mutex<Option<Child>> = Mutex::new(None);
 static HTTP_ASR_LAUNCH_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ParsedUrl {
-    is_https: bool,
-    host: String,
-    port: u16,
-    base_path: String,
+pub(crate) struct ParsedUrl {
+    pub(crate) is_https: bool,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) base_path: String,
 }
 
-fn parse_url(raw: &str) -> Result<ParsedUrl, String> {
+pub(crate) fn parse_url(raw: &str) -> Result<ParsedUrl, String> {
     let trimmed = raw.trim().trim_end_matches('/');
     let (is_https, rest, default_port) = if let Some(r) = trimmed.strip_prefix("https://") {
         (true, r, 443u16)

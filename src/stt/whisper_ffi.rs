@@ -334,6 +334,19 @@ impl ResidentWhisperRecognizer {
         samples_16k: &[f32],
         clarity_boost: bool,
     ) -> Result<String, String> {
+        self.transcribe_with_options(samples_16k, clarity_boost, 0.55, 200, 300, 5, true)
+    }
+
+    pub fn transcribe_with_options(
+        &self,
+        samples_16k: &[f32],
+        clarity_boost: bool,
+        eq_strength: f32,
+        head_pad_ms: u64,
+        tail_pad_ms: u64,
+        beam_size: i32,
+        temperature_fallback: bool,
+    ) -> Result<String, String> {
         if samples_16k.len() < 1600 {
             return Ok(String::new());
         }
@@ -343,9 +356,18 @@ impl ResidentWhisperRecognizer {
             (sq / samples_16k.len() as f32).sqrt()
         };
 
-        // Apply clean utterance conditioning (DC removal + gentle continuous clarity + uniform AGC + 250ms/350ms pad)
-        let conditioned =
-            crate::audio::enhance::enhance_utterance_16k(samples_16k, clarity_boost, true);
+        // Layer 1: DC removal + consonant presence EQ + uniform AGC/soft limiter + >=200/300ms silence pad
+        let conditioned = crate::audio::enhance::enhance_utterance_16k_with_options(
+            samples_16k,
+            &crate::audio::enhance::EnhanceOptions {
+                clarity_boost,
+                eq_strength,
+                highpass_enabled: true,
+                agc_enabled: true,
+                head_pad_ms,
+                tail_pad_ms,
+            },
+        );
 
         let _vk = WHISPER_VULKAN_LOCK
             .lock()
@@ -355,10 +377,20 @@ impl ResidentWhisperRecognizer {
             .lock()
             .map_err(|_| "Whisper 認識ロックの取得に失敗しました".to_string())?;
 
-        let text = run_whisper_pass(&guard, &conditioned, self.using_gpu, false)?;
-        if text.is_empty() && input_rms >= 0.015 && samples_16k.len() >= 6400 {
-            // Safety fallback pass: never drop audible speech due to strict thresholds or timestamps
-            return run_whisper_pass(&guard, &conditioned, self.using_gpu, true);
+        // Layer 4 (#38): Beam search + Temperature Fallback ladder (0.0 -> 0.2 -> 0.4)
+        let text = run_whisper_pass(&guard, &conditioned, self.using_gpu, false, beam_size, 0.0)?;
+        if temperature_fallback
+            && (text.trim().is_empty() || crate::stt::ensemble::looks_low_confidence(&text, samples_16k.len() as f32 / 16_000.0))
+            && input_rms >= 0.010
+            && samples_16k.len() >= 6400
+        {
+            for &temp in &[0.2f32, 0.4f32] {
+                if let Ok(alt) = run_whisper_pass(&guard, &conditioned, self.using_gpu, true, beam_size, temp) {
+                    if !alt.trim().is_empty() && !crate::stt::ensemble::looks_low_confidence(&alt, samples_16k.len() as f32 / 16_000.0) {
+                        return Ok(alt);
+                    }
+                }
+            }
         }
         Ok(text)
     }
@@ -381,9 +413,11 @@ fn run_whisper_pass(
     conditioned: &[f32],
     using_gpu: bool,
     safety_fallback: bool,
+    beam_size: i32,
+    temperature: f32,
 ) -> Result<String, String> {
     unsafe {
-        // Use beam_size=2 on GPU for high Japanese accuracy with fast decode; greedy on CPU
+        // Use beam_search on GPU for high Japanese accuracy; greedy on CPU
         let strategy = if using_gpu { 1 } else { 0 };
         let wp_ptr = (guard.fns.full_default_params_by_ref)(strategy);
         if wp_ptr.is_null() {
@@ -420,7 +454,7 @@ fn run_whisper_pass(
         }
         wparams.suppress_blank = true;
         wparams.suppress_nst = true;
-        wparams.temperature = 0.0;
+        wparams.temperature = temperature;
         if safety_fallback {
             wparams.temperature_inc = 0.0;
             wparams.entropy_thold = 5.0;
@@ -435,7 +469,7 @@ fn run_whisper_pass(
         }
         wparams.max_tokens = 0;
         if using_gpu {
-            wparams.beam_search.beam_size = 2;
+            wparams.beam_search.beam_size = beam_size.clamp(1, 5);
             wparams.beam_search.patience = 1.0;
         } else {
             wparams.greedy.best_of = 1;

@@ -18,10 +18,12 @@ use windows::Win32::System::Threading::{
 use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationInvokePattern,
-    IUIAutomationTogglePattern, IUIAutomationTreeWalker, ToggleState_On, TreeScope_Descendants,
-    UIA_ButtonControlTypeId, UIA_ControlTypePropertyId, UIA_EditControlTypeId, UIA_InvokePatternId,
-    UIA_NamePropertyId, UIA_TogglePatternId,
+    IUIAutomationTextPattern, IUIAutomationTogglePattern, IUIAutomationTreeWalker,
+    IUIAutomationValuePattern, ToggleState_On, TreeScope_Descendants, UIA_ButtonControlTypeId,
+    UIA_ControlTypePropertyId, UIA_EditControlTypeId, UIA_InvokePatternId, UIA_NamePropertyId,
+    UIA_TextPatternId, UIA_TogglePatternId, UIA_ValuePatternId,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
 };
@@ -664,6 +666,255 @@ pub fn is_discord_chat_composer_label(label: &str) -> bool {
         || lower.starts_with("message #")
 }
 
+pub fn is_excluded_edit_label(label: &str) -> bool {
+    let lower = label.trim().to_ascii_lowercase();
+    ["メモ", "note", "検索", "search", "ステータス", "status", "プロフィール", "profile"]
+        .iter()
+        .any(|kw| lower.contains(kw))
+}
+
+pub fn score_composer_candidate(label: &str, elem_rect: RECT, win_rect: RECT) -> Option<i32> {
+    if is_excluded_edit_label(label) {
+        return None;
+    }
+    let win_w = win_rect.right - win_rect.left;
+    let win_h = win_rect.bottom - win_rect.top;
+    let elem_w = elem_rect.right - elem_rect.left;
+    let elem_h = elem_rect.bottom - elem_rect.top;
+    if elem_w < 80 || elem_h < 12 || win_w <= 0 || win_h <= 0 {
+        return None;
+    }
+    // Exclude top search bar / header controls
+    if elem_rect.top < win_rect.top + (win_h / 4) {
+        return None;
+    }
+    // Exclude narrow right-sidebar profile note fields unless wide enough to be main composer
+    let in_right_sidebar = elem_rect.left > win_rect.left + (win_w * 72) / 100 && elem_w < (win_w * 35) / 100;
+    if in_right_sidebar {
+        return None;
+    }
+
+    let mut score = if is_discord_chat_composer_label(label) { 100 } else { 30 };
+    if elem_rect.top >= win_rect.top + (win_h / 2) {
+        score += 20;
+    }
+    if elem_w >= (win_w * 35) / 100 {
+        score += 10;
+    }
+    Some(score)
+}
+
+fn find_best_composer_element(
+    root: &IUIAutomationElement,
+    uia: &IUIAutomation,
+    win_rect: RECT,
+) -> Option<(IUIAutomationElement, RECT)> {
+    let edit_cond = unsafe {
+        uia.CreatePropertyCondition(
+            UIA_ControlTypePropertyId,
+            &VARIANT::from(UIA_EditControlTypeId.0),
+        )
+        .ok()?
+    };
+    let edits = unsafe { root.FindAll(TreeScope_Descendants, &edit_cond).ok()? };
+    let len = unsafe { edits.Length().unwrap_or(0) };
+    let mut best: Option<(i32, IUIAutomationElement, RECT)> = None;
+    for i in 0..len {
+        if let Ok(elem) = unsafe { edits.GetElement(i) } {
+            let name = unsafe { elem.CurrentName().map(|b| b.to_string()).unwrap_or_default() };
+            let rect = unsafe { elem.CurrentBoundingRectangle().unwrap_or_default() };
+            if let Some(score) = score_composer_candidate(&name, rect, win_rect) {
+                if best.as_ref().map(|(bs, _, _)| score > *bs).unwrap_or(true) {
+                    best = Some((score, elem, rect));
+                }
+            }
+        }
+    }
+    best.map(|(_, elem, rect)| (elem, rect))
+}
+
+/// Zero-mouse User Profile modal recovery for PostMessage / anti-cheat-safe flows (Section 2.2):
+/// Invokes "メッセージ / メッセージを送る / Message" button via UIA InvokePattern only; if obstructed by a
+/// profile popout, sends PostMessage(VK_ESCAPE) and retries up to 2 times.
+pub fn recover_from_profile_modal_no_mouse(
+    allowed_processes: &[String],
+    render_hwnd: Option<HWND>,
+    timeout_ms: u64,
+) -> Result<bool, &'static str> {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(250));
+    let mut esc_attempts = 0u8;
+
+    while Instant::now() < deadline {
+        if let Some((top_hwnd, _)) = find_discord_window(allowed_processes) {
+            let mut win_rect = RECT::default();
+            let _ = unsafe { GetWindowRect(top_hwnd, &mut win_rect) };
+
+            let mut invoked = false;
+            let mut has_main_composer = false;
+            unsafe {
+                let com_inited = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
+                if let Ok(uia) =
+                    CoCreateInstance::<_, IUIAutomation>(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
+                {
+                    if let Ok(root) = uia.ElementFromHandle(top_hwnd) {
+                        if let Ok(btn_cond) = uia.CreatePropertyCondition(
+                            UIA_ControlTypePropertyId,
+                            &VARIANT::from(UIA_ButtonControlTypeId.0),
+                        ) {
+                            for label in ["メッセージを送る", "メッセージ", "Send Message", "Message"] {
+                                if let Ok(name_cond) = uia.CreatePropertyCondition(
+                                    UIA_NamePropertyId,
+                                    &VARIANT::from(label),
+                                ) {
+                                    if let Ok(and_cond) = uia.CreateAndCondition(&btn_cond, &name_cond) {
+                                        if let Ok(elem) = root.FindFirst(TreeScope_Descendants, &and_cond) {
+                                            let rect = elem.CurrentBoundingRectangle().unwrap_or_default();
+                                            let in_win = rect.right > rect.left
+                                                && rect.bottom > rect.top
+                                                && rect.left >= win_rect.left
+                                                && rect.right <= win_rect.right;
+                                            if in_win {
+                                                if let Ok(pat) = elem.GetCurrentPatternAs::<IUIAutomationInvokePattern>(
+                                                    UIA_InvokePatternId,
+                                                ) {
+                                                    if pat.Invoke().is_ok() {
+                                                        invoked = true;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if !invoked {
+                            has_main_composer = find_best_composer_element(&root, &uia, win_rect).is_some();
+                        }
+                    }
+                }
+                if com_inited {
+                    CoUninitialize();
+                }
+            }
+
+            if invoked {
+                thread::sleep(Duration::from_millis(160));
+                return Ok(true);
+            }
+            if has_main_composer {
+                return Ok(false);
+            }
+            if esc_attempts < 2 {
+                esc_attempts += 1;
+                let target = render_hwnd.unwrap_or(top_hwnd);
+                let _ = input::post_key_window_message(target, VK_ESCAPE);
+                thread::sleep(Duration::from_millis(120));
+                continue;
+            }
+            return Err("profile_modal_stuck");
+        }
+        thread::sleep(Duration::from_millis(60));
+    }
+    Err("composer_not_found")
+}
+
+/// Strictly locates the main Discord composer (`Edit`), calls `SetFocus()`, and polls
+/// `HasKeyboardFocus == true` every 50ms up to `timeout_ms` (default 500ms).
+pub fn focus_main_composer_verified_no_mouse(
+    allowed_processes: &[String],
+    timeout_ms: u64,
+) -> Result<(), &'static str> {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(200));
+    let mut found_any_composer = false;
+
+    while Instant::now() < deadline {
+        if let Some((hwnd, _)) = find_discord_window(allowed_processes) {
+            let mut win_rect = RECT::default();
+            let _ = unsafe { GetWindowRect(hwnd, &mut win_rect) };
+            let mut focused = false;
+
+            unsafe {
+                let com_inited = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
+                if let Ok(uia) =
+                    CoCreateInstance::<_, IUIAutomation>(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
+                {
+                    if let Ok(root) = uia.ElementFromHandle(hwnd) {
+                        if let Some((elem, _)) = find_best_composer_element(&root, &uia, win_rect) {
+                            found_any_composer = true;
+                            let _ = elem.SetFocus();
+                            for _ in 0..10 {
+                                if elem
+                                    .CurrentHasKeyboardFocus()
+                                    .map(|b| b.as_bool())
+                                    .unwrap_or(false)
+                                {
+                                    focused = true;
+                                    break;
+                                }
+                                thread::sleep(Duration::from_millis(50));
+                                let _ = elem.SetFocus();
+                            }
+                        }
+                    }
+                }
+                if com_inited {
+                    CoUninitialize();
+                }
+            }
+            if focused {
+                return Ok(());
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    if found_any_composer {
+        Err("focus_failed")
+    } else {
+        Err("composer_not_found")
+    }
+}
+
+/// Reads the current text inside Discord's main chat composer using UIA ValuePattern or TextPattern.
+pub fn read_main_composer_text_no_mouse(allowed_processes: &[String]) -> Option<String> {
+    let (hwnd, _) = find_discord_window(allowed_processes)?;
+    let mut win_rect = RECT::default();
+    let _ = unsafe { GetWindowRect(hwnd, &mut win_rect) };
+    let mut text_out = None;
+
+    unsafe {
+        let com_inited = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
+        if let Ok(uia) =
+            CoCreateInstance::<_, IUIAutomation>(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
+        {
+            if let Ok(root) = uia.ElementFromHandle(hwnd) {
+                if let Some((elem, _)) = find_best_composer_element(&root, &uia, win_rect) {
+                    if let Ok(vp) =
+                        elem.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
+                    {
+                        if let Ok(val) = vp.CurrentValue() {
+                            text_out = Some(val.to_string());
+                        }
+                    } else if let Ok(tp) =
+                        elem.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
+                    {
+                        if let Ok(range) = tp.DocumentRange() {
+                            if let Ok(val) = range.GetText(-1) {
+                                text_out = Some(val.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if com_inited {
+            CoUninitialize();
+        }
+    }
+    text_out
+}
+
 /// Checks Discord's voice control UI button (Mic Mute / Deafen) via UIA without mouse/keyboard,
 /// and optionally toggles it ONLY if `desired_muted` differs from the live state (`invoke_toggle = true`).
 /// Returns `Some(Ok((was_already_target, action_msg)))` if the UIA control was found.
@@ -790,6 +1041,17 @@ mod tests {
         assert!(is_discord_chat_composer_label("Message #general"));
         assert!(!is_discord_chat_composer_label("メッセージ"));
         assert!(!is_discord_chat_composer_label("会話を見つける、または始める"));
+        assert!(is_excluded_edit_label("フレンド メモ (Note)"));
+        assert!(is_excluded_edit_label("検索 Search"));
+
+        let win = RECT { left: 0, top: 0, right: 1200, bottom: 900 };
+        let good_box = RECT { left: 310, top: 820, right: 1120, bottom: 868 };
+        let search_box = RECT { left: 400, top: 40, right: 800, bottom: 72 };
+        let sidebar_note = RECT { left: 930, top: 450, right: 1170, bottom: 510 };
+        assert!(score_composer_candidate("@alice へメッセージを送信", good_box, win).unwrap() >= 100);
+        assert!(score_composer_candidate("検索", search_box, win).is_none());
+        assert!(score_composer_candidate("メモ", sidebar_note, win).is_none());
+        assert!(score_composer_candidate("", sidebar_note, win).is_none());
     }
 
     #[test]

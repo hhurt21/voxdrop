@@ -253,13 +253,48 @@ impl Default for VadConfig {
     }
 }
 
-/// beast-tools 相当の高性能ノイズキャンセリング（RNNoise + ハイパスフィルタ + ニューラルVADゲート）設定。
+/// beast-tools / v1.6.0 相当の高性能ノイズキャンセリング（DPDFNet / GTCRN / RNNoise / HPF 経路独立切替）設定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NoiseEngineKind {
+    #[serde(alias = "dpdfnet_16k")]
+    DpdfNet16k,
+    #[serde(alias = "dpdfnet_48k")]
+    DpdfNet48k,
+    #[serde(alias = "gtcrn_16k")]
+    Gtcrn16k,
+    #[serde(alias = "deepfilternet3")]
+    DeepFilterNet3,
+    Rnnoise,
+    #[serde(alias = "off_hpf", alias = "off")]
+    OffHpf,
+}
+
+impl Default for NoiseEngineKind {
+    fn default() -> Self {
+        Self::Rnnoise
+    }
+}
+
+impl NoiseEngineKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::DpdfNet16k => "dpdfnet-16k",
+            Self::DpdfNet48k => "dpdfnet-48k",
+            Self::Gtcrn16k => "gtcrn-16k",
+            Self::DeepFilterNet3 => "deepfilternet3",
+            Self::Rnnoise => "rnnoise",
+            Self::OffHpf => "off-hpf",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NoiseCancelConfig {
-    /// RNNoise（ニューラルネットワークノイズ抑制）の有効/無効
+    /// ノイズ抑制の有効/無効
     pub enabled: bool,
-    /// RNNoise 抑制強度 (0.0 ..= 1.0) — 0.70前後が子音欠けを防ぎつつ雑音除去に最適
+    /// RNNoise 抑制強度 (0.0 ..= 1.0)
     pub strength: f32,
     /// 85Hz ハイパスフィルタ（空調・PCファン・机振動の低周波カット）
     pub highpass_enabled: bool,
@@ -267,8 +302,25 @@ pub struct NoiseCancelConfig {
     pub noise_gate_enabled: bool,
     /// 発話とみなすニューラルVAD確率しきい値 (0.05 ..= 0.95)
     pub vad_prob_threshold: f32,
-    /// 無線・ラジオ・滑舌強化モード（GTCRN AI音声強調 + 2.5-4kHz子音明瞭化EQ + AGC自動音量正規化）
+    /// 子音強調プレゼンスEQ & 適応的音声調整モード
     pub radio_clarity_mode: bool,
+    /// VAD 判定経路で使うノイズ抑制エンジン（Section 3.1）
+    pub vad_engine: NoiseEngineKind,
+    /// STT 入力経路で使うノイズ抑制エンジン（Section 3.1）
+    pub stt_engine: NoiseEngineKind,
+    /// DPDFNet の過抑制リミット (dB、12.0dB で打鍵音除去と滑舌両立)
+    pub dpdfnet_attenuation_limit_db: f32,
+    /// 子音強調プレゼンスEQ 強度 (0.0 ..= 1.0)
+    pub presence_eq_strength: f32,
+}
+
+impl NoiseCancelConfig {
+    pub fn vad_engine_name(&self) -> &'static str {
+        self.vad_engine.as_str()
+    }
+    pub fn stt_engine_name(&self) -> &'static str {
+        self.stt_engine.as_str()
+    }
 }
 
 impl Default for NoiseCancelConfig {
@@ -280,6 +332,10 @@ impl Default for NoiseCancelConfig {
             noise_gate_enabled: false,
             vad_prob_threshold: 0.30,
             radio_clarity_mode: true,
+            vad_engine: NoiseEngineKind::Rnnoise,
+            stt_engine: NoiseEngineKind::OffHpf,
+            dpdfnet_attenuation_limit_db: 12.0,
+            presence_eq_strength: 0.55,
         }
     }
 }
@@ -450,6 +506,10 @@ pub struct GuardConfig {
     pub restore_previous_window: bool,
     /// アンチチート干渉回避のための SendInput 制御方式
     pub send_method: SendMethod,
+    /// 宛先ロック（声による誤宛先切替防止・#32）
+    pub target_locked: bool,
+    /// 慎重チャンネル/DM IDリスト（送信前確認/カウントダウン強制・#32）
+    pub careful_target_ids: Vec<String>,
 }
 
 impl GuardConfig {
@@ -475,6 +535,8 @@ impl Default for GuardConfig {
             auto_focus_discord: true,
             restore_previous_window: true,
             send_method: SendMethod::AutoPaste,
+            target_locked: false,
+            careful_target_ids: Vec::new(),
         }
     }
 }
@@ -565,7 +627,110 @@ impl Default for HttpAsrConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeechStyle {
+    Normal,
+    Casual,
+    Polite,
+    GameShort,
+}
+
+impl Default for SpeechStyle {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LlmCorrectionConfig {
+    pub enabled: bool,
+    pub base_url: String,
+    pub endpoint_path: String,
+    pub model: String,
+    pub model_file: String,
+    pub api_key: String,
+    pub server_exe_path: String,
+    pub server_args: String,
+    pub auto_launch: bool,
+    pub stop_on_exit: bool,
+    pub timeout_ms: u64,
+    pub style: SpeechStyle,
+}
+
+impl Default for LlmCorrectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: "http://127.0.0.1:8081".into(),
+            endpoint_path: "/v1/chat/completions".into(),
+            model: "qwen3-1.7b".into(),
+            model_file: String::new(),
+            api_key: String::new(),
+            server_exe_path: String::new(),
+            server_args: String::new(),
+            auto_launch: false,
+            stop_on_exit: true,
+            timeout_ms: 900,
+            style: SpeechStyle::Normal,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AccuracyPipelineConfig {
+    pub wsola_enabled: bool,
+    pub wsola_rate: f32,
+    pub wsola_auto_fast: bool,
+    pub head_silence_pad_ms: u64,
+    pub tail_silence_pad_ms: u64,
+    pub overlap_chunking_enabled: bool,
+    pub overlap_threshold_sec: f32,
+    pub overlap_sec: f32,
+    pub beam_size: i32,
+    pub temperature_fallback: bool,
+    pub two_pass_rescue: bool,
+    pub ultimate_ensemble: bool,
+    pub secondary_engine: String,
+    pub context_prompt_injection: bool,
+    pub streaming_preview_enabled: bool,
+    pub streaming_interval_ms: u64,
+    pub phonetic_fuzzy_matching: bool,
+    pub stutter_cleanup: bool,
+    pub auto_learn_respeak: bool,
+    pub llm: LlmCorrectionConfig,
+}
+
+impl Default for AccuracyPipelineConfig {
+    fn default() -> Self {
+        Self {
+            wsola_enabled: true,
+            wsola_rate: 0.88,
+            wsola_auto_fast: true,
+            head_silence_pad_ms: 200,
+            tail_silence_pad_ms: 300,
+            overlap_chunking_enabled: true,
+            overlap_threshold_sec: 8.0,
+            overlap_sec: 0.9,
+            beam_size: 5,
+            temperature_fallback: true,
+            two_pass_rescue: true,
+            ultimate_ensemble: false,
+            secondary_engine: "sherpa-qwen3".into(),
+            context_prompt_injection: true,
+            streaming_preview_enabled: true,
+            streaming_interval_ms: 1700,
+            phonetic_fuzzy_matching: true,
+            stutter_cleanup: true,
+            auto_learn_respeak: true,
+            llm: LlmCorrectionConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SttConfig {
     /// "auto" | "whisper-cpp" | "sherpa-qwen3" | "sherpa-onnx" | "local-http" | "whisper-cli" | "mock"
@@ -578,6 +743,7 @@ pub struct SttConfig {
     pub threads: u32,
     pub preset: ConversationPreset,
     pub http_asr: HttpAsrConfig,
+    pub accuracy: AccuracyPipelineConfig,
 }
 
 impl Default for SttConfig {
@@ -591,6 +757,7 @@ impl Default for SttConfig {
             threads: 8,
             preset: ConversationPreset::Normal,
             http_asr: HttpAsrConfig::default(),
+            accuracy: AccuracyPipelineConfig::default(),
         }
     }
 }
@@ -623,6 +790,7 @@ pub struct GameProfile {
     pub overlay_x: Option<i32>,
     pub overlay_y: Option<i32>,
     pub overlay_opacity: Option<f32>,
+    pub speech_style: Option<SpeechStyle>,
 }
 
 impl Default for GameProfile {
@@ -637,6 +805,7 @@ impl Default for GameProfile {
             overlay_x: None,
             overlay_y: None,
             overlay_opacity: None,
+            speech_style: None,
         }
     }
 }
@@ -742,6 +911,90 @@ fn default_legacy_config_version() -> u32 {
     0
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SnippetMacro {
+    pub id: String,
+    pub trigger: String,
+    pub expansion: String,
+}
+
+impl Default for SnippetMacro {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            trigger: String::new(),
+            expansion: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EmojiAlias {
+    pub spoken: String,
+    pub emoji: String,
+}
+
+impl Default for EmojiAlias {
+    fn default() -> Self {
+        Self {
+            spoken: String::new(),
+            emoji: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NightModeConfig {
+    pub enabled: bool,
+    pub start_hour: u8,
+    pub end_hour: u8,
+    pub tts_volume_scale: f32,
+}
+
+impl Default for NightModeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            start_hour: 23,
+            end_hour: 6,
+            tts_volume_scale: 0.65,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PowerEcoConfig {
+    pub vram_watchdog_enabled: bool,
+    pub vram_threshold_pct: u8,
+    pub auto_battery_eco: bool,
+    pub eco_threads: u32,
+}
+
+impl Default for PowerEcoConfig {
+    fn default() -> Self {
+        Self {
+            vram_watchdog_enabled: true,
+            vram_threshold_pct: 88,
+            auto_battery_eco: false,
+            eco_threads: 4,
+        }
+    }
+}
+
+fn default_emoji_aliases() -> Vec<EmojiAlias> {
+    vec![
+        EmojiAlias { spoken: "くさスタンプ".into(), emoji: "🌿".into() },
+        EmojiAlias { spoken: "いいね絵文字".into(), emoji: "👍".into() },
+        EmojiAlias { spoken: "わらいスタンプ".into(), emoji: "😂".into() },
+        EmojiAlias { spoken: "ハート絵文字".into(), emoji: "❤️".into() },
+        EmojiAlias { spoken: "GGスタンプ".into(), emoji: "🎮".into() },
+    ]
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -750,6 +1003,7 @@ pub struct AppConfig {
     pub input_mode: InputMode,
     pub activation_mode: ActivationMode,
     pub audio_device: Option<String>,
+    pub audio_device_fallbacks: Vec<String>,
     /// Windows起動時に自動起動する（デフォルト: false / OFF）
     pub auto_start: bool,
     pub start_minimized: bool,
@@ -767,6 +1021,12 @@ pub struct AppConfig {
     pub overlay: OverlayConfig,
     pub sound: SoundConfig,
     pub stt: SttConfig,
+    pub snippets: Vec<SnippetMacro>,
+    pub emoji_aliases: Vec<EmojiAlias>,
+    pub speech_habits: Vec<DictionaryEntry>,
+    pub night_mode: NightModeConfig,
+    pub power_eco: PowerEcoConfig,
+    pub wizard_completed: bool,
 }
 
 impl Default for AppConfig {
@@ -776,6 +1036,7 @@ impl Default for AppConfig {
             input_mode: InputMode::Draft,
             activation_mode: ActivationMode::Vad,
             audio_device: None,
+            audio_device_fallbacks: Vec::new(),
             auto_start: false,
             start_minimized: false,
             commands: VoiceCommandsConfig::default(),
@@ -792,6 +1053,12 @@ impl Default for AppConfig {
             overlay: OverlayConfig::default(),
             sound: SoundConfig::default(),
             stt: SttConfig::default(),
+            snippets: Vec::new(),
+            emoji_aliases: default_emoji_aliases(),
+            speech_habits: Vec::new(),
+            night_mode: NightModeConfig::default(),
+            power_eco: PowerEcoConfig::default(),
+            wizard_completed: false,
         }
     }
 }
@@ -826,8 +1093,35 @@ impl AppConfig {
         true
     }
 
-    /// Returns the default configuration file path (`%APPDATA%\VoxDrop\config.json`).
+    /// Returns the portable folder beside the EXE if `portable.flag` exists (#33).
+    pub fn portable_dir() -> Option<PathBuf> {
+        let exe = std::env::current_exe().ok()?;
+        let dir = exe.parent()?;
+        if dir.join("portable.flag").is_file() {
+            Some(dir.to_path_buf())
+        } else {
+            None
+        }
+    }
+
+    pub fn app_data_dir() -> PathBuf {
+        if let Some(p) = Self::portable_dir() {
+            return p;
+        }
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            let trimmed = appdata.trim();
+            if !trimmed.is_empty() {
+                return PathBuf::from(trimmed).join("VoxDrop");
+            }
+        }
+        PathBuf::from(".")
+    }
+
+    /// Returns the default configuration file path (`portable.flag` dir or `%APPDATA%\VoxDrop\config.json`).
     pub fn default_path() -> PathBuf {
+        if let Some(p) = Self::portable_dir() {
+            return p.join("config.json");
+        }
         if let Ok(appdata) = std::env::var("APPDATA") {
             let trimmed = appdata.trim();
             if !trimmed.is_empty() {
@@ -1044,6 +1338,7 @@ mod tests {
             overlay_x: Some(40),
             overlay_y: Some(80),
             overlay_opacity: Some(0.75),
+            speech_style: None,
         });
         let json = serde_json::to_string(&cfg).expect("serialize");
         let back: AppConfig = serde_json::from_str(&json).expect("deserialize");

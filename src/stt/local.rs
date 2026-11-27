@@ -107,6 +107,16 @@ pub fn has_qwen3_asr_model(cfg: &SttConfig, runtime_dir: Option<&Path>) -> bool 
 
 /// Resolves the writable target directory for downloading external models.
 pub fn resolve_download_model_dir(configured: &str, runtime_dir: Option<&Path>) -> PathBuf {
+    if let Some(p_dir) = crate::config::AppConfig::portable_dir() {
+        let trimmed = configured.trim();
+        return if trimmed.is_empty() {
+            p_dir.join("models")
+        } else if Path::new(trimmed).is_absolute() {
+            PathBuf::from(trimmed)
+        } else {
+            p_dir.join(trimmed)
+        };
+    }
     let raw = PathBuf::from(configured.trim());
     if !configured.trim().is_empty() && (raw.is_absolute() || raw.exists()) {
         return raw;
@@ -127,6 +137,45 @@ pub fn resolve_download_model_dir(configured: &str, runtime_dir: Option<&Path>) 
     runtime_dir
         .map(|rt| rt.join("models"))
         .unwrap_or_else(|| PathBuf::from("models"))
+}
+
+pub fn discover_stt_denoiser(
+    kind: crate::config::NoiseEngineKind,
+    cfg: &SttConfig,
+    runtime_dir: Option<&Path>,
+    attenuation_limit_db: f32,
+) -> Option<Arc<crate::stt::sherpa_ffi::ResidentSherpaDenoiser>> {
+    use crate::config::NoiseEngineKind;
+    let names: &[&str] = match kind {
+        NoiseEngineKind::DpdfNet16k => &["dpdfnet2.onnx", "dpdfnet_baseline_16k.onnx"],
+        NoiseEngineKind::DpdfNet48k => &["dpdfnet_48k.onnx"],
+        NoiseEngineKind::Gtcrn16k => &["gtcrn_simple.onnx", "gtcrn.onnx"],
+        NoiseEngineKind::DeepFilterNet3 => &["deepfilternet3.onnx"],
+        NoiseEngineKind::Rnnoise | NoiseEngineKind::OffHpf => return None,
+    };
+    let dll = find_file_in_search_dirs("", &["sherpa-onnx-c-api.dll"], runtime_dir)?;
+    let models_dir = resolve_download_model_dir(&cfg.model_dir, runtime_dir);
+    let model_path = names
+        .iter()
+        .map(|n| models_dir.join(n))
+        .find(|p| p.is_file())
+        .or_else(|| {
+            runtime_dir.and_then(|rt| {
+                names
+                    .iter()
+                    .map(|n| rt.join("models").join(n))
+                    .find(|p| p.is_file())
+            })
+        })?;
+    crate::stt::sherpa_ffi::ResidentSherpaDenoiser::load(
+        &dll,
+        kind.as_str(),
+        &model_path,
+        attenuation_limit_db,
+        cfg.threads.clamp(1, 4),
+    )
+    .ok()
+    .map(Arc::new)
 }
 
 /// Lists available GGML Whisper `.bin` model filenames ordered by quality priority.
@@ -329,8 +378,15 @@ impl SttEngine for WhisperResidentEngine {
         if let Some(ref prompt) = ctx.hotwords_prompt {
             self.recognizer.set_prompt_hints(prompt);
         }
-        self.recognizer
-            .transcribe_with_clarity(samples_16k, ctx.radio_clarity)
+        self.recognizer.transcribe_with_options(
+            samples_16k,
+            ctx.radio_clarity,
+            ctx.eq_strength,
+            ctx.head_pad_ms,
+            ctx.tail_pad_ms,
+            ctx.beam_size,
+            ctx.temperature_fallback,
+        )
     }
 
     fn set_prompt_hints(&self, hints: &str) {

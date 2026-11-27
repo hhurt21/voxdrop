@@ -767,6 +767,137 @@ fn load_dll_fns(dll_path: &Path) -> Result<SherpaDllFns, String> {
     }
 }
 
+/// Standalone neural speech denoiser (DPDFNet-16k / DPDFNet-48k / GTCRN-16k) using
+/// `sherpa-onnx-c-api.dll` with DirectML -> CPU safe fallback (Section 3.1 / #21).
+pub struct ResidentSherpaDenoiser {
+    fns: SherpaDllFns,
+    denoiser: *const c_void,
+    #[allow(dead_code)]
+    label: String,
+    device_label: String,
+}
+
+unsafe impl Send for ResidentSherpaDenoiser {}
+unsafe impl Sync for ResidentSherpaDenoiser {}
+
+impl Drop for ResidentSherpaDenoiser {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.denoiser.is_null() {
+                if let Some(destroy_fn) = self.fns.destroy_denoiser {
+                    destroy_fn(self.denoiser);
+                }
+                self.denoiser = ptr::null();
+            }
+        }
+    }
+}
+
+impl ResidentSherpaDenoiser {
+    pub fn load(
+        dll_path: &Path,
+        kind: &str,
+        model_path: &Path,
+        attenuation_limit_db: f32,
+        threads: u32,
+    ) -> Result<Self, String> {
+        let fns = load_dll_fns(dll_path)?;
+        let create_sd = fns
+            .create_denoiser
+            .ok_or_else(|| "sherpa-onnx-c-api.dll に SpeechDenoiser API がありません".to_string())?;
+        let model_c = CString::new(model_path.to_string_lossy().as_ref())
+            .map_err(|_| "ノイズ抑制モデルパスが不正です".to_string())?;
+
+        let mut picked_ptr: *const c_void = ptr::null();
+        let mut device_label = String::from("CPU");
+
+        for prov in ["directml", "cpu"] {
+            let Ok(prov_c) = CString::new(prov) else {
+                continue;
+            };
+            let mut sd_cfg: SherpaOnnxOfflineSpeechDenoiserConfig = unsafe { std::mem::zeroed() };
+            sd_cfg.model.num_threads = threads.clamp(1, 4) as i32;
+            sd_cfg.model.debug = 0;
+            sd_cfg.model.provider = prov_c.as_ptr();
+            if kind.starts_with("gtcrn") {
+                sd_cfg.model.gtcrn.model = model_c.as_ptr();
+            } else {
+                sd_cfg.model.dpdfnet.model = model_c.as_ptr();
+                sd_cfg.model.dpdfnet.attenuation_limit_db = attenuation_limit_db.clamp(0.0, 60.0);
+            }
+            let ptr_sd = unsafe { create_sd(&sd_cfg) };
+            if !ptr_sd.is_null() {
+                picked_ptr = ptr_sd;
+                device_label = if prov == "directml" {
+                    "DirectML (GPU)".into()
+                } else {
+                    "CPU".into()
+                };
+                break;
+            }
+        }
+
+        if picked_ptr.is_null() {
+            return Err(format!(
+                "ノイズ抑制モデルの初期化に失敗しました ({}): {}",
+                kind,
+                model_path.display()
+            ));
+        }
+
+        let label = match kind {
+            "dpdfnet-48k" => "DPDFNet (48kHz)",
+            "gtcrn-16k" => "GTCRN (16kHz)",
+            _ => "DPDFNet (16kHz)",
+        }
+        .to_string();
+
+        Ok(Self {
+            fns,
+            denoiser: picked_ptr,
+            label,
+            device_label,
+        })
+    }
+
+    #[allow(dead_code)]
+    pub fn name(&self) -> &str {
+        &self.label
+    }
+
+    pub fn device_name(&self) -> &str {
+        &self.device_label
+    }
+
+    pub fn denoise(&self, samples: &[f32], sample_rate: i32) -> Result<Vec<f32>, String> {
+        if samples.is_empty() || self.denoiser.is_null() {
+            return Ok(samples.to_vec());
+        }
+        let run_sd = self
+            .fns
+            .run_denoiser
+            .ok_or_else(|| "SherpaOnnxOfflineSpeechDenoiserRun が見つかりません".to_string())?;
+        let free_sd = self
+            .fns
+            .destroy_denoised_audio
+            .ok_or_else(|| "SherpaOnnxDestroyDenoisedAudio が見つかりません".to_string())?;
+        unsafe {
+            let res = run_sd(self.denoiser, samples.as_ptr(), samples.len() as i32, sample_rate);
+            if !res.is_null() && !(*res).samples.is_null() && (*res).n > 0 {
+                let slice = std::slice::from_raw_parts((*res).samples, (*res).n as usize);
+                let out = slice.to_vec();
+                free_sd(res);
+                Ok(out)
+            } else {
+                if !res.is_null() {
+                    free_sd(res);
+                }
+                Ok(samples.to_vec())
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -839,6 +970,23 @@ mod tests {
         );
         assert!(text1.contains("弁当") && text1.contains("パン"));
         assert!(text1.contains("持っていけない"));
+    }
+
+    #[test]
+    fn standalone_dpdfnet_denoiser_processes_16k_audio_cleanly() {
+        let dll = Path::new("bin/sherpa-onnx-c-api.dll");
+        let model = Path::new("models/dpdfnet2.onnx");
+        if !dll.is_file() || !model.is_file() {
+            return;
+        }
+        let sd = ResidentSherpaDenoiser::load(dll, "dpdfnet-16k", model, 12.0, 4)
+            .expect("load DPDFNet2 standalone denoiser");
+        assert!(!sd.device_name().is_empty());
+        let noisy: Vec<f32> = (0..8000)
+            .map(|i| (i as f32 * 0.08).sin() * 0.08)
+            .collect();
+        let out = sd.denoise(&noisy, 16_000).expect("denoise 16k");
+        assert!(!out.is_empty());
     }
 }
 

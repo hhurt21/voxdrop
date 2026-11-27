@@ -43,6 +43,17 @@ VoxDrop incorporates or interacts with the following third-party open-source sof
 - License: BSD 3-Clause License
 - See the BSD 3-Clause License text below.
 
+### DPDFNet / GTCRN (Optional Speech Enhancement Models via sherpa-onnx)
+- Sources:
+  - DPDFNet: https://github.com/k2-fsa/sherpa-onnx (Speech Enhancement ONNX distribution)
+  - GTCRN: https://github.com/Xiaobin-Rong/gtcrn
+- License: Apache License 2.0 / MIT License
+
+### Qwen3-ASR (Optional External Speech Recognition Model)
+- Source: https://huggingface.co/Qwen (converted for `sherpa-onnx` / GGUF `llama-server`)
+- License: Apache License 2.0
+- Notice: Downloaded optionally on demand by the user into `models/`; not bundled inside `voxdrop.exe`.
+
 ## Rust Crates (Cargo Dependencies)
 
 VoxDrop is built with open-source Rust crates (including `tao`, `wry`, `tray-icon`, `global-hotkey`, `cpal`, `rodio`, `windows`, `windows-core`, `arboard`, `serde`, `serde_json`, `regex`, `flate2`, and their transitive dependencies), each distributed under its respective license (primarily MIT / Apache-2.0 / BSD-3-Clause).

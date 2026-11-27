@@ -664,4 +664,57 @@ mod tests {
         assert_eq!(path, "/api/webhooks/12345/abcdef");
         assert!(parse_webhook_url("https://example.com/api/webhooks/1/2").is_err());
     }
+
+    #[test]
+    fn splits_long_messages_within_discord_limit() {
+        let short = "こんにちは";
+        assert_eq!(split_message_for_discord(short, 1950), vec!["こんにちは"]);
+
+        let long = "これは長文テストです。".repeat(300); // > 3000 chars
+        let chunks = split_message_for_discord(&long, 1950);
+        assert!(chunks.len() >= 2);
+        assert!(chunks.iter().all(|c| c.chars().count() <= 1950));
+        assert_eq!(chunks.concat(), long);
+    }
+}
+
+/// Splits outgoing Discord text safely at newlines or sentence boundaries (`。！？`)
+/// so messages exceeding Discord's 2000-character limit never fail silently (#23).
+pub fn split_message_for_discord(text: &str, max_chars: usize) -> Vec<String> {
+    let limit = max_chars.max(200);
+    if text.chars().count() <= limit {
+        return vec![text.to_string()];
+    }
+    let mut chunks = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        if rest.chars().count() <= limit {
+            chunks.push(rest.to_string());
+            break;
+        }
+        let mut split_byte = rest.len();
+        let mut best_punct: Option<usize> = None;
+        let mut best_newline: Option<usize> = None;
+        for (count, (idx, ch)) in rest.char_indices().enumerate() {
+            let end_idx = idx + ch.len_utf8();
+            if count + 1 > limit {
+                split_byte = idx;
+                break;
+            }
+            if ch == '\n' {
+                best_newline = Some(end_idx);
+            } else if matches!(ch, '。' | '！' | '？' | '.' | '!' | '?') {
+                best_punct = Some(end_idx);
+            }
+        }
+        let chosen = best_newline
+            .or(best_punct)
+            .filter(|&b| b > split_byte / 3)
+            .unwrap_or(split_byte)
+            .max(1);
+        let (head, tail) = rest.split_at(chosen);
+        chunks.push(head.to_string());
+        rest = tail;
+    }
+    chunks
 }

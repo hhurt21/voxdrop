@@ -20,6 +20,11 @@ pub enum AudioEvent {
     },
     SpeechStart,
     SpeechCancelled,
+    UtterancePreview(Vec<f32>),
     Utterance(Vec<f32>),
+    DeviceSwitched {
+        from: Option<String>,
+        to: String,
+    },
     Error(String),
 }

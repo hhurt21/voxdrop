@@ -186,6 +186,7 @@ pub fn focus_hwnd_ex(target_hwnd: HWND, allow_send_input: bool) -> bool {
     }
 }
 
+#[allow(dead_code)]
 pub fn focus_hwnd(target_hwnd: HWND) -> bool {
     focus_hwnd_ex(target_hwnd, true)
 }
@@ -231,6 +232,7 @@ pub fn restore_hwnd_raw_ex(raw_hwnd: isize, allow_send_input: bool) {
     let _ = focus_hwnd_ex(hwnd, allow_send_input);
 }
 
+#[allow(dead_code)]
 pub fn restore_hwnd_raw(raw_hwnd: isize) {
     restore_hwnd_raw_ex(raw_hwnd, true);
 }

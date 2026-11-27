@@ -1,5 +1,8 @@
+pub mod catalog;
 pub mod downloader;
+pub mod ensemble;
 pub mod http_asr;
+pub mod llm_corrector;
 pub mod local;
 pub mod sherpa_ffi;
 pub mod whisper_ffi;
@@ -15,6 +18,11 @@ pub struct TranscribeContext {
     #[allow(dead_code)]
     pub preset: ConversationPreset,
     pub radio_clarity: bool,
+    pub eq_strength: f32,
+    pub head_pad_ms: u64,
+    pub tail_pad_ms: u64,
+    pub beam_size: i32,
+    pub temperature_fallback: bool,
 }
 
 impl Default for TranscribeContext {
@@ -24,6 +32,11 @@ impl Default for TranscribeContext {
             hotwords_prompt: None,
             preset: ConversationPreset::Normal,
             radio_clarity: true,
+            eq_strength: 0.55,
+            head_pad_ms: 200,
+            tail_pad_ms: 300,
+            beam_size: 5,
+            temperature_fallback: true,
         }
     }
 }

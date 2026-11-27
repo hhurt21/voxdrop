@@ -328,21 +328,14 @@ pub fn copy_text_to_clipboard_only(text: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Sends text directly to a target window handle using Win32 `PostMessageW(WM_CHAR / VK_RETURN)`
-/// without calling `SendInput`, `SetCursorPos`, or modifying the global input stream (`LLKHF_INJECTED`).
-pub fn post_text_window_message(
-    target_hwnd: HWND,
-    text: &str,
-    press_enter: bool,
-) -> Result<(), String> {
+/// Posts only UTF-16 text via `WM_CHAR` (without pressing Return yet so UIA verification can run first).
+pub fn post_chars_window_message(target_hwnd: HWND, text: &str) -> Result<(), String> {
     let _guard = INPUT_MUTEX
         .lock()
         .map_err(|_| "入力ロックの取得に失敗しました".to_string())?;
     if target_hwnd.0.is_null() {
         return Err("送信先ウィンドウハンドルが無効です".into());
     }
-
-    // Flatten embedded newlines to spaces in WM_CHAR mode so intermediate '\n' doesn't accidentally submit
     let normalized = text.replace("\r\n", " ").replace('\n', " ");
     for unit in normalized.encode_utf16() {
         unsafe {
@@ -351,28 +344,60 @@ pub fn post_text_window_message(
         }
         thread::sleep(Duration::from_millis(2));
     }
+    Ok(())
+}
 
+/// Posts `VK_RETURN` down+up directly to `target_hwnd`.
+pub fn post_enter_window_message(target_hwnd: HWND) -> Result<(), String> {
+    let _guard = INPUT_MUTEX
+        .lock()
+        .map_err(|_| "入力ロックの取得に失敗しました".to_string())?;
+    if target_hwnd.0.is_null() {
+        return Err("送信先ウィンドウハンドルが無効です".into());
+    }
+    thread::sleep(Duration::from_millis(16));
+    unsafe {
+        let lparam_down = LPARAM(0x001C_0001);
+        let lparam_up = LPARAM((0xC01C_0001u32) as isize);
+        PostMessageW(
+            Some(target_hwnd),
+            WM_KEYDOWN,
+            WPARAM(VK_RETURN.0 as usize),
+            lparam_down,
+        )
+        .map_err(|e| format!("PostMessageW(VK_RETURN down) に失敗しました: {}", e))?;
+        thread::sleep(Duration::from_millis(24));
+        PostMessageW(
+            Some(target_hwnd),
+            WM_KEYUP,
+            WPARAM(VK_RETURN.0 as usize),
+            lparam_up,
+        )
+        .map_err(|e| format!("PostMessageW(VK_RETURN up) に失敗しました: {}", e))?;
+    }
+    Ok(())
+}
+
+/// Reads current text on the Windows clipboard safely (#25).
+pub fn copy_clipboard_read_fallback() -> String {
+    let Ok(_guard) = INPUT_MUTEX.lock() else {
+        return String::new();
+    };
+    Clipboard::new()
+        .and_then(|mut cb| cb.get_text())
+        .unwrap_or_default()
+}
+
+/// Sends text directly to a target window handle using Win32 `PostMessageW(WM_CHAR / VK_RETURN)`
+/// without calling `SendInput`, `SetCursorPos`, or modifying the global input stream (`LLKHF_INJECTED`).
+pub fn post_text_window_message(
+    target_hwnd: HWND,
+    text: &str,
+    press_enter: bool,
+) -> Result<(), String> {
+    post_chars_window_message(target_hwnd, text)?;
     if press_enter {
-        thread::sleep(Duration::from_millis(20));
-        unsafe {
-            let lparam_down = LPARAM(0x001C_0001);
-            let lparam_up = LPARAM((0xC01C_0001u32) as isize);
-            PostMessageW(
-                Some(target_hwnd),
-                WM_KEYDOWN,
-                WPARAM(VK_RETURN.0 as usize),
-                lparam_down,
-            )
-            .map_err(|e| format!("PostMessageW(VK_RETURN down) に失敗しました: {}", e))?;
-            thread::sleep(Duration::from_millis(12));
-            PostMessageW(
-                Some(target_hwnd),
-                WM_KEYUP,
-                WPARAM(VK_RETURN.0 as usize),
-                lparam_up,
-            )
-            .map_err(|e| format!("PostMessageW(VK_RETURN up) に失敗しました: {}", e))?;
-        }
+        post_enter_window_message(target_hwnd)?;
     }
     Ok(())
 }

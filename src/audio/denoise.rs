@@ -1,5 +1,29 @@
-use crate::config::NoiseCancelConfig;
+use crate::config::{NoiseCancelConfig, NoiseEngineKind};
 use nnnoiseless::DenoiseState;
+
+/// Unified noise suppression abstraction (Section 3.1).
+#[allow(dead_code)]
+pub trait NoiseSuppressor: Send + Sync {
+    fn id(&self) -> &'static str;
+    fn is_active(&self) -> bool;
+    fn process_48k_dual(&mut self, samples_48k: &[f32]) -> (Vec<f32>, Vec<f32>, f32, bool);
+    fn reset(&mut self);
+}
+
+impl NoiseSuppressor for AudioDenoiser {
+    fn id(&self) -> &'static str {
+        self.config.vad_engine.as_str()
+    }
+    fn is_active(&self) -> bool {
+        self.is_rnnoise_enabled()
+    }
+    fn process_48k_dual(&mut self, samples_48k: &[f32]) -> (Vec<f32>, Vec<f32>, f32, bool) {
+        self.process_dual(samples_48k)
+    }
+    fn reset(&mut self) {
+        AudioDenoiser::reset(self)
+    }
+}
 
 pub const RNNOISE_SAMPLE_RATE: u32 = 48_000;
 const FRAME_SIZE: usize = DenoiseState::FRAME_SIZE; // 480 samples (10ms at 48kHz)
@@ -93,7 +117,7 @@ impl AudioDenoiser {
             stage1.extend_from_slice(samples_48k);
         }
 
-        if !self.config.enabled {
+        if !self.config.enabled || self.config.vad_engine == NoiseEngineKind::OffHpf {
             self.last_vad_prob = 0.0;
             let stt = if produce_stt { stage1.clone() } else { Vec::new() };
             return (stage1, stt, 0.0, false);

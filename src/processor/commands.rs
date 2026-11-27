@@ -367,8 +367,74 @@ pub fn parse_target_switch(
     None
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpecialVoiceAction {
+    QuickReplyDm(String),
+    PartialReplace { from: String, to: String },
+    PasteClipboard { press_enter: bool },
+    LockTarget,
+    UnlockTarget,
+}
+
+/// Detects special v1.6.0 chat/target manipulation voice commands (#13, #14, #25, #32).
+pub fn parse_special_voice_action(input: &str) -> Option<SpecialVoiceAction> {
+    let trimmed = trim_trailing_punct(input.trim()).trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if matches!(trimmed, "宛先ロック" | "あてさきロック" | "ターゲットロック") {
+        return Some(SpecialVoiceAction::LockTarget);
+    }
+    if matches!(trimmed, "宛先ロック解除" | "ロック解除" | "ターゲットロック解除") {
+        return Some(SpecialVoiceAction::UnlockTarget);
+    }
+    if matches!(trimmed, "クリップボード貼って" | "クリップボード貼り付け") {
+        return Some(SpecialVoiceAction::PasteClipboard { press_enter: false });
+    }
+    if matches!(trimmed, "クリップボード送って" | "URL送って" | "リンク送って") {
+        return Some(SpecialVoiceAction::PasteClipboard { press_enter: true });
+    }
+
+    let raw_trimmed = input.trim();
+    for p in ["返信して", "リプライして", "返信"] {
+        if let Some(rest) = raw_trimmed.strip_prefix(p) {
+            let body = trim_leading_sep(rest);
+            if !body.is_empty() {
+                return Some(SpecialVoiceAction::QuickReplyDm(body.to_string()));
+            }
+        }
+    }
+
+    for suf in ["に変えて", "に直して", "に変更して", "に置換して"] {
+        if let Some(stem) = trimmed.strip_suffix(suf) {
+            if let Some(sep_idx) = stem.rfind('を') {
+                let from = stem[..sep_idx].trim();
+                let to = stem[sep_idx + 'を'.len_utf8()..].trim();
+                if !from.is_empty() && !to.is_empty() {
+                    return Some(SpecialVoiceAction::PartialReplace {
+                        from: from.to_string(),
+                        to: to.to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Detects standalone or suffix voice commands and strips the command phrase from the text.
 pub fn parse_voice_command(input: &str, cfg: &VoiceCommandsConfig) -> CommandParseResult {
+    parse_voice_command_ex(input, cfg, true)
+}
+
+/// Configurable version of `parse_voice_command` supporting mora-level phonetic tolerance (#4).
+pub fn parse_voice_command_ex(
+    input: &str,
+    cfg: &VoiceCommandsConfig,
+    phonetic_fuzzy: bool,
+) -> CommandParseResult {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return CommandParseResult {
@@ -479,6 +545,20 @@ pub fn parse_voice_command(input: &str, cfg: &VoiceCommandsConfig) -> CommandPar
                 remaining_text: cleaned_prefix.to_string(),
                 command: Some(*cmd),
             };
+        }
+    }
+
+    if phonetic_fuzzy {
+        for (cmd, list) in groups {
+            if let Some((_matched, prefix)) =
+                crate::processor::phonetic::fuzzy_match_suffix(without_trailing_punct, list)
+            {
+                let cleaned_prefix = trim_trailing_sep(prefix);
+                return CommandParseResult {
+                    remaining_text: cleaned_prefix.to_string(),
+                    command: Some(*cmd),
+                };
+            }
         }
     }
 
@@ -733,6 +813,21 @@ mod tests {
         assert_eq!(
             parse_voice_command("改行", &cfg).command,
             Some(VoiceCommand::Newline)
+        );
+        assert_eq!(
+            parse_special_voice_action("返信して 今すぐ行く！"),
+            Some(SpecialVoiceAction::QuickReplyDm("今すぐ行く！".into()))
+        );
+        assert_eq!(
+            parse_special_voice_action("ばんだるをヴァンダルに変えて"),
+            Some(SpecialVoiceAction::PartialReplace {
+                from: "ばんだる".into(),
+                to: "ヴァンダル".into(),
+            })
+        );
+        assert_eq!(
+            parse_special_voice_action("宛先ロック"),
+            Some(SpecialVoiceAction::LockTarget)
         );
     }
 }

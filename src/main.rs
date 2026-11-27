@@ -10,12 +10,14 @@ mod audio;
 mod automation;
 mod autostart;
 mod config;
+mod gpu_diag;
 mod hotkey;
 mod ipc;
 mod notification;
 mod processor;
 mod runtime;
 mod sound;
+mod stats;
 mod stt;
 mod tray;
 mod tts;
@@ -27,7 +29,7 @@ use automation::input::KeyAction;
 use automation::uia;
 use config::{
     ActivationMode, AppConfig, DictionaryEntry, DiscordTarget, DiscordTargetKind, GameProfile,
-    GuardConfig, InputMode, TextFilterConfig,
+    GuardConfig, InputMode, NoiseEngineKind, SpeechStyle, TextFilterConfig,
 };
 use hotkey::{HotkeyAction, HotkeyManager};
 use ipc::{
@@ -35,8 +37,8 @@ use ipc::{
 };
 use notification::{NotificationController, NotificationEvent};
 use processor::commands::{
-    parse_confirmation_reply, parse_countdown_cancel, ConfirmationReply, TargetSwitchAction,
-    VoiceCommand,
+    parse_confirmation_reply, parse_countdown_cancel, parse_special_voice_action,
+    ConfirmationReply, SpecialVoiceAction, TargetSwitchAction, VoiceCommand,
 };
 use sound::{SoundKind, SoundPlayer};
 use std::collections::VecDeque;
@@ -126,6 +128,13 @@ enum UserEvent {
         ok: bool,
     },
     HttpAsrHealthDone(Result<String, String>),
+    LlmHealthDone(Result<String, String>),
+    PhaseUpdate(String),
+    StreamingPreviewReady(String),
+    AppUpdateFound {
+        latest_tag: String,
+        url: String,
+    },
     ActiveWindowChanged {
         process: String,
         target_active: bool,
@@ -153,9 +162,24 @@ enum SttWorkerMsg {
     Transcribe {
         samples: Vec<f32>,
         ctx: TranscribeContext,
+        accuracy: config::AccuracyPipelineConfig,
+        noise_stt: NoiseEngineKind,
+        dpdfnet_limit_db: f32,
+        stt_cfg: config::SttConfig,
+        runtime_dir: Option<PathBuf>,
+        recent_msgs: Vec<String>,
+        target_label: String,
+        game_name: Option<String>,
+        dict: Vec<DictionaryEntry>,
+        speech_style: SpeechStyle,
+    },
+    TranscribePreview {
+        samples: Vec<f32>,
+        ctx: TranscribeContext,
     },
     ReloadEngine(Arc<dyn SttEngine>),
     UpdatePromptHints(String),
+    UnloadAll,
     Shutdown,
 }
 
@@ -174,6 +198,16 @@ struct WinSystemTime {
 }
 
 fn current_local_hms() -> String {
+    let (_, _, st) = current_local_time_raw();
+    format!("{:02}:{:02}:{:02}", st.hour, st.minute, st.second)
+}
+
+fn current_local_ymd_hour() -> (String, u8) {
+    let (ymd, hour, _) = current_local_time_raw();
+    (ymd, hour)
+}
+
+fn current_local_time_raw() -> (String, u8, WinSystemTime) {
     #[link(name = "kernel32")]
     extern "system" {
         fn GetLocalTime(lp_system_time: *mut WinSystemTime);
@@ -191,7 +225,11 @@ fn current_local_hms() -> String {
     unsafe {
         GetLocalTime(&mut st);
     }
-    format!("{:02}:{:02}:{:02}", st.hour, st.minute, st.second)
+    (
+        format!("{:04}-{:02}-{:02}", st.year, st.month, st.day),
+        st.hour as u8,
+        st,
+    )
 }
 
 pub fn compute_peak_dbfs(samples: &[f32]) -> f32 {
@@ -237,6 +275,15 @@ pub fn merge_profile_filter(
 }
 
 fn build_stt_prompt_hints(cfg: &AppConfig, active_profile: Option<&GameProfile>) -> String {
+    build_stt_prompt_hints_with_ctx(cfg, active_profile, &[], None)
+}
+
+fn build_stt_prompt_hints_with_ctx(
+    cfg: &AppConfig,
+    active_profile: Option<&GameProfile>,
+    recent_msgs: &[String],
+    active_target_label: Option<&str>,
+) -> String {
     let mut terms: Vec<String> = Vec::new();
     let mut push_term = |s: &str| {
         let t = s.trim();
@@ -251,6 +298,18 @@ fn build_stt_prompt_hints(cfg: &AppConfig, active_profile: Option<&GameProfile>)
     for s in ["Discord", "DM", "通話", "ミュート", "テスト"] {
         push_term(s);
     }
+    if let Some(lbl) = active_target_label {
+        push_term(lbl);
+    }
+    if let Some(p) = active_profile {
+        push_term(&p.name);
+        for d in &p.dictionary {
+            push_term(&d.to);
+        }
+    }
+    for d in &cfg.speech_habits {
+        push_term(&d.to);
+    }
     for s in cfg
         .commands
         .send
@@ -261,11 +320,6 @@ fn build_stt_prompt_hints(cfg: &AppConfig, active_profile: Option<&GameProfile>)
     {
         push_term(s);
     }
-    if let Some(p) = active_profile {
-        for d in &p.dictionary {
-            push_term(&d.to);
-        }
-    }
     for d in &cfg.filter.dictionary {
         push_term(&d.to);
     }
@@ -275,11 +329,17 @@ fn build_stt_prompt_hints(cfg: &AppConfig, active_profile: Option<&GameProfile>)
             push_term(p);
         }
     }
+    if cfg.stt.accuracy.context_prompt_injection {
+        for msg in recent_msgs.iter().rev().take(2) {
+            let short: String = msg.chars().take(22).collect();
+            push_term(&short);
+        }
+    }
 
     let mut out = String::new();
     for term in terms {
         let add_len = term.chars().count() + if out.is_empty() { 0 } else { 1 };
-        if out.chars().count() + add_len > 160 {
+        if out.chars().count() + add_len > 200 {
             break;
         }
         if !out.is_empty() {
@@ -423,6 +483,19 @@ struct AppState {
     next_countdown_id: u64,
     recent_utterances: VecDeque<UtteranceDiagnostic>,
     next_diag_id: u64,
+    phase: String,
+    panic_mode: bool,
+    night_mode_active: bool,
+    eco_mode_active: bool,
+    vram_eco_offloaded: bool,
+    recent_sent_texts: VecDeque<(String, Instant)>,
+    last_dm_sender_info: Option<(String, Instant)>,
+    last_cancelled_raw: Option<(String, Instant)>,
+    calibration_wizard_active: bool,
+    stats: stats::StatsStore,
+    stats_path: PathBuf,
+    bench_cases: Vec<stats::BenchmarkCase>,
+    win_poll_ticks: u32,
 }
 
 impl AppState {
@@ -437,6 +510,9 @@ impl AppState {
         let active_game_profile_id =
             find_matching_game_profile(&active_process, &config.game_profiles)
                 .map(|p| p.id.clone());
+        let stats_path = stats::StatsStore::default_path();
+        let stats = stats::StatsStore::load_from(&stats_path);
+        let bench_cases = stats::load_benchmark_cases(&stats::bench_dir());
         Self {
             config,
             config_path,
@@ -465,7 +541,40 @@ impl AppState {
             next_countdown_id: 1,
             recent_utterances: VecDeque::with_capacity(5),
             next_diag_id: 1,
+            phase: "idle".into(),
+            panic_mode: false,
+            night_mode_active: false,
+            eco_mode_active: false,
+            vram_eco_offloaded: false,
+            recent_sent_texts: VecDeque::with_capacity(10),
+            last_dm_sender_info: None,
+            last_cancelled_raw: None,
+            calibration_wizard_active: false,
+            stats,
+            stats_path,
+            bench_cases,
+            win_poll_ticks: 0,
         }
+    }
+
+    fn recent_sent_strings(&self) -> Vec<String> {
+        let now = Instant::now();
+        self.recent_sent_texts
+            .iter()
+            .filter(|(_, ts)| now.duration_since(*ts) <= Duration::from_secs(30))
+            .map(|(s, _)| s.clone())
+            .collect()
+    }
+
+    fn record_sent_text(&mut self, text: &str) {
+        let t = text.trim();
+        if t.is_empty() {
+            return;
+        }
+        if self.recent_sent_texts.len() >= 10 {
+            self.recent_sent_texts.pop_front();
+        }
+        self.recent_sent_texts.push_back((t.to_string(), Instant::now()));
     }
 
     fn active_profile(&self) -> Option<&GameProfile> {
@@ -487,7 +596,27 @@ impl AppState {
     }
 
     fn effective_filter(&self) -> TextFilterConfig {
-        merge_profile_filter(&self.config.filter, self.active_profile())
+        let mut f = merge_profile_filter(&self.config.filter, self.active_profile());
+        for h in &self.config.speech_habits {
+            if !h.from.trim().is_empty() {
+                f.dictionary.push(h.clone());
+            }
+        }
+        f
+    }
+
+    fn effective_phase(&self) -> String {
+        if self.pending_countdown.is_some() {
+            "countdown".into()
+        } else if self.phase == "rescuing" && self.recognizing {
+            "rescuing".into()
+        } else if self.recognizing {
+            "recognizing".into()
+        } else if self.listening && !self.sleeping {
+            "listening".into()
+        } else {
+            "idle".into()
+        }
     }
 
     fn sync_guard(&self) {
@@ -586,6 +715,14 @@ impl AppState {
             active_discord_target_id: active_target.map(|t| t.id.clone()),
             active_discord_target_label: discord::target_display_label(active_target),
             active_profile: self.active_profile().map(|p| p.name.clone()),
+            phase: self.effective_phase(),
+            panic_mode: self.panic_mode,
+            target_locked: self.config.guard.target_locked,
+            noise_vad_engine: self.config.noise_cancel.vad_engine_name().into(),
+            noise_stt_engine: self.config.noise_cancel.stt_engine_name().into(),
+            night_mode_active: self.night_mode_active,
+            eco_mode_active: self.eco_mode_active || self.vram_eco_offloaded,
+            portable_mode: AppConfig::portable_dir().is_some(),
         }
     }
 }
@@ -662,13 +799,172 @@ fn spawn_stt_worker(
     let (tx, rx) = mpsc::channel::<SttWorkerMsg>();
     thread::spawn(move || {
         let mut engine = initial_engine;
+        let mut denoiser_cache: Option<(String, Option<Arc<stt::sherpa_ffi::ResidentSherpaDenoiser>>)> =
+            None;
+        let mut secondary_cache: Option<(String, Arc<dyn SttEngine>)> = None;
+
         while let Ok(msg) = rx.recv() {
             match msg {
-                SttWorkerMsg::Transcribe { samples, ctx } => {
+                SttWorkerMsg::Transcribe {
+                    samples,
+                    ctx,
+                    accuracy,
+                    noise_stt,
+                    dpdfnet_limit_db,
+                    stt_cfg,
+                    runtime_dir,
+                    recent_msgs,
+                    target_label,
+                    game_name,
+                    dict,
+                    speech_style,
+                } => {
                     let duration_sec = samples.len() as f32 / 16_000.0;
                     let peak_dbfs = compute_peak_dbfs(&samples);
                     let t0 = Instant::now();
-                    let result = engine.transcribe_with_context(&samples, &ctx);
+
+                    // Layer 1 (#21): Standalone STT-path Neural Speech Enhancement (DPDFNet / GTCRN)
+                    let denoised_samples = if noise_stt != NoiseEngineKind::Rnnoise
+                        && noise_stt != NoiseEngineKind::OffHpf
+                    {
+                        let d_key = format!(
+                            "{}|{}|{:.1}",
+                            noise_stt.as_str(),
+                            stt_cfg.model_dir,
+                            dpdfnet_limit_db
+                        );
+                        let den_opt = match denoiser_cache {
+                            Some((ref k, ref d)) if k == &d_key => d.clone(),
+                            _ => {
+                                let loaded = stt::local::discover_stt_denoiser(
+                                    noise_stt,
+                                    &stt_cfg,
+                                    runtime_dir.as_deref(),
+                                    dpdfnet_limit_db,
+                                );
+                                denoiser_cache = Some((d_key, loaded.clone()));
+                                loaded
+                            }
+                        };
+                        if let Some(ref den) = den_opt {
+                            den.denoise(&samples, 16_000).unwrap_or_else(|_| samples.clone())
+                        } else {
+                            samples.clone()
+                        }
+                    } else {
+                        samples.clone()
+                    };
+
+                    // Layer 2 (#1): WSOLA pitch-preserving slow stretch when speech is fast
+                    let tempo = crate::audio::enhance::estimate_speech_tempo_score(&denoised_samples);
+                    let use_wsola = accuracy.wsola_enabled
+                        && (ctx.preset == config::ConversationPreset::Fast
+                            || (accuracy.wsola_auto_fast && tempo >= 4.2));
+                    let wsola_input = if use_wsola && (accuracy.wsola_rate - 1.0).abs() > 0.02 {
+                        crate::audio::enhance::wsola_time_stretch(&denoised_samples, accuracy.wsola_rate)
+                    } else {
+                        denoised_samples.clone()
+                    };
+
+                    // Layer 2+4 (#35 + #38): Overlap chunking + Beam Search + Temperature Fallback
+                    let primary_res = if accuracy.overlap_chunking_enabled {
+                        stt::ensemble::transcribe_with_overlap(
+                            engine.as_ref(),
+                            &wsola_input,
+                            &ctx,
+                            accuracy.overlap_threshold_sec,
+                            accuracy.overlap_sec,
+                        )
+                    } else {
+                        engine.transcribe_with_context(&wsola_input, &ctx)
+                    };
+
+                    let mut final_res = primary_res;
+                    let mut secondary_text: Option<String> = None;
+
+                    // Layer 4 (#6, #34): 2-pass low-confidence rescue or Ultimate Dual-Engine Ensemble
+                    if let Ok(ref p_txt) = final_res {
+                        let needs_rescue =
+                            accuracy.two_pass_rescue && stt::ensemble::looks_low_confidence(p_txt, duration_sec);
+                        if accuracy.ultimate_ensemble || needs_rescue {
+                            let _ = proxy.send_event(UserEvent::PhaseUpdate("rescuing".into()));
+                            let sec_eng_id = accuracy.secondary_engine.trim();
+                            let sec_key = format!("{}|{}|{}", sec_eng_id, stt_cfg.model_dir, stt_cfg.language);
+                            let sec_ready = if !sec_eng_id.is_empty() && sec_eng_id != engine.id() {
+                                let cached = match secondary_cache {
+                                    Some((ref k, ref e)) if k == &sec_key => Some(e.clone()),
+                                    _ => {
+                                        let mut sec_cfg = stt_cfg.clone();
+                                        sec_cfg.engine = sec_eng_id.to_string();
+                                        sec_cfg.model_file.clear();
+                                        let e = stt::create_engine(&sec_cfg, runtime_dir.as_deref());
+                                        if e.is_ready() {
+                                            secondary_cache = Some((sec_key, e.clone()));
+                                            Some(e)
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                };
+                                cached
+                            } else {
+                                None
+                            };
+
+                            if let Some(sec_eng) = sec_ready {
+                                if let Some(ref hints) = ctx.hotwords_prompt {
+                                    sec_eng.set_prompt_hints(hints);
+                                }
+                                if let Ok(s_txt) = sec_eng.transcribe_with_context(&wsola_input, &ctx) {
+                                    secondary_text = Some(s_txt.clone());
+                                    if !accuracy.llm.enabled {
+                                        let picked = stt::ensemble::reconcile_dual_candidates(
+                                            p_txt,
+                                            &s_txt,
+                                            duration_sec,
+                                        );
+                                        final_res = Ok(picked);
+                                    }
+                                }
+                            } else if needs_rescue {
+                                // Fallback rescue pass with stronger 0.85x WSOLA stretch
+                                let slow_rescue =
+                                    crate::audio::enhance::wsola_time_stretch(&denoised_samples, 0.85);
+                                if let Ok(alt) = engine.transcribe_with_context(&slow_rescue, &ctx) {
+                                    let picked = stt::ensemble::reconcile_dual_candidates(
+                                        p_txt,
+                                        &alt,
+                                        duration_sec,
+                                    );
+                                    final_res = Ok(picked);
+                                }
+                            }
+                        }
+                    }
+
+                    // Layer 5 (#3, #11): Local LLM Phonetic & Contextual Post-Correction
+                    if accuracy.llm.enabled {
+                        if let Ok(ref cur_txt) = final_res {
+                            if !cur_txt.trim().is_empty() {
+                                let _ = proxy.send_event(UserEvent::PhaseUpdate("rescuing".into()));
+                                let req = stt::llm_corrector::LlmCorrectionRequest {
+                                    primary_text: cur_txt,
+                                    secondary_text: secondary_text.as_deref(),
+                                    recent_messages: &recent_msgs,
+                                    target_label: &target_label,
+                                    game_name: game_name.as_deref(),
+                                    dictionary: &dict,
+                                    style: speech_style,
+                                };
+                                if let Ok(llm_out) =
+                                    stt::llm_corrector::correct_transcript_with_llm(&accuracy.llm, &req)
+                                {
+                                    final_res = Ok(llm_out);
+                                }
+                            }
+                        }
+                    }
+
                     let infer_ms = t0.elapsed().as_millis() as u64;
                     let rtf = if duration_sec > 0.01 {
                         (infer_ms as f32 / 1000.0) / duration_sec
@@ -686,11 +982,21 @@ fn spawn_stt_worker(
                             rtf,
                             engine_label,
                             device_name,
-                            result,
+                            result: final_res,
                         })
                         .is_err()
                     {
                         break;
+                    }
+                }
+                SttWorkerMsg::TranscribePreview { samples, ctx } => {
+                    if engine.is_ready() {
+                        if let Ok(pv_txt) = engine.transcribe_with_context(&samples, &ctx) {
+                            let clean = pv_txt.trim().to_string();
+                            if !clean.is_empty() {
+                                let _ = proxy.send_event(UserEvent::StreamingPreviewReady(clean));
+                            }
+                        }
                     }
                 }
                 SttWorkerMsg::ReloadEngine(new_engine) => {
@@ -698,6 +1004,11 @@ fn spawn_stt_worker(
                 }
                 SttWorkerMsg::UpdatePromptHints(hints) => {
                     engine.set_prompt_hints(&hints);
+                }
+                SttWorkerMsg::UnloadAll => {
+                    engine = Arc::new(BootLoadingEngine);
+                    denoiser_cache = None;
+                    secondary_cache = None;
                 }
                 SttWorkerMsg::Shutdown => break,
             }
@@ -1405,6 +1716,13 @@ fn execute_text_and_command(
         }
         Some(VoiceCommand::ClearAll) => {
             sound.play(SoundKind::Cancel, &state.config.sound);
+            let removed_all = state.draft_text();
+            if !removed_all.trim().is_empty() {
+                state.last_cancelled_raw = Some((removed_all, Instant::now()));
+            }
+            let (ymd, _) = current_local_ymd_hour();
+            state.stats.record_cancel(&ymd, &state.stt_engine_name);
+            state.stats.save_to(&state.stats_path);
             match state.config.input_mode {
                 InputMode::Draft => {
                     state.draft_segments.clear();
@@ -1440,9 +1758,15 @@ fn execute_text_and_command(
         }
         Some(VoiceCommand::Undo) => {
             sound.play(SoundKind::Cancel, &state.config.sound);
+            let (ymd, _) = current_local_ymd_hour();
+            state.stats.record_cancel(&ymd, &state.stt_engine_name);
+            state.stats.save_to(&state.stats_path);
             match state.config.input_mode {
                 InputMode::Draft => {
                     let removed = state.draft_segments.pop().unwrap_or_default();
+                    if !removed.trim().is_empty() {
+                        state.last_cancelled_raw = Some((removed.clone(), Instant::now()));
+                    }
                     let draft = state.draft_text();
                     emit_all(
                         main_wv,
@@ -1588,26 +1912,43 @@ fn execute_text_and_command(
                             message: "送信するテキストがありません".into(),
                         },
                     );
-                } else if state.config.send_countdown.enabled
-                    && state.config.send_countdown.duration_ms >= 300
-                {
-                    start_send_countdown(
-                        full_text,
-                        true,
-                        VoiceCommand::Send.as_str(),
-                        state,
-                        main_wv,
-                        overlay_wv,
-                        proxy.clone(),
-                    );
                 } else {
-                    spawn_send_for_state(
-                        full_text,
-                        true,
-                        VoiceCommand::Send.as_str(),
-                        state,
-                        proxy.clone(),
-                    );
+                    state.record_sent_text(&full_text);
+                    let active_id = state.config.discord_targets.active_target_id.clone();
+                    let is_careful = active_id
+                        .as_ref()
+                        .map(|id| state.config.guard.careful_target_ids.iter().any(|c| c == id))
+                        .unwrap_or(false);
+                    if (state.config.send_countdown.enabled
+                        && state.config.send_countdown.duration_ms >= 300)
+                        || is_careful
+                    {
+                        let dur = if is_careful {
+                            state.config.send_countdown.duration_ms.max(2500)
+                        } else {
+                            state.config.send_countdown.duration_ms
+                        };
+                        let orig = state.config.send_countdown.duration_ms;
+                        state.config.send_countdown.duration_ms = dur;
+                        start_send_countdown(
+                            full_text,
+                            true,
+                            VoiceCommand::Send.as_str(),
+                            state,
+                            main_wv,
+                            overlay_wv,
+                            proxy.clone(),
+                        );
+                        state.config.send_countdown.duration_ms = orig;
+                    } else {
+                        spawn_send_for_state(
+                            full_text,
+                            true,
+                            VoiceCommand::Send.as_str(),
+                            state,
+                            proxy.clone(),
+                        );
+                    }
                 }
             }
             InputMode::Direct => {
@@ -1919,14 +2260,177 @@ fn handle_transcript(
         }
     }
 
+    // 1.5 Handle v1.6.0 special inline voice actions (#13 QuickReply, #14 PartialReplace, #25 Clipboard, #32 Target Lock)
+    if !state.sleeping {
+        if let Some(special) = parse_special_voice_action(raw) {
+            match special {
+                SpecialVoiceAction::LockTarget => {
+                    state.config.guard.target_locked = true;
+                    let _ = state.config.save_to(&state.config_path);
+                    emit_all(main_wv, overlay_wv, &state.status_event());
+                    emit_all(
+                        main_wv,
+                        overlay_wv,
+                        &BackendEvent::CommandExecuted {
+                            action: "target_lock".into(),
+                            detail: "宛先をロックしました（音声での誤切替を防止）".into(),
+                        },
+                    );
+                    return String::new();
+                }
+                SpecialVoiceAction::UnlockTarget => {
+                    state.config.guard.target_locked = false;
+                    let _ = state.config.save_to(&state.config_path);
+                    emit_all(main_wv, overlay_wv, &state.status_event());
+                    emit_all(
+                        main_wv,
+                        overlay_wv,
+                        &BackendEvent::CommandExecuted {
+                            action: "target_unlock".into(),
+                            detail: "宛先ロックを解除しました".into(),
+                        },
+                    );
+                    return String::new();
+                }
+                SpecialVoiceAction::PasteClipboard { press_enter } => {
+                    spawn_send_for_state(
+                        automation::input::copy_clipboard_read_fallback(),
+                        press_enter,
+                        "clipboard_paste",
+                        state,
+                        proxy.clone(),
+                    );
+                    return String::new();
+                }
+                SpecialVoiceAction::PartialReplace { from, to } => {
+                    if let Some(last) = state.draft_segments.last_mut() {
+                        if let Some(updated) = processor::phonetic::fuzzy_replace_segment(last, &from, &to) {
+                            *last = updated.clone();
+                            let draft = state.draft_text();
+                            emit_all(
+                                main_wv,
+                                overlay_wv,
+                                &BackendEvent::TranscriptUpdate {
+                                    text: String::new(),
+                                    draft,
+                                    is_final: true,
+                                },
+                            );
+                            emit_all(
+                                main_wv,
+                                overlay_wv,
+                                &BackendEvent::CommandExecuted {
+                                    action: "partial_replace".into(),
+                                    detail: format!("部分修正: 「{}」→「{}」", from, to),
+                                },
+                            );
+                            return updated;
+                        }
+                    }
+                    emit(
+                        main_wv,
+                        &BackendEvent::Toast {
+                            level: "info".into(),
+                            message: format!("ドラフト内に「{}」に一致する部分が見つかりませんでした", from),
+                        },
+                    );
+                    return String::new();
+                }
+                SpecialVoiceAction::QuickReplyDm(reply_body) => {
+                    if let Some((sender, ts)) = state.last_dm_sender_info.clone() {
+                        if ts.elapsed() <= Duration::from_secs(60) {
+                            let (cands, _) =
+                                discord::find_matching_targets(&sender, &state.config.discord_targets.targets);
+                            if let Some(t) = cands.first().cloned() {
+                                let eff_guard = state.effective_guard();
+                                let integ = state.config.discord_integration.clone();
+                                let delay = state.config.discord_targets.navigate_delay_ms;
+                                let p = proxy.clone();
+                                let msg_text = reply_body.clone();
+                                thread::spawn(move || {
+                                    let res = automation::send_to_discord_target(
+                                        &msg_text,
+                                        true,
+                                        Some(&t),
+                                        true,
+                                        delay,
+                                        &eff_guard,
+                                        &integ,
+                                    );
+                                    let _ = p.send_event(match res {
+                                        Ok(m) => UserEvent::AutomationResult {
+                                            ok: true,
+                                            action: "quick_reply".into(),
+                                            message: m,
+                                        },
+                                        Err(e) => UserEvent::AutomationResult {
+                                            ok: false,
+                                            action: "quick_reply".into(),
+                                            message: e,
+                                        },
+                                    });
+                                });
+                                return reply_body;
+                            }
+                        }
+                    }
+                    // Fallback: send as regular text if no recent DM target mapped
+                    spawn_send_for_state(reply_body.clone(), true, "quick_reply", state, proxy.clone());
+                    return reply_body;
+                }
+            }
+        }
+    }
+
     let eff_filter = state.effective_filter();
-    let processed = processor::process_transcript(
+    let active_targets_cfg = if state.config.guard.target_locked {
+        // When Target Lock is active (#32), do not allow passphrase target switching!
+        let mut locked = state.config.discord_targets.clone();
+        locked.switch_prefixes.clear();
+        locked.switch_suffixes.clear();
+        locked.reset_phrases.clear();
+        locked.allow_standalone_passphrase = false;
+        locked
+    } else {
+        state.config.discord_targets.clone()
+    };
+    let processed = processor::process_transcript_full(
         raw,
         &eff_filter,
         &state.config.commands,
-        &state.config.discord_targets,
+        &active_targets_cfg,
+        &state.config.snippets,
+        &state.config.emoji_aliases,
+        state.config.stt.accuracy.stutter_cleanup,
+        state.config.stt.accuracy.phonetic_fuzzy_matching,
     );
     let final_text = processed.text.clone();
+
+    // Auto re-speak habit learning (#5): if user cancelled within last 10s and now says a corrected phrase
+    if state.config.stt.accuracy.auto_learn_respeak && !final_text.is_empty() && processed.command.is_none() {
+        if let Some((cancelled, ts)) = state.last_cancelled_raw.take() {
+            if ts.elapsed() <= Duration::from_secs(10) {
+                if let Some(pair) = processor::phonetic::extract_respeak_habit_pair(&cancelled, &final_text) {
+                    if !state.config.speech_habits.iter().any(|h| h.from == pair.from) {
+                        state.stats.record_learning(&pair.from, &pair.to);
+                        state.stats.save_to(&state.stats_path);
+                        state.config.speech_habits.push(pair.clone());
+                        let _ = state.config.save_to(&state.config_path);
+                        emit(
+                            main_wv,
+                            &BackendEvent::Toast {
+                                level: "ok".into(),
+                                message: format!(
+                                    "言い直しから発音クセを学習しました: 「{}」→「{}」",
+                                    pair.from, pair.to
+                                ),
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     if processed.target_switch.is_some() || processed.command == Some(VoiceCommand::ClearAll) {
         if state.pending_confirm.take().is_some() {
@@ -2170,10 +2674,34 @@ fn main() -> wry::Result<()> {
         );
     }
 
+    audio_ctrl.set_fallbacks(state.config.audio_device_fallbacks.clone());
+    audio_ctrl.set_streaming_preview_ms(if state.config.stt.accuracy.streaming_preview_enabled {
+        state.config.stt.accuracy.streaming_interval_ms
+    } else {
+        0
+    });
+
     if state.config.stt.engine.eq_ignore_ascii_case("local-http")
         && state.config.stt.http_asr.auto_launch
     {
         spawn_http_asr_autostart(state.config.stt.http_asr.clone(), proxy.clone());
+    }
+    if state.config.stt.accuracy.llm.enabled && state.config.stt.accuracy.llm.auto_launch {
+        let lcfg = state.config.stt.accuracy.llm.clone();
+        let lp = proxy.clone();
+        thread::spawn(move || {
+            let res = stt::llm_corrector::ensure_llm_server_running(&lcfg);
+            let _ = lp.send_event(UserEvent::LlmHealthDone(res));
+        });
+    }
+    // Non-intrusive once-per-startup GitHub Releases update check (#33)
+    {
+        let up_proxy = proxy.clone();
+        thread::spawn(move || {
+            if let Some((latest_tag, url)) = stats::check_latest_release_non_blocking() {
+                let _ = up_proxy.send_event(UserEvent::AppUpdateFound { latest_tag, url });
+            }
+        });
     }
 
     let hk_proxy = proxy.clone();
@@ -2369,6 +2897,7 @@ fn main() -> wry::Result<()> {
                 }
                 AudioEvent::SpeechStart => {
                     state.recognizing = true;
+                    state.phase = "recognizing".into();
                     if let Some(ref t) = tray {
                         t.update_state(state.tray_state(), state.overlay_visible);
                     }
@@ -2376,25 +2905,108 @@ fn main() -> wry::Result<()> {
                 }
                 AudioEvent::SpeechCancelled => {
                     state.recognizing = false;
+                    state.phase = "idle".into();
                     if let Some(ref t) = tray {
                         t.update_state(state.tray_state(), state.overlay_visible);
                     }
                     emit_all(&webview, &overlay_webview, &state.status_event());
                 }
+                AudioEvent::UtterancePreview(samples) => {
+                    if !state.panic_mode && !state.sleeping && state.config.stt.accuracy.streaming_preview_enabled {
+                        let tgt_label = discord::target_display_label(
+                            state.config.discord_targets.active_target(),
+                        );
+                        let hints = build_stt_prompt_hints_with_ctx(
+                            &state.config,
+                            state.active_profile(),
+                            &state.recent_sent_strings(),
+                            Some(&tgt_label),
+                        );
+                        let ctx = TranscribeContext {
+                            language: state.config.stt.language.clone(),
+                            hotwords_prompt: if hints.is_empty() { None } else { Some(hints) },
+                            preset: state.config.stt.preset,
+                            radio_clarity: state.config.noise_cancel.radio_clarity_mode,
+                            eq_strength: state.config.noise_cancel.presence_eq_strength,
+                            head_pad_ms: state.config.stt.accuracy.head_silence_pad_ms,
+                            tail_pad_ms: state.config.stt.accuracy.tail_silence_pad_ms,
+                            beam_size: 2,
+                            temperature_fallback: false,
+                        };
+                        let _ = stt_tx.send(SttWorkerMsg::TranscribePreview { samples, ctx });
+                    }
+                }
                 AudioEvent::Utterance(samples) => {
-                    let hints = build_stt_prompt_hints(&state.config, state.active_profile());
+                    if state.panic_mode {
+                        state.recognizing = false;
+                        return;
+                    }
+                    let recent_msgs = state.recent_sent_strings();
+                    let tgt_label =
+                        discord::target_display_label(state.config.discord_targets.active_target());
+                    let hints = build_stt_prompt_hints_with_ctx(
+                        &state.config,
+                        state.active_profile(),
+                        &recent_msgs,
+                        Some(&tgt_label),
+                    );
+                    let eff_beam = if state.eco_mode_active {
+                        1
+                    } else {
+                        state.config.stt.accuracy.beam_size
+                    };
                     let ctx = TranscribeContext {
                         language: state.config.stt.language.clone(),
                         hotwords_prompt: if hints.is_empty() { None } else { Some(hints) },
                         preset: state.config.stt.preset,
                         radio_clarity: state.config.noise_cancel.radio_clarity_mode,
+                        eq_strength: state.config.noise_cancel.presence_eq_strength,
+                        head_pad_ms: state.config.stt.accuracy.head_silence_pad_ms,
+                        tail_pad_ms: state.config.stt.accuracy.tail_silence_pad_ms,
+                        beam_size: eff_beam,
+                        temperature_fallback: state.config.stt.accuracy.temperature_fallback,
                     };
-                    let _ = stt_tx.send(SttWorkerMsg::Transcribe { samples, ctx });
+                    let game_name = state.active_profile().map(|p| p.name.clone());
+                    let eff_filter = state.effective_filter();
+                    let style = state
+                        .active_profile()
+                        .and_then(|p| p.speech_style)
+                        .unwrap_or(state.config.stt.accuracy.llm.style);
+                    let _ = stt_tx.send(SttWorkerMsg::Transcribe {
+                        samples,
+                        ctx,
+                        accuracy: state.config.stt.accuracy.clone(),
+                        noise_stt: state.config.noise_cancel.stt_engine,
+                        dpdfnet_limit_db: state.config.noise_cancel.dpdfnet_attenuation_limit_db,
+                        stt_cfg: state.config.stt.clone(),
+                        runtime_dir: state.runtime_dir.clone(),
+                        recent_msgs,
+                        target_label: tgt_label,
+                        game_name,
+                        dict: eff_filter.dictionary,
+                        speech_style: style,
+                    });
+                }
+                AudioEvent::DeviceSwitched { from, to } => {
+                    state.config.audio_device = Some(to.clone());
+                    let _ = state.config.save_to(&state.config_path);
+                    emit(
+                        &webview,
+                        &BackendEvent::Toast {
+                            level: "info".into(),
+                            message: format!(
+                                "マイク自動切替 (#18): {} → {}",
+                                from.as_deref().unwrap_or("既定"),
+                                to
+                            ),
+                        },
+                    );
                 }
                 AudioEvent::Error(err) => {
                     state.listening = false;
                     state.recognizing = false;
                     state.ptt_active = false;
+                    state.phase = "idle".into();
                     if let Some(ref t) = tray {
                         t.update_state(state.tray_state(), state.overlay_visible);
                     }
@@ -2408,6 +3020,46 @@ fn main() -> wry::Result<()> {
                     );
                 }
             },
+            Event::UserEvent(UserEvent::PhaseUpdate(ph)) => {
+                state.phase = ph;
+                emit_all(&webview, &overlay_webview, &state.status_event());
+            }
+            Event::UserEvent(UserEvent::StreamingPreviewReady(pv_text)) => {
+                if !state.panic_mode {
+                    emit_all(
+                        &webview,
+                        &overlay_webview,
+                        &BackendEvent::StreamingPreview { draft: pv_text },
+                    );
+                }
+            }
+            Event::UserEvent(UserEvent::LlmHealthDone(res)) => match res {
+                Ok(msg) => {
+                    emit(&webview, &BackendEvent::LlmHealthResult { ok: true, message: msg.clone() });
+                    emit(&webview, &BackendEvent::Toast { level: "ok".into(), message: msg });
+                }
+                Err(err) => {
+                    emit(&webview, &BackendEvent::LlmHealthResult { ok: false, message: err.clone() });
+                    emit(&webview, &BackendEvent::Toast { level: "error".into(), message: err });
+                }
+            },
+            Event::UserEvent(UserEvent::AppUpdateFound { latest_tag, url }) => {
+                emit(
+                    &webview,
+                    &BackendEvent::AppUpdateAvailable {
+                        current_tag: stats::CURRENT_APP_TAG.into(),
+                        latest_tag: latest_tag.clone(),
+                        url,
+                    },
+                );
+                emit(
+                    &webview,
+                    &BackendEvent::Toast {
+                        level: "info".into(),
+                        message: format!("新しいバージョン {} が公開されています", latest_tag),
+                    },
+                );
+            }
             Event::UserEvent(UserEvent::TranscriptReady {
                 samples_16k,
                 duration_sec,
@@ -2419,11 +3071,19 @@ fn main() -> wry::Result<()> {
                 result,
             }) => {
                 state.recognizing = false;
+                state.phase = "idle".into();
                 state.last_infer_ms = infer_ms;
                 state.last_rtf = rtf;
                 if !device_name.is_empty() {
                     state.stt_device_name = device_name.clone();
                 }
+                let (ymd, _) = current_local_ymd_hour();
+                state
+                    .stats
+                    .record_utterance(&ymd, &engine_label, &device_name, infer_ms);
+                state.stats.save_to(&state.stats_path);
+                emit(&webview, &BackendEvent::StatsUpdated { summary: state.stats.summary() });
+
                 if let Some(ref t) = tray {
                     t.update_state(state.tray_state(), state.overlay_visible);
                 }
@@ -2432,6 +3092,29 @@ fn main() -> wry::Result<()> {
                 match result {
                     Ok(raw) => {
                         let trimmed = raw.trim().to_string();
+                        if state.calibration_wizard_active {
+                            state.calibration_wizard_active = false;
+                            let tempo = crate::audio::enhance::estimate_speech_tempo_score(&samples_16k);
+                            let hw = gpu_diag::detect_hardware_profile(state.runtime_dir.as_deref());
+                            let rec_vad = if peak_dbfs < -24.0 { 0.007 } else if peak_dbfs < -14.0 { 0.010 } else { 0.012 };
+                            let rec_eq = if peak_dbfs < -18.0 || tempo >= 4.0 { 0.70 } else { 0.55 };
+                            let rec_wsola = tempo >= 3.8;
+                            let note = format!(
+                                "診断完了: ピーク {:.1} dBFS / 話速スコア {:.1} / 認識「{}」",
+                                peak_dbfs, tempo, trimmed
+                            );
+                            emit(
+                                &webview,
+                                &BackendEvent::CalibrationWizardResult {
+                                    score_note: note,
+                                    recommended_vad: rec_vad,
+                                    recommended_eq: rec_eq,
+                                    recommended_wsola: rec_wsola,
+                                    recommended_model: hw.recommended_stt_model,
+                                },
+                            );
+                            return;
+                        }
                         let final_text = if !trimmed.is_empty() {
                             handle_transcript(
                                 &trimmed,
@@ -2688,7 +3371,12 @@ fn main() -> wry::Result<()> {
                 }
                 if state.active_game_profile_id != prev_profile {
                     state.sync_guard();
-                    let hints = build_stt_prompt_hints(&state.config, state.active_profile());
+                    let hints = build_stt_prompt_hints_with_ctx(
+                        &state.config,
+                        state.active_profile(),
+                        &state.recent_sent_strings(),
+                        None,
+                    );
                     let _ = stt_tx.send(SttWorkerMsg::UpdatePromptHints(hints));
                     if let Some(p) = state.active_profile().cloned() {
                         if let (Some(x), Some(y)) = (p.overlay_x, p.overlay_y) {
@@ -2713,6 +3401,48 @@ fn main() -> wry::Result<()> {
                                 opacity: state.config.overlay.opacity.clamp(0.2, 1.0),
                             },
                         );
+                    }
+                }
+                // #26 Night Mode Auto-Schedule + #16/#30 Periodic VRAM Watchdog & Battery Eco
+                state.win_poll_ticks = state.win_poll_ticks.wrapping_add(1);
+                if state.config.night_mode.enabled {
+                    let (_, hour) = current_local_ymd_hour();
+                    let s = state.config.night_mode.start_hour;
+                    let e = state.config.night_mode.end_hour;
+                    let in_night = if s <= e {
+                        hour >= s && hour < e
+                    } else {
+                        hour >= s || hour < e
+                    };
+                    if in_night != state.night_mode_active {
+                        state.night_mode_active = in_night;
+                        if in_night {
+                            let mut vad = state.config.vad.clone();
+                            vad.threshold = vad.threshold.min(0.008);
+                            vad.silence_ms = vad.silence_ms.max(800);
+                            audio_ctrl.update_vad(vad);
+                        } else {
+                            audio_ctrl.update_vad(state.config.vad.clone());
+                        }
+                    }
+                } else {
+                    state.night_mode_active = false;
+                }
+                if state.win_poll_ticks % 20 == 1 {
+                    if state.config.power_eco.auto_battery_eco {
+                        let (on_bat, _) = gpu_diag::query_power_status();
+                        state.eco_mode_active = on_bat;
+                    } else {
+                        state.eco_mode_active = false;
+                    }
+                    if state.config.power_eco.vram_watchdog_enabled {
+                        if let Some(adp) = gpu_diag::query_best_dxgi_adapter() {
+                            if let Some(pct) = adp.vram_usage_pct {
+                                state.vram_eco_offloaded = pct >= state.config.power_eco.vram_threshold_pct;
+                            }
+                        }
+                    } else {
+                        state.vram_eco_offloaded = false;
                     }
                 }
                 emit_all(&webview, &overlay_webview, &state.status_event());
@@ -2878,6 +3608,24 @@ fn main() -> wry::Result<()> {
                     );
                 } else {
                     sound_player.play(SoundKind::Cancel, &state.config.sound);
+                    for code in [
+                        "profile_modal_stuck",
+                        "composer_not_found",
+                        "focus_failed",
+                        "text_not_inserted",
+                    ] {
+                        if message.contains(code) {
+                            emit_all(
+                                &webview,
+                                &overlay_webview,
+                                &BackendEvent::PostSendError {
+                                    code: code.into(),
+                                    detail: message.clone(),
+                                },
+                            );
+                            break;
+                        }
+                    }
                     emit(
                         &webview,
                         &BackendEvent::Toast {
@@ -2915,8 +3663,11 @@ fn main() -> wry::Result<()> {
                     body,
                     speech_text,
                 } => {
-                    tts_ctrl.enqueue(speech_text, false);
-                    if state.config.discord_tts.debug_log_toasts {
+                    state.last_dm_sender_info = Some((sender.clone(), Instant::now()));
+                    if !state.panic_mode {
+                        tts_ctrl.enqueue(speech_text, false);
+                    }
+                    if state.config.discord_tts.debug_log_toasts && !state.panic_mode {
                         emit(
                             &webview,
                             &BackendEvent::ToastDebugLog {
@@ -3102,6 +3853,9 @@ fn main() -> wry::Result<()> {
                     if state.config.stt.http_asr.stop_on_exit {
                         stt::http_asr::stop_http_asr_if_started_by_us();
                     }
+                    if state.config.stt.accuracy.llm.stop_on_exit {
+                        stt::llm_corrector::stop_llm_server_if_started_by_us();
+                    }
                     audio_ctrl.shutdown();
                     let _ = stt_tx.send(SttWorkerMsg::Shutdown);
                     *control_flow = ControlFlow::Exit;
@@ -3122,6 +3876,32 @@ fn main() -> wry::Result<()> {
                             &webview,
                             &BackendEvent::DiagnosticsUpdated {
                                 items: state.diagnostic_dtos(),
+                            },
+                        );
+                        emit(
+                            &webview,
+                            &BackendEvent::StatsUpdated {
+                                summary: state.stats.summary(),
+                            },
+                        );
+                        emit(
+                            &webview,
+                            &BackendEvent::BenchmarkCasesUpdated {
+                                cases: state.bench_cases.clone(),
+                            },
+                        );
+                        let m_dir = stt::local::resolve_download_model_dir(
+                            &state.config.stt.model_dir,
+                            state.runtime_dir.as_deref(),
+                        );
+                        let hw = gpu_diag::detect_hardware_profile(state.runtime_dir.as_deref());
+                        let cat_items =
+                            stt::catalog::build_catalog_inventory(&m_dir, &state.config, &hw);
+                        emit(
+                            &webview,
+                            &BackendEvent::CatalogInventory {
+                                hardware: hw,
+                                items: cat_items,
                             },
                         );
                         emit(
@@ -3192,8 +3972,16 @@ fn main() -> wry::Result<()> {
                             Ordering::Relaxed,
                         );
                         audio_ctrl.set_device(state.config.audio_device.clone());
+                        audio_ctrl.set_fallbacks(state.config.audio_device_fallbacks.clone());
                         audio_ctrl.update_vad(state.config.vad.clone());
                         audio_ctrl.update_noise_cancel(state.config.noise_cancel.clone());
+                        audio_ctrl.set_streaming_preview_ms(
+                            if state.config.stt.accuracy.streaming_preview_enabled {
+                                state.config.stt.accuracy.streaming_interval_ms
+                            } else {
+                                0
+                            },
+                        );
                         tts_ctrl.update_config(state.config.discord_tts.clone());
                         notif_ctrl.update_config(state.config.discord_tts.clone());
                         if should_launch_voicevox {
@@ -3205,6 +3993,16 @@ fn main() -> wry::Result<()> {
                         }
                         if should_launch_http_asr {
                             spawn_http_asr_autostart(state.config.stt.http_asr.clone(), proxy.clone());
+                        }
+                        if state.config.stt.accuracy.llm.enabled
+                            && state.config.stt.accuracy.llm.auto_launch
+                        {
+                            let lcfg = state.config.stt.accuracy.llm.clone();
+                            let lp = proxy.clone();
+                            thread::spawn(move || {
+                                let res = stt::llm_corrector::ensure_llm_server_running(&lcfg);
+                                let _ = lp.send_event(UserEvent::LlmHealthDone(res));
+                            });
                         }
 
                         if autostart_changed {
@@ -3742,6 +4540,7 @@ fn main() -> wry::Result<()> {
                                 },
                                 preset: ab_cfg.preset,
                                 radio_clarity: state.config.noise_cancel.radio_clarity_mode,
+                                ..Default::default()
                             };
                             let p = proxy.clone();
                             thread::spawn(move || {
@@ -3924,6 +4723,520 @@ fn main() -> wry::Result<()> {
                         thread::spawn(move || {
                             let res = stt::http_asr::ensure_http_asr_running(&cfg);
                             let _ = p.send_event(UserEvent::HttpAsrHealthDone(res));
+                        });
+                    }
+                    ClientCommand::TestLlmCorrector { base_url } => {
+                        let mut u = state.config.stt.accuracy.llm.base_url.clone();
+                        if let Some(ov) = base_url {
+                            if !ov.trim().is_empty() {
+                                u = ov.trim().to_string();
+                            }
+                        }
+                        let p = proxy.clone();
+                        thread::spawn(move || {
+                            let res = stt::llm_corrector::check_llm_health(&u);
+                            let _ = p.send_event(UserEvent::LlmHealthDone(res));
+                        });
+                    }
+                    ClientCommand::LaunchLlmServer => {
+                        let cfg = state.config.stt.accuracy.llm.clone();
+                        let p = proxy.clone();
+                        thread::spawn(move || {
+                            let res = stt::llm_corrector::ensure_llm_server_running(&cfg);
+                            let _ = p.send_event(UserEvent::LlmHealthDone(res));
+                        });
+                    }
+                    ClientCommand::GetCatalogInventory => {
+                        let m_dir = stt::local::resolve_download_model_dir(
+                            &state.config.stt.model_dir,
+                            state.runtime_dir.as_deref(),
+                        );
+                        let hw = gpu_diag::detect_hardware_profile(state.runtime_dir.as_deref());
+                        let items =
+                            stt::catalog::build_catalog_inventory(&m_dir, &state.config, &hw);
+                        emit(
+                            &webview,
+                            &BackendEvent::CatalogInventory {
+                                hardware: hw,
+                                items,
+                            },
+                        );
+                    }
+                    ClientCommand::DeleteModel { model_id } => {
+                        // Safe unload BEFORE deleting files on Windows (Section 3.0 & 6.2)!
+                        let deleted_was_llm = model_id.contains("llm")
+                            || state
+                                .config
+                                .stt
+                                .accuracy
+                                .llm
+                                .model_file
+                                .eq_ignore_ascii_case(model_id.trim_start_matches("custom:"));
+                        let deleted_was_http = model_id == "qwen3-asr-1.7b-gguf";
+                        let deleted_was_vad_nc = model_id
+                            == state.config.noise_cancel.vad_engine_name()
+                            || model_id == state.config.noise_cancel.stt_engine_name();
+
+                        let _ = stt_tx.send(SttWorkerMsg::UnloadAll);
+                        if let Ok(mut g) = AB_ENGINE_CACHE.lock() {
+                            *g = None;
+                        }
+                        if deleted_was_http {
+                            stt::http_asr::stop_http_asr_if_started_by_us();
+                            if state.config.stt.engine == "local-http" {
+                                state.config.stt.engine = "auto".into();
+                            }
+                        }
+                        if deleted_was_llm {
+                            stt::llm_corrector::stop_llm_server_if_started_by_us();
+                            state.config.stt.accuracy.llm.enabled = false;
+                            state.config.stt.accuracy.llm.model_file.clear();
+                        }
+                        if deleted_was_vad_nc {
+                            if state.config.noise_cancel.vad_engine_name() == model_id {
+                                state.config.noise_cancel.vad_engine = NoiseEngineKind::Rnnoise;
+                            }
+                            if state.config.noise_cancel.stt_engine_name() == model_id {
+                                state.config.noise_cancel.stt_engine = NoiseEngineKind::OffHpf;
+                            }
+                            audio_ctrl.update_noise_cancel(state.config.noise_cancel.clone());
+                        }
+                        if !state.config.stt.model_file.is_empty()
+                            && (model_id == state.config.stt.model_file
+                                || model_id == format!("custom:{}", state.config.stt.model_file)
+                                || (model_id == "whisper-large-v3-q8"
+                                    && state.config.stt.model_file.contains("large-v3-q8")))
+                        {
+                            state.config.stt.model_file.clear();
+                            state.config.stt.engine = "auto".into();
+                        }
+                        if model_id == "qwen3-asr-0.6b-int8" && state.config.stt.engine == "sherpa-qwen3" {
+                            state.config.stt.engine = "auto".into();
+                        }
+                        if model_id == "parakeet-ja-int8" && state.config.stt.engine == "sherpa-onnx" {
+                            state.config.stt.engine = "auto".into();
+                        }
+
+                        thread::sleep(Duration::from_millis(80));
+                        let m_dir = stt::local::resolve_download_model_dir(
+                            &state.config.stt.model_dir,
+                            state.runtime_dir.as_deref(),
+                        );
+                        match stt::catalog::delete_model_from_disk(&m_dir, &model_id) {
+                            Ok(freed) => {
+                                let _ = state.config.save_to(&state.config_path);
+                                state.stt_ready = false;
+                                state.stt_engine_name = "標準モデルへ再読込中...".into();
+                                spawn_stt_loader(
+                                    state.config.stt.clone(),
+                                    state.runtime_dir.clone(),
+                                    proxy.clone(),
+                                );
+                                let hw = gpu_diag::detect_hardware_profile(state.runtime_dir.as_deref());
+                                let items = stt::catalog::build_catalog_inventory(&m_dir, &state.config, &hw);
+                                emit(
+                                    &webview,
+                                    &BackendEvent::CatalogInventory {
+                                        hardware: hw,
+                                        items,
+                                    },
+                                );
+                                emit(
+                                    &webview,
+                                    &BackendEvent::ConfigLoaded {
+                                        config: state.config.clone(),
+                                        config_path: state.config_path.display().to_string(),
+                                    },
+                                );
+                                emit(
+                                    &webview,
+                                    &BackendEvent::Toast {
+                                        level: "ok".into(),
+                                        message: format!(
+                                            "モデルを削除し、{} を解放しました",
+                                            stt::catalog::format_bytes(freed)
+                                        ),
+                                    },
+                                );
+                            }
+                            Err(err) => {
+                                spawn_stt_loader(
+                                    state.config.stt.clone(),
+                                    state.runtime_dir.clone(),
+                                    proxy.clone(),
+                                );
+                                emit(
+                                    &webview,
+                                    &BackendEvent::Toast {
+                                        level: "error".into(),
+                                        message: err,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    ClientCommand::ApplyWizardRecommendation => {
+                        let hw = gpu_diag::detect_hardware_profile(state.runtime_dir.as_deref());
+                        state.config.stt.engine = hw.recommended_stt_engine.clone();
+                        state.config.noise_cancel.vad_engine = match hw.recommended_vad_noise.as_str() {
+                            "gtcrn-16k" => NoiseEngineKind::Gtcrn16k,
+                            _ => NoiseEngineKind::Rnnoise,
+                        };
+                        state.config.noise_cancel.stt_engine = match hw.recommended_stt_noise.as_str() {
+                            "dpdfnet-16k" => NoiseEngineKind::DpdfNet16k,
+                            _ => NoiseEngineKind::OffHpf,
+                        };
+                        state.config.wizard_completed = true;
+                        let _ = state.config.save_to(&state.config_path);
+                        audio_ctrl.update_noise_cancel(state.config.noise_cancel.clone());
+                        spawn_stt_loader(
+                            state.config.stt.clone(),
+                            state.runtime_dir.clone(),
+                            proxy.clone(),
+                        );
+                        let m_dir = stt::local::resolve_download_model_dir(
+                            &state.config.stt.model_dir,
+                            state.runtime_dir.as_deref(),
+                        );
+                        let items = stt::catalog::build_catalog_inventory(&m_dir, &state.config, &hw);
+                        emit(&webview, &BackendEvent::CatalogInventory { hardware: hw.clone(), items });
+                        emit(
+                            &webview,
+                            &BackendEvent::ConfigLoaded {
+                                config: state.config.clone(),
+                                config_path: state.config_path.display().to_string(),
+                            },
+                        );
+                        emit(
+                            &webview,
+                            &BackendEvent::Toast {
+                                level: "ok".into(),
+                                message: format!("PC最適化構成を適用しました: {}", hw.summary_note),
+                            },
+                        );
+                    }
+                    ClientCommand::SaveBenchmarkCase {
+                        diag_id,
+                        expected_text,
+                    } => {
+                        if let Some(d) = state
+                            .recent_utterances
+                            .iter()
+                            .find(|x| x.id == diag_id)
+                            .cloned()
+                        {
+                            let id = format!("b_{}", d.id);
+                            let dir = stats::bench_dir();
+                            let wav_path = dir.join(format!("{}.wav", id));
+                            match stats::write_f32_wav_16k(&wav_path, &d.samples_16k) {
+                                Ok(()) => {
+                                    let exp = if expected_text.trim().is_empty() {
+                                        d.final_text.clone()
+                                    } else {
+                                        expected_text.trim().to_string()
+                                    };
+                                    state.bench_cases.retain(|c| c.id != id);
+                                    state.bench_cases.push(stats::BenchmarkCase {
+                                        id,
+                                        label: format!("{} ({:.1}s)", d.timestamp, d.duration_sec),
+                                        expected_text: exp,
+                                        wav_path: wav_path.to_string_lossy().into_owned(),
+                                        duration_sec: d.duration_sec,
+                                    });
+                                    stats::save_benchmark_cases(&dir, &state.bench_cases);
+                                    emit(
+                                        &webview,
+                                        &BackendEvent::BenchmarkCasesUpdated {
+                                            cases: state.bench_cases.clone(),
+                                        },
+                                    );
+                                    emit(
+                                        &webview,
+                                        &BackendEvent::Toast {
+                                            level: "ok".into(),
+                                            message: "ベンチマークWAVとして保存しました".into(),
+                                        },
+                                    );
+                                }
+                                Err(err) => emit(
+                                    &webview,
+                                    &BackendEvent::Toast {
+                                        level: "error".into(),
+                                        message: err,
+                                    },
+                                ),
+                            }
+                        }
+                    }
+                    ClientCommand::DeleteBenchmarkCase { id } => {
+                        if let Some(pos) = state.bench_cases.iter().position(|c| c.id == id) {
+                            let c = state.bench_cases.remove(pos);
+                            let _ = std::fs::remove_file(&c.wav_path);
+                            stats::save_benchmark_cases(&stats::bench_dir(), &state.bench_cases);
+                            emit(
+                                &webview,
+                                &BackendEvent::BenchmarkCasesUpdated {
+                                    cases: state.bench_cases.clone(),
+                                },
+                            );
+                        }
+                    }
+                    ClientCommand::RunBenchmarkSuite => {
+                        let cases = state.bench_cases.clone();
+                        let stt_cfg = state.config.stt.clone();
+                        let rt = state.runtime_dir.clone();
+                        let ctx = TranscribeContext {
+                            language: stt_cfg.language.clone(),
+                            hotwords_prompt: None,
+                            preset: stt_cfg.preset,
+                            radio_clarity: state.config.noise_cancel.radio_clarity_mode,
+                            eq_strength: state.config.noise_cancel.presence_eq_strength,
+                            head_pad_ms: stt_cfg.accuracy.head_silence_pad_ms,
+                            tail_pad_ms: stt_cfg.accuracy.tail_silence_pad_ms,
+                            beam_size: stt_cfg.accuracy.beam_size,
+                            temperature_fallback: stt_cfg.accuracy.temperature_fallback,
+                        };
+                        let mut results = Vec::new();
+                        let eng = stt::create_engine(&stt_cfg, rt.as_deref());
+                        let mut sum_sim = 0.0f32;
+                        for c in &cases {
+                            if let Ok(s) = stats::read_f32_wav_16k(std::path::Path::new(&c.wav_path)) {
+                                let t0 = Instant::now();
+                                let actual = eng.transcribe_with_context(&s, &ctx).unwrap_or_default();
+                                let ms = t0.elapsed().as_millis() as u64;
+                                let sim = processor::phonetic::phonetic_similarity(&actual, &c.expected_text);
+                                sum_sim += sim;
+                                results.push(stats::BenchmarkCaseResult {
+                                    id: c.id.clone(),
+                                    label: c.label.clone(),
+                                    expected_text: c.expected_text.clone(),
+                                    actual_text: actual,
+                                    similarity: sim,
+                                    infer_ms: ms,
+                                });
+                            }
+                        }
+                        let avg = if results.is_empty() { 0.0 } else { sum_sim / results.len() as f32 };
+                        emit(
+                            &webview,
+                            &BackendEvent::BenchmarkSuiteResult {
+                                results,
+                                avg_similarity: avg,
+                            },
+                        );
+                    }
+                    ClientCommand::RunAutoTuner => {
+                        let eng = stt::create_engine(&state.config.stt, state.runtime_dir.as_deref());
+                        let ctx = TranscribeContext {
+                            language: state.config.stt.language.clone(),
+                            hotwords_prompt: None,
+                            preset: state.config.stt.preset,
+                            radio_clarity: state.config.noise_cancel.radio_clarity_mode,
+                            eq_strength: state.config.noise_cancel.presence_eq_strength,
+                            head_pad_ms: state.config.stt.accuracy.head_silence_pad_ms,
+                            tail_pad_ms: state.config.stt.accuracy.tail_silence_pad_ms,
+                            beam_size: state.config.stt.accuracy.beam_size,
+                            temperature_fallback: state.config.stt.accuracy.temperature_fallback,
+                        };
+                        match stats::run_auto_parameter_tuner(&state.bench_cases, eng.as_ref(), &ctx) {
+                            Ok(proposal) => {
+                                emit(&webview, &BackendEvent::AutoTunerResult { proposal });
+                            }
+                            Err(err) => {
+                                emit(
+                                    &webview,
+                                    &BackendEvent::Toast {
+                                        level: "error".into(),
+                                        message: err,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    ClientCommand::ApplyAutoTuner {
+                        eq_strength,
+                        wsola_rate,
+                        beam_size,
+                    } => {
+                        state.config.noise_cancel.presence_eq_strength = eq_strength.clamp(0.0, 1.0);
+                        state.config.stt.accuracy.wsola_rate = wsola_rate.clamp(0.75, 1.0);
+                        state.config.stt.accuracy.beam_size = beam_size.clamp(1, 5);
+                        let _ = state.config.save_to(&state.config_path);
+                        emit(
+                            &webview,
+                            &BackendEvent::ConfigLoaded {
+                                config: state.config.clone(),
+                                config_path: state.config_path.display().to_string(),
+                            },
+                        );
+                        emit(
+                            &webview,
+                            &BackendEvent::Toast {
+                                level: "ok".into(),
+                                message: "自動探索パラメータを適用しました".into(),
+                            },
+                        );
+                    }
+                    ClientCommand::StartCalibrationWizard => {
+                        state.calibration_wizard_active = true;
+                        if !state.listening {
+                            set_listening_state(
+                                true,
+                                true,
+                                &mut state,
+                                &audio_ctrl,
+                                &sound_player,
+                                &webview,
+                                &overlay_webview,
+                                &tray,
+                            );
+                        }
+                        emit(
+                            &webview,
+                            &BackendEvent::Toast {
+                                level: "info".into(),
+                                message: "15秒滑舌診断開始：普段通りの速さで「今日は天気がいいのでDiscordで連絡します」と話してください".into(),
+                            },
+                        );
+                    }
+                    ClientCommand::TogglePanicSafeMode => {
+                        state.panic_mode = !state.panic_mode;
+                        if state.panic_mode {
+                            set_listening_state(
+                                false,
+                                false,
+                                &mut state,
+                                &audio_ctrl,
+                                &sound_player,
+                                &webview,
+                                &overlay_webview,
+                                &tray,
+                            );
+                            cancel_send_countdown(
+                                &mut state,
+                                &webview,
+                                &overlay_webview,
+                                &sound_player,
+                                "パニックセーフモード発動",
+                            );
+                            state.draft_segments.clear();
+                            tts_ctrl.stop_and_clear();
+                            state.overlay_visible = false;
+                            overlay_window.set_visible(false);
+                        } else {
+                            state.overlay_visible = state.config.overlay.enabled;
+                            overlay_window.set_visible(state.overlay_visible);
+                        }
+                        emit_all(&webview, &overlay_webview, &state.status_event());
+                        emit(
+                            &webview,
+                            &BackendEvent::Toast {
+                                level: if state.panic_mode { "warn" } else { "ok" }.into(),
+                                message: if state.panic_mode {
+                                    "配信・画面共有セーフモード ON（マイク停止・HUD非表示・読み上げ停止・履歴マスク）"
+                                } else {
+                                    "配信セーフモードを解除しました"
+                                }
+                                .into(),
+                            },
+                        );
+                    }
+                    ClientCommand::ToggleTargetLock => {
+                        state.config.guard.target_locked = !state.config.guard.target_locked;
+                        let _ = state.config.save_to(&state.config_path);
+                        emit_all(&webview, &overlay_webview, &state.status_event());
+                        emit(
+                            &webview,
+                            &BackendEvent::Toast {
+                                level: "ok".into(),
+                                message: if state.config.guard.target_locked {
+                                    "宛先ロック ON（誤宛先切替を防止）"
+                                } else {
+                                    "宛先ロック OFF"
+                                }
+                                .into(),
+                            },
+                        );
+                    }
+                    ClientCommand::ExportBackup => {
+                        match stats::export_backup_json(&state.config, &state.stats) {
+                            Ok(json) => emit(&webview, &BackendEvent::BackupExported { json }),
+                            Err(err) => emit(
+                                &webview,
+                                &BackendEvent::Toast {
+                                    level: "error".into(),
+                                    message: err,
+                                },
+                            ),
+                        }
+                    }
+                    ClientCommand::ImportBackup { json } => {
+                        match stats::import_backup_json(&json) {
+                            Ok((new_cfg, new_stats)) => {
+                                state.config = new_cfg;
+                                let _ = state.config.save_to(&state.config_path);
+                                if let Some(ns) = new_stats {
+                                    state.stats = ns;
+                                    state.stats.save_to(&state.stats_path);
+                                    emit(
+                                        &webview,
+                                        &BackendEvent::StatsUpdated {
+                                            summary: state.stats.summary(),
+                                        },
+                                    );
+                                }
+                                audio_ctrl.update_vad(state.config.vad.clone());
+                                audio_ctrl.update_noise_cancel(state.config.noise_cancel.clone());
+                                state.sync_guard();
+                                emit(
+                                    &webview,
+                                    &BackendEvent::ConfigLoaded {
+                                        config: state.config.clone(),
+                                        config_path: state.config_path.display().to_string(),
+                                    },
+                                );
+                                emit_all(&webview, &overlay_webview, &state.status_event());
+                                emit(
+                                    &webview,
+                                    &BackendEvent::Toast {
+                                        level: "ok".into(),
+                                        message: "バックアップから設定・辞書を復元しました".into(),
+                                    },
+                                );
+                            }
+                            Err(err) => emit(
+                                &webview,
+                                &BackendEvent::Toast {
+                                    level: "error".into(),
+                                    message: err,
+                                },
+                            ),
+                        }
+                    }
+                    ClientCommand::GetStats => {
+                        emit(
+                            &webview,
+                            &BackendEvent::StatsUpdated {
+                                summary: state.stats.summary(),
+                            },
+                        );
+                    }
+                    ClientCommand::ResetStats => {
+                        state.stats = stats::StatsStore::default();
+                        state.stats.save_to(&state.stats_path);
+                        emit(
+                            &webview,
+                            &BackendEvent::StatsUpdated {
+                                summary: state.stats.summary(),
+                            },
+                        );
+                    }
+                    ClientCommand::CheckAppUpdate => {
+                        let up_p = proxy.clone();
+                        thread::spawn(move || {
+                            if let Some((latest_tag, url)) = stats::check_latest_release_non_blocking() {
+                                let _ = up_p.send_event(UserEvent::AppUpdateFound { latest_tag, url });
+                            }
                         });
                     }
                     ClientCommand::ToggleOverlay => {

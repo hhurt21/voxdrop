@@ -31,14 +31,25 @@
         flex-direction: column;
         gap: 6px;
       }
-      .hud.speaking {
-        border-color: rgba(88, 101, 242, 0.9);
+      .hud.speaking,
+      .hud.recognizing {
+        border-color: rgba(59, 130, 246, 0.9);
+      }
+      .hud.rescuing {
+        border-color: rgba(168, 85, 247, 0.92);
       }
       .hud.listening {
-        border-color: rgba(35, 165, 90, 0.65);
+        border-color: rgba(35, 165, 90, 0.72);
       }
-      .hud.sleeping {
-        border-color: rgba(240, 178, 50, 0.75);
+      .hud.sleeping,
+      .hud.countdown {
+        border-color: rgba(240, 178, 50, 0.85);
+      }
+      .hud.panic {
+        border-color: rgba(239, 68, 68, 0.9);
+      }
+      .hud.idle {
+        border-color: rgba(255, 255, 255, 0.14);
       }
       .hud-header {
         display: flex;
@@ -64,12 +75,37 @@
       .hud.listening .dot {
         background: #23a55a;
       }
-      .hud.speaking .dot {
-        background: #5865f2;
-        box-shadow: 0 0 8px #5865f2;
+      .hud.speaking .dot,
+      .hud.recognizing .dot {
+        background: #3b82f6;
+        box-shadow: 0 0 8px #3b82f6;
       }
-      .hud.sleeping .dot {
+      .hud.rescuing .dot {
+        background: #a855f7;
+        box-shadow: 0 0 8px #a855f7;
+      }
+      .hud.sleeping .dot,
+      .hud.countdown .dot {
         background: #f0b232;
+      }
+      .hud.panic .dot {
+        background: #ef4444;
+        box-shadow: 0 0 8px #ef4444;
+      }
+      .tag.warn {
+        color: #ffd166;
+        background: rgba(240, 178, 50, 0.2);
+      }
+      .tag.danger {
+        color: #ff9999;
+        background: rgba(239, 68, 68, 0.22);
+      }
+      .draft.preview {
+        color: #a5b4fc;
+        font-style: italic;
+      }
+      .footer-hint.err #actionHint {
+        color: #ff9999;
       }
       .badges {
         display: flex;
@@ -193,6 +229,7 @@
           <span id="stateLabel">停止中 (OFF)</span>
         </div>
         <div class="badges">
+          <span id="lockTag" class="tag warn" style="display: none">🔒 ロック</span>
           <span id="profileTag" class="tag ok" style="display: none"></span>
           <span id="ncTag" class="tag ok">NC</span>
           <span id="targetTag" class="tag">待機中</span>
@@ -231,6 +268,8 @@
         const modeLabel = document.getElementById("modeLabel");
         const actionHint = document.getElementById("actionHint");
         const profileTag = document.getElementById("profileTag");
+        const lockTag = document.getElementById("lockTag");
+        const footerHint = actionHint.parentElement;
         const countdownBox = document.getElementById("countdownBox");
         const countdownLabel = document.getElementById("countdownLabel");
         const countdownBar = document.getElementById("countdownBar");
@@ -256,6 +295,7 @@
             }
             case "TranscriptUpdate": {
               const text = (ev.draft || "").trim();
+              draftText.classList.remove("preview");
               if (text) {
                 draftText.textContent = text;
                 draftText.classList.remove("empty");
@@ -263,6 +303,24 @@
                 draftText.textContent = "下書きは空です";
                 draftText.classList.add("empty");
               }
+              break;
+            }
+            case "StreamingPreview": {
+              const draft = (ev.draft || "").trim();
+              if (draft) {
+                draftText.textContent = "… " + draft;
+                draftText.classList.remove("empty");
+                draftText.classList.add("preview");
+              }
+              break;
+            }
+            case "PostSendError": {
+              footerHint.classList.add("err");
+              actionHint.textContent = `[${ev.code || "ERR"}] ${ev.detail || "送信エラー"}`;
+              setTimeout(() => {
+                footerHint.classList.remove("err");
+                actionHint.textContent = "「合言葉 〇〇」で宛先切替 / 「送信して」で送信";
+              }, 4500);
               break;
             }
             case "ConfirmationPrompt": {
@@ -283,20 +341,44 @@
               break;
             }
             case "StatusChanged": {
-              hud.classList.remove("listening", "speaking", "sleeping");
-              if (!ev.listening) {
+              hud.classList.remove(
+                "listening",
+                "speaking",
+                "recognizing",
+                "rescuing",
+                "countdown",
+                "sleeping",
+                "panic",
+                "idle"
+              );
+              const phase = ev.phase || "";
+              if (ev.panic_mode) {
+                hud.classList.add("panic");
+                stateLabel.textContent = "配信セーフ (ミュート)";
+              } else if (!ev.listening) {
+                hud.classList.add("idle");
                 stateLabel.textContent =
                   ev.activation_mode === "push_to_talk" ? "PTT 待機中" : "停止中 (OFF)";
               } else if (ev.sleeping) {
                 hud.classList.add("sleeping");
                 stateLabel.textContent = "スリープ中";
-              } else if (ev.recognizing) {
-                hud.classList.add("speaking");
+              } else if (phase === "rescuing") {
+                hud.classList.add("rescuing");
+                stateLabel.textContent = "高精度レスキュー中...";
+              } else if (phase === "countdown") {
+                hud.classList.add("countdown");
+                stateLabel.textContent = "送信カウントダウン";
+              } else if (phase === "recognizing" || ev.recognizing) {
+                hud.classList.add("recognizing", "speaking");
                 stateLabel.textContent = "認識中...";
               } else {
                 hud.classList.add("listening");
                 stateLabel.textContent =
                   ev.activation_mode === "push_to_talk" ? "PTT 録音中" : "録音待機中";
+              }
+
+              if (lockTag) {
+                lockTag.style.display = ev.target_locked ? "inline-block" : "none";
               }
 
               if (ev.active_profile) {
@@ -306,13 +388,30 @@
                 profileTag.style.display = "none";
               }
 
-              ncTag.textContent = ev.rnnoise_enabled ? "RNNoise" : "NC OFF";
-              ncTag.className = "tag " + (ev.rnnoise_enabled ? "ok" : "");
+              const ncName = ev.noise_stt_engine || "";
+              const ncShort =
+                ncName === "dpdfnet-16k"
+                  ? "DPDF16"
+                  : ncName === "dpdfnet-48k"
+                  ? "DPDF48"
+                  : ncName === "gtcrn-16k"
+                  ? "GTCRN"
+                  : ncName === "deepfilternet3"
+                  ? "DF3"
+                  : ev.rnnoise_enabled
+                  ? "RNNoise"
+                  : "NC OFF";
+              ncTag.textContent = ncShort;
+              ncTag.className = "tag " + (ev.rnnoise_enabled || (ncName && ncName !== "off-hpf") ? "ok" : "");
 
               targetTag.textContent = ev.active_process || "未検出";
               targetTag.className = "tag " + (ev.target_active ? "ok" : "");
 
-              destLabel.textContent = "宛先: " + (ev.active_discord_target_label || "現在の画面");
+              destLabel.textContent =
+                (ev.target_locked ? "🔒 宛先: " : "宛先: ") +
+                (ev.panic_mode
+                  ? "*** (セーフモード)"
+                  : ev.active_discord_target_label || "現在の画面");
               modeLabel.textContent =
                 ev.input_mode === "direct" ? "ダイレクト" : "ドラフト";
               break;

@@ -1,8 +1,11 @@
 pub mod commands;
 pub mod filter;
 pub mod japanese_fix;
+pub mod phonetic;
 
-use crate::config::{DiscordTargetsConfig, TextFilterConfig, VoiceCommandsConfig};
+use crate::config::{
+    DiscordTargetsConfig, EmojiAlias, SnippetMacro, TextFilterConfig, VoiceCommandsConfig,
+};
 use commands::{TargetSwitchAction, VoiceCommand};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,20 +15,29 @@ pub struct ProcessedUtterance {
     pub target_switch: Option<TargetSwitchAction>,
 }
 
-/// Runs the full text-processing pipeline on raw STT output:
-/// 0. Japanese naturalness & ASR artifact post-correction
-/// 1. Filler removal & custom dictionary substitution
-/// 2. Discord target switching via passphrase (合言葉)
-/// 3. Voice command extraction (suffix or standalone)
-/// 4. Punctuation cleanup / auto-period rules on the remaining text
-pub fn process_transcript(
+/// Runs the full v1.6.0 text-processing pipeline on raw STT output:
+/// 0. Stutter cleanup (#8) & Japanese normalization
+/// 1. Filler removal, custom dictionary + speech habits (#5)
+/// 2. Discord target switching via passphrase (with phonetic tolerance)
+/// 3. Voice command extraction (exact + phonetic fuzzy matching #4)
+/// 4. Snippet macros (#10), Emoji aliases (#12), Discord markdown formatting (#24), and punctuation rules
+pub fn process_transcript_full(
     raw: &str,
     filter_cfg: &TextFilterConfig,
     cmd_cfg: &VoiceCommandsConfig,
     targets_cfg: &DiscordTargetsConfig,
+    snippets: &[SnippetMacro],
+    emojis: &[EmojiAlias],
+    stutter_cleanup: bool,
+    phonetic_fuzzy: bool,
 ) -> ProcessedUtterance {
-    let repaired = japanese_fix::normalize_japanese_transcript(raw);
-    let normalized = filter::apply_fillers_and_dictionary(&repaired, filter_cfg);
+    let mut base = if stutter_cleanup {
+        filter::cleanup_stutter(raw)
+    } else {
+        raw.trim().to_string()
+    };
+    base = japanese_fix::normalize_japanese_transcript(&base);
+    let normalized = filter::apply_fillers_and_dictionary(&base, filter_cfg);
 
     let (target_switch, after_target) =
         match commands::parse_target_switch(&normalized, targets_cfg) {
@@ -33,13 +45,35 @@ pub fn process_transcript(
             None => (None, normalized),
         };
 
-    let parsed = commands::parse_voice_command(&after_target, cmd_cfg);
-    let final_text = filter::apply_punctuation_rules(&parsed.remaining_text, filter_cfg);
+    let parsed = commands::parse_voice_command_ex(&after_target, cmd_cfg, phonetic_fuzzy);
+    let after_macro = filter::expand_snippet_macros(&parsed.remaining_text, snippets);
+    let after_emoji = filter::apply_emoji_aliases(&after_macro, emojis);
+    let after_md = filter::apply_discord_markdown_commands(&after_emoji);
+    let final_text = filter::apply_punctuation_rules(&after_md, filter_cfg);
     ProcessedUtterance {
         text: final_text,
         command: parsed.command,
         target_switch,
     }
+}
+
+/// Backward-compatible pipeline helper.
+pub fn process_transcript(
+    raw: &str,
+    filter_cfg: &TextFilterConfig,
+    cmd_cfg: &VoiceCommandsConfig,
+    targets_cfg: &DiscordTargetsConfig,
+) -> ProcessedUtterance {
+    process_transcript_full(
+        raw,
+        filter_cfg,
+        cmd_cfg,
+        targets_cfg,
+        &[],
+        &[],
+        false,
+        false,
+    )
 }
 
 #[cfg(test)]

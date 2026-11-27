@@ -1104,3 +1104,132 @@ input[type="range"] {
   padding: 5px 8px;
   font-size: 12.5px;
 }
+
+.topbar-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.btn-warning {
+  background: #f0b232;
+  color: #1e1f22;
+  border: none;
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.btn-warning:hover {
+  background: #ffd166;
+}
+.btn-panic-on {
+  background: #da373c !important;
+  color: #fff !important;
+}
+
+.panic-masked {
+  filter: blur(5px);
+  user-select: none;
+}
+
+.streaming-preview-line {
+  display: none;
+  font-size: 12px;
+  color: #a5b4fc;
+  background: rgba(88, 101, 242, 0.14);
+  border-left: 3px solid var(--accent);
+  padding: 4px 8px;
+  border-radius: 4px;
+  margin-bottom: 6px;
+}
+.streaming-preview-line.show {
+  display: block;
+}
+
+.hw-card {
+  background: var(--bg-darkest);
+  border: 1px solid rgba(88, 101, 242, 0.35);
+  border-radius: 8px;
+  padding: 12px;
+  margin-bottom: 12px;
+}
+
+.catalog-category-title {
+  margin: 14px 0 8px;
+  font-size: 13px;
+  font-weight: 700;
+  color: #c2c9ff;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 4px;
+}
+
+.catalog-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(310px, 1fr));
+  gap: 10px;
+}
+
+.model-card {
+  background: var(--bg-darkest);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.model-card.in-use {
+  border-color: #23a55a;
+}
+
+.model-benefits {
+  margin: 0;
+  padding-left: 16px;
+  font-size: 11.5px;
+  color: var(--text);
+  line-height: 1.4;
+}
+
+.model-meta-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  align-items: center;
+}
+
+.score-bars {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 4px;
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
+
+.bench-item {
+  background: var(--bg-darkest);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-bottom: 6px;
+}
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.stat-kpi {
+  background: var(--bg-darkest);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+.stat-kpi .kpi-val {
+  font-size: 17px;
+  font-weight: 700;
+  color: #fff;
+}

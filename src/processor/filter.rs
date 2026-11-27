@@ -1,5 +1,92 @@
-use crate::config::TextFilterConfig;
+use crate::config::{EmojiAlias, SnippetMacro, TextFilterConfig};
 use regex::Regex;
+
+/// Cleans mild Japanese stuttering ("そ、それで" / "あ、あの") (#8).
+pub fn cleanup_stutter(raw: &str) -> String {
+    let mut s = raw.trim().to_string();
+    if let Ok(re) = Regex::new(r"(?u)([ぁ-んァ-ヶ]{1,2})[、,]\s*([ぁ-んァ-ヶ]{2,})") {
+        // Collapse repeated mora prefixes like "そ、それで" -> "それで"
+        let out = re.replace_all(&s, |caps: &regex::Captures| {
+            let head = &caps[1];
+            let body = &caps[2];
+            if body.starts_with(head) {
+                body.to_string()
+            } else {
+                caps[0].to_string()
+            }
+        });
+        s = out.into_owned();
+    }
+    s
+}
+
+/// Expands registered snippet macros ("合言葉定型" -> long template) (#10).
+pub fn expand_snippet_macros(raw: &str, snippets: &[SnippetMacro]) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || snippets.is_empty() {
+        return raw.to_string();
+    }
+    for sn in snippets {
+        let trg = sn.trigger.trim();
+        if trg.is_empty() {
+            continue;
+        }
+        if trimmed.eq_ignore_ascii_case(trg)
+            || crate::processor::phonetic::to_normalized_mora(trimmed)
+                == crate::processor::phonetic::to_normalized_mora(trg)
+        {
+            return sn.expansion.clone();
+        }
+        if let Some(rest) = trimmed.strip_prefix(trg) {
+            let rest_t = rest.trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '、' | ','));
+            if rest_t.is_empty() {
+                return sn.expansion.clone();
+            }
+            return format!("{}\n{}", sn.expansion, rest_t);
+        }
+    }
+    raw.to_string()
+}
+
+/// Replaces spoken emoji/stamp triggers ("くさスタンプ" -> "🌿") (#12).
+pub fn apply_emoji_aliases(raw: &str, aliases: &[EmojiAlias]) -> String {
+    let mut out = raw.to_string();
+    for al in aliases {
+        let s = al.spoken.trim();
+        if !s.is_empty() && !al.emoji.trim().is_empty() {
+            out = out.replace(s, al.emoji.trim());
+        }
+    }
+    out
+}
+
+/// Applies voice-triggered Discord markdown & spoiler formatting (#24):
+/// "ネタバレ 〇〇" -> "||〇〇||", "強調 〇〇" -> "**〇〇**", "コード 〇〇" -> "`〇〇`", "引用 〇〇" -> "> 〇〇".
+pub fn apply_discord_markdown_commands(raw: &str) -> String {
+    let t = raw.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    let rules: &[(&str, &str, &str)] = &[
+        ("ネタバレ", "||", "||"),
+        ("スポイラー", "||", "||"),
+        ("強調", "**", "**"),
+        ("太字", "**", "**"),
+        ("コード", "`", "`"),
+        ("引用", "> ", ""),
+    ];
+    for &(prefix, wrap_l, wrap_r) in rules {
+        if let Some(rest) = t.strip_prefix(prefix) {
+            let body = rest
+                .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '、' | ',' | '：' | ':'))
+                .trim();
+            if !body.is_empty() {
+                return format!("{}{}{}", wrap_l, body, wrap_r);
+            }
+        }
+    }
+    raw.to_string()
+}
 
 /// Removes configured fillers and applies custom dictionary replacements.
 /// Punctuation rules are applied separately after command parsing so period insertion
@@ -138,5 +225,28 @@ mod tests {
         cfg.append_period = true;
         assert_eq!(apply_punctuation_rules("了解", &cfg), "了解。");
         assert_eq!(apply_punctuation_rules(":nice:", &cfg), ":nice:");
+    }
+
+    #[test]
+    fn expands_stutter_snippets_emojis_and_markdown() {
+        assert_eq!(cleanup_stutter("そ、それでさ"), "それでさ");
+        let sn = vec![SnippetMacro {
+            id: "s1".into(),
+            trigger: "集合合図".into(),
+            expansion: "@everyone 21時から集合お願いします！".into(),
+        }];
+        assert_eq!(
+            expand_snippet_macros("集合合図", &sn),
+            "@everyone 21時から集合お願いします！"
+        );
+        let em = vec![EmojiAlias {
+            spoken: "いいね絵文字".into(),
+            emoji: "👍".into(),
+        }];
+        assert_eq!(apply_emoji_aliases("ナイスいいね絵文字", &em), "ナイス👍");
+        assert_eq!(apply_discord_markdown_commands("ネタバレ 黒幕は犯人"), "||黒幕は犯人||");
+        assert_eq!(apply_discord_markdown_commands("強調 重要"), "**重要**");
+        assert_eq!(apply_discord_markdown_commands("コード cargo test"), "`cargo test`");
+        assert_eq!(apply_discord_markdown_commands("引用 了解"), "> 了解");
     }
 }

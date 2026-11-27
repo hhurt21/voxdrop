@@ -37,6 +37,7 @@ pub struct VadSegmenter {
     speech_peak_rms: f32,
     max_neural_prob: f32,
     silero_seen: bool,
+    last_preview_samples: usize,
     // Optional explicit 2-second room calibration state
     calibrating: bool,
     calib_samples_left: usize,
@@ -58,6 +59,7 @@ impl VadSegmenter {
             speech_peak_rms: 0.0,
             max_neural_prob: 0.0,
             silero_seen: false,
+            last_preview_samples: 0,
             calibrating: false,
             calib_samples_left: 0,
             calib_rms_values: Vec::new(),
@@ -81,6 +83,22 @@ impl VadSegmenter {
         self.speech_peak_rms = 0.0;
         self.max_neural_prob = 0.0;
         self.silero_seen = false;
+        self.last_preview_samples = 0;
+    }
+
+    /// Returns a non-destructive 16kHz snapshot of the ongoing utterance every `interval_ms` (#7)
+    /// once the utterance exceeds 2.0 seconds, so the mini HUD can show live interim text!
+    pub fn take_streaming_preview_if_ready(&mut self, interval_ms: u64) -> Option<Vec<f32>> {
+        if !self.in_speech || self.utterance.len() < ms_to_samples(2000) {
+            return None;
+        }
+        let step = ms_to_samples(interval_ms.clamp(900, 5000));
+        if self.utterance.len().saturating_sub(self.last_preview_samples) >= step {
+            self.last_preview_samples = self.utterance.len();
+            Some(self.utterance.clone())
+        } else {
+            None
+        }
     }
 
     /// Starts an explicit ambient noise calibration window (e.g. 2000ms of room silence).
@@ -264,6 +282,7 @@ impl VadSegmenter {
                 self.speech_peak_rms = 0.0;
                 self.max_neural_prob = 0.0;
                 self.silero_seen = false;
+                self.last_preview_samples = 0;
 
                 if reached_max && !buf.is_empty() {
                     // Carry 320ms overlap into pre_roll so continuous speech split at max_utterance never drops words

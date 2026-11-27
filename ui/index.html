@@ -54,14 +54,18 @@
         <header class="topbar">
           <div class="status-pills">
             <span class="pill" id="pillListen">停止中</span>
-            <span class="pill" id="pillRnnoise">RNNoise: ON</span>
+            <span class="pill" id="pillPhase">待機</span>
+            <span class="pill" id="pillRnnoise">ノイズ抑制: ON</span>
             <span class="pill" id="pillDiscordTarget">宛先: 現在の画面</span>
             <span class="pill" id="pillTarget">ガード: 待機</span>
             <span class="pill" id="pillStt">STT: 読み込み中...</span>
             <span class="pill" id="pillSttDevice">推論: -</span>
+            <span class="pill" id="pillEnvMode" style="display: none"></span>
             <span class="pill ok" id="pillGameProfile" style="display: none"></span>
           </div>
           <div class="topbar-actions">
+            <button class="btn-secondary btn-sm" id="btnTargetLock" title="音声コマンドや自動検出による宛先変更を禁止します">🔓 宛先ロック</button>
+            <button class="btn-secondary btn-sm" id="btnPanicMute" title="配信中の誤認識事故を防ぐため、録音停止＆機密情報をマスクします">🛡 配信セーフ</button>
             <button class="btn-secondary btn-sm" id="btnToggleOverlay">ミニHUD切替</button>
             <button class="btn-primary btn-sm" id="btnSaveAll">設定を保存</button>
           </div>
@@ -69,6 +73,16 @@
 
         <!-- Dashboard Tab -->
         <section class="tab-panel active" id="tab-dashboard">
+          <div id="updateBanner" class="url-banner" style="display: none">
+            <div class="confirm-text">
+              <strong id="updateTitle">VoxDrop の新しいバージョンが公開されています</strong>
+              <span id="updateSub"></span>
+            </div>
+            <div class="row gap-sm">
+              <a id="updateOpenLink" href="#" target="_blank" class="btn-primary btn-sm" style="text-decoration: none">リリースページを開く</a>
+              <button class="btn-secondary btn-sm" id="btnDismissUpdate">閉じる</button>
+            </div>
+          </div>
           <div id="urlDetectBanner" class="url-banner" style="display: none">
             <div class="confirm-text">
               <strong id="urlDetectTitle">Discord リンクを検出しました</strong>
@@ -183,9 +197,29 @@
                 <div class="row space-between">
                   <label class="checkbox-row">
                     <input type="checkbox" id="chkNcEnabled" />
-                    <span>高性能ノイズ抑制 (RNNoise)</span>
+                    <span>高性能ノイズ抑制 (2系統独立エンジン)</span>
                   </label>
                   <span class="pill" id="ncLiveBadge">待機</span>
+                </div>
+                <div class="form-grid" style="margin-top: 8px">
+                  <label class="small-label">VAD判定側ノイズ抑制 (低遅延)
+                    <select id="ncVadEngine" class="input">
+                      <option value="gtcrn-16k">GTCRN 16kHz (最軽量・高速)</option>
+                      <option value="dpdfnet-16k">DPDFNet2 16kHz (高精度・DirectML/CPU)</option>
+                      <option value="rnnoise">RNNoise 48kHz (同梱標準)</option>
+                      <option value="off-hpf">バイパス (85Hzハイパスのみ)</option>
+                    </select>
+                  </label>
+                  <label class="small-label">STT推論側ノイズ抑制 (高音質・語頭保護)
+                    <select id="ncSttEngine" class="input">
+                      <option value="dpdfnet-16k">DPDFNet2 16kHz (推奨・DirectML/CPU)</option>
+                      <option value="dpdfnet-48k">DPDFNet 48kHz (最高音質・外部)</option>
+                      <option value="gtcrn-16k">GTCRN 16kHz (軽量AI)</option>
+                      <option value="deepfilternet3">DeepFilterNet3 外部CLI</option>
+                      <option value="rnnoise">RNNoise 48kHz (同梱標準)</option>
+                      <option value="off-hpf">バイパス (85Hzハイパスのみ)</option>
+                    </select>
+                  </label>
                 </div>
                 <div class="row space-between" style="margin-top: 6px">
                   <span class="small-label">AI発話確率: <strong id="vadProbVal">0%</strong></span>
@@ -195,6 +229,14 @@
                   <div class="meter-bar ai-bar" id="vadProbBar"></div>
                 </div>
                 <input type="range" id="ncStrength" min="0" max="1" step="0.05" value="1" />
+                <div class="form-grid" style="margin-top: 6px">
+                  <label class="small-label">DPDFNet残響ガード (dB): <strong id="ncDpdfLimitVal">-18</strong> dB
+                    <input type="range" id="ncDpdfLimit" min="-40" max="0" step="1" value="-18" />
+                  </label>
+                  <label class="small-label">子音Presence EQ (3.6kHz): <strong id="ncPresenceEqVal">55%</strong>
+                    <input type="range" id="ncPresenceEq" min="0" max="1" step="0.05" value="0.55" />
+                  </label>
+                </div>
                 <div class="row gap-sm" style="margin-top: 6px; flex-wrap: wrap">
                   <label class="checkbox-row small-check">
                     <input type="checkbox" id="chkNcRadioClarity" />
@@ -225,6 +267,7 @@
                 <button class="btn-success btn-sm" id="btnForceSend">今すぐ送信</button>
               </div>
             </div>
+            <div id="streamingPreviewLine" class="streaming-preview-line"></div>
             <textarea
               id="draftBox"
               class="draft-area"
@@ -687,6 +730,18 @@
                 <input type="checkbox" id="chkAppendPeriod" />
                 <span>末尾に句点「。」を自動付与</span>
               </label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkStutterCleanup" />
+                <span>言い直し・吃音（「あ、あ、あれ」）を整理</span>
+              </label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkPhoneticFuzzy" />
+                <span>音韻（モーラ）類似マッチでコマンド/辞書を補助</span>
+              </label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkAutoLearnRespeak" />
+                <span>キャンセル後の言い直しパターンを自動学習</span>
+              </label>
             </div>
             <label style="margin-top: 12px; display: block">
               フィラー語句リスト（カンマ区切り）
@@ -700,6 +755,31 @@
               <button class="btn-primary btn-sm" id="btnAddDict">+ 追加</button>
             </div>
             <div id="dictRows" class="dict-rows"></div>
+          </div>
+
+          <div class="grid-2">
+            <div class="card">
+              <div class="row space-between">
+                <h3>定型文スニペットマクロ</h3>
+                <button class="btn-primary btn-sm" id="btnAddSnippet">+ 追加</button>
+              </div>
+              <p class="hint">設定したトリガー名を発話すると定型文へ展開します。</p>
+              <div id="snippetRows" class="dict-rows"></div>
+            </div>
+            <div class="card">
+              <div class="row space-between">
+                <h3>音声絵文字リアクション辞書</h3>
+                <button class="btn-primary btn-sm" id="btnAddEmojiAlias">+ 追加</button>
+              </div>
+              <p class="hint">例: 「くさ」→「😂」「ぐっじょぶ」→「👍」</p>
+              <div id="emojiAliasRows" class="dict-rows"></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3>自動学習された言い直し癖辞書</h3>
+            <p class="hint">「取り消し」直後に言い直して送信したペアが記録されます。</p>
+            <div id="speechHabitsList" class="dict-rows"></div>
           </div>
         </section>
 
@@ -736,6 +816,14 @@
                 <input type="checkbox" id="chkGuardEnabled" />
                 <span>ホワイトリスト以外のアプリへの誤送信をブロックする（安全ガード）</span>
               </label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkTargetLocked" />
+                <span>宛先ロックを有効化（音声「合言葉〇〇」等による勝手な宛先切替を禁止）</span>
+              </label>
+            </div>
+            <div style="margin-top: 10px">
+              <div class="small-label">送信前に二重確認を必須にする相手（慎重対象 #13）:</div>
+              <div id="carefulTargetsBox" class="row gap-sm" style="margin-top: 6px; flex-wrap: wrap"></div>
             </div>
             <div class="form-grid" style="margin-top: 12px">
               <label>許可プロセス名（カンマ区切り）
@@ -803,6 +891,15 @@
                   <option value="window_message">ウィンドウメッセージ送信 (DirectInput干渉回避)</option>
                   <option value="safe_when_game_active">Discord最前面時のみ自動送信</option>
                   <option value="no_send_input">自動キー送信なし (クリップボードのみ)</option>
+                </select>
+              </label>
+              <label>文体プリセット（LLM補正時）
+                <select id="gpSpeechStyle" class="input">
+                  <option value="">全体設定を使用</option>
+                  <option value="normal">標準（誤字のみ最小修正）</option>
+                  <option value="casual">フレンド向けタメ口チャット</option>
+                  <option value="polite">丁寧語（です・ます）</option>
+                  <option value="game_short">ゲーム通話向け簡潔報告</option>
                 </select>
               </label>
               <div class="row gap-sm">
@@ -966,24 +1063,159 @@
           </div>
 
           <div class="card">
-            <div class="row space-between">
-              <h3>外部モデルダウンローダー（オンデマンド・models/ 配置）</h3>
-              <span class="pill" id="qwen3StatusBadge">Qwen3-ASR: 未導入</span>
-            </div>
-            <p class="hint">
-              モデル本体は実行ファイルへ同梱せず <code>models/</code> フォルダへ取得します。ダウンロード中は通信が進みます。
-            </p>
-            <div class="row gap-sm" style="margin-top: 8px; flex-wrap: wrap">
-              <button type="button" class="btn-primary btn-sm" data-download-model="qwen3-asr-0.6b-int8">Qwen3-ASR-0.6B int8 (DirectML/CPU)</button>
-              <button type="button" class="btn-secondary btn-sm" data-download-model="whisper-large-v3-q8">Whisper Large-v3 (Q8_0)</button>
-              <button type="button" class="btn-secondary btn-sm" data-download-model="whisper-large-v3-turbo-q8">Whisper Large-v3-Turbo (Q8_0)</button>
-              <button type="button" class="btn-secondary btn-sm" data-download-model="parakeet-ja-int8">Parakeet-JA int8</button>
+            <h3>6層 極限認識パイプライン設定（早口・不明瞭・長文対策）</h3>
+            <div class="toggle-grid">
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkWsolaEnabled" />
+                <span>早口自動検出 &amp; 音程維持スローダウン再生 (WSOLA)</span>
+              </label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkWsolaAutoFast" />
+                <span>速いと判定された発話だけ自動減速する</span>
+              </label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkOverlapEnabled" />
+                <span>長文オーバーラップチャンク分割 &amp; あいまい結合</span>
+              </label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkTempFallback" />
+                <span>温度フォールバック再推論 (0.0→0.2→0.4)</span>
+              </label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkTwoPassRescue" />
+                <span>不安定認識の自動2パスレスキュー</span>
+              </label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkUltimateEnsemble" />
+                <span>究極2エンジン合議モード (STT1 + STT2)</span>
+              </label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkContextPrompt" />
+                <span>リアルタイム文脈・直前メッセージ Prompt 注入</span>
+              </label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkStreamingPreview" />
+                <span>発話中ストリーミング暫定プレビュー表示</span>
+              </label>
             </div>
             <div class="form-grid" style="margin-top: 10px">
-              <label>カスタム HTTPS URL（.bin / .tar.bz2）
+              <label>WSOLA 減速倍率 (0.65〜1.00): <strong id="wsolaRateVal">0.84x</strong>
+                <input type="range" id="wsolaRate" min="0.65" max="1.0" step="0.01" value="0.84" />
+              </label>
+              <label>ビーム探索幅 (1〜5)
+                <input type="number" id="beamSize" class="input" min="1" max="5" value="3" />
+              </label>
+              <label>語頭無音パディング (ms)
+                <input type="number" id="headPadMs" class="input" min="100" max="600" value="220" />
+              </label>
+              <label>語尾無音パディング (ms)
+                <input type="number" id="tailPadMs" class="input" min="150" max="700" value="300" />
+              </label>
+              <label>長文分割しきい値 (秒)
+                <input type="number" id="overlapThresholdSec" class="input" min="6" max="30" step="1" value="12" />
+              </label>
+              <label>オーバーラップ秒数
+                <input type="number" id="overlapSec" class="input" min="0.5" max="4" step="0.25" value="1.5" />
+              </label>
+              <label>合議用サブSTTエンジン (STT2)
+                <select id="secondaryEngine" class="input">
+                  <option value="sherpa-qwen3">sherpa-onnx Qwen3-ASR (DirectML/CPU)</option>
+                  <option value="whisper-cpp">whisper.cpp (Vulkan/CPU)</option>
+                  <option value="sherpa-onnx">sherpa-onnx (SenseVoice/Zipformer)</option>
+                  <option value="local-http">Local HTTP ASR</option>
+                </select>
+              </label>
+              <label>暫定プレビュー間隔 (ms)
+                <input type="number" id="streamingIntervalMs" class="input" min="800" max="4000" step="100" value="1700" />
+              </label>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="row space-between">
+              <h3>ローカルLLM 誤認識・空耳ポストコレクタ（OpenAI互換 / Vulkan）</h3>
+              <span class="pill" id="llmStatusBadge">未確認</span>
+            </div>
+            <div class="toggle-grid" style="margin-top: 8px">
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkLlmEnabled" />
+                <span>認識後の誤字・空耳をローカルLLMで文脈補正する</span>
+              </label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkLlmAutoLaunch" />
+                <span>有効時に llama-server 等を自動起動</span>
+              </label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkLlmStopExit" />
+                <span>終了時に自動停止</span>
+              </label>
+            </div>
+            <div class="form-grid" style="margin-top: 8px">
+              <label>LLM Base URL
+                <input type="text" id="llmBaseUrl" class="input" placeholder="http://127.0.0.1:8081" />
+              </label>
+              <label>Endpoint Path
+                <input type="text" id="llmEndpointPath" class="input" placeholder="/v1/chat/completions" />
+              </label>
+              <label>モデル識別子
+                <input type="text" id="llmModel" class="input" placeholder="qwen3-1.7b" />
+              </label>
+              <label>文体スタイル
+                <select id="llmStyle" class="input">
+                  <option value="normal">標準（誤字のみ最小修正）</option>
+                  <option value="casual">フレンド向けタメ口</option>
+                  <option value="polite">丁寧語（です・ます）</option>
+                  <option value="game_short">ゲーム通話向け簡潔</option>
+                </select>
+              </label>
+              <label>LLM実行ファイル (llama-server.exe 等)
+                <input type="text" id="llmExePath" class="input" />
+              </label>
+              <label>起動引数 (Vulkan GPU / -m models\...)
+                <input type="text" id="llmArgs" class="input" />
+              </label>
+              <label>タイムアウト (ms)
+                <input type="number" id="llmTimeoutMs" class="input" min="250" max="10000" value="1800" />
+              </label>
+              <label>API Key（任意）
+                <input type="password" id="llmApiKey" class="input" />
+              </label>
+            </div>
+            <div class="row gap-sm" style="margin-top: 8px">
+              <button type="button" class="btn-secondary btn-sm" id="btnTestLlm">LLM接続テスト</button>
+              <button type="button" class="btn-primary btn-sm" id="btnLaunchLlm">LLMサーバー起動</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="row space-between">
+              <h3>ハードウェア診断ウィザード &amp; 統合モデルカタログ（個別削除対応）</h3>
+              <div class="row gap-sm">
+                <span class="pill" id="qwen3StatusBadge">Qwen3-ASR: 未導入</span>
+                <button type="button" class="btn-secondary btn-sm" id="btnRefreshCatalog">カタログ更新</button>
+              </div>
+            </div>
+            <div id="hwSummaryCard" class="hw-card">
+              <div class="row space-between" style="flex-wrap: wrap; gap: 8px">
+                <div>
+                  <strong id="hwGpuName">GPU/CPU 診断中...</strong>
+                  <div class="small-label" id="hwSummaryNote">CUDA不要・Vulkan / DirectML で自動判定します</div>
+                </div>
+                <div class="row gap-sm">
+                  <button type="button" class="btn-primary btn-sm" id="btnApplyWizard">最適構成を1クリック適用</button>
+                  <button type="button" class="btn-secondary btn-sm" id="btnStartCalibrationWizard">15秒滑舌診断</button>
+                </div>
+              </div>
+              <div id="calibrationResultBox" class="ab-result" style="margin-top: 8px"></div>
+            </div>
+
+            <div id="modelCatalogContainer"></div>
+
+            <div class="form-grid" style="margin-top: 12px">
+              <label>カスタム HTTPS URL（.bin / .onnx / .gguf / .tar.bz2）
                 <input type="text" id="customModelUrl" class="input" placeholder="https://..." />
               </label>
-              <label>保存ファイル名（任意・.bin 等）
+              <label>保存ファイル名（任意）
                 <input type="text" id="customModelFilename" class="input" placeholder="custom-model.bin" />
               </label>
             </div>
@@ -994,6 +1226,59 @@
               <div class="small-label" id="dlProgressText">準備中...</div>
               <div class="countdown-track">
                 <div id="dlProgressBar" class="countdown-fill"></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="grid-2">
+            <div class="card">
+              <h3>マイク冗長フォールバック &amp; 夜間サイレントモード</h3>
+              <label style="display: block">フォールバック用予備マイク名（カンマ区切り・優先順）
+                <input type="text" id="audioFallbacksInput" class="input" placeholder="ヘッドセットマイク, 卓上マイク" />
+              </label>
+              <div class="toggle-grid" style="margin-top: 10px">
+                <label class="checkbox-row">
+                  <input type="checkbox" id="chkNightEnabled" />
+                  <span>夜間自動サイレント（TTS音量抑制・小声閾値）</span>
+                </label>
+              </div>
+              <div class="form-grid" style="margin-top: 8px">
+                <label>開始時 (0-23時)
+                  <input type="number" id="nightStartHour" class="input" min="0" max="23" value="23" />
+                </label>
+                <label>終了時 (0-23時)
+                  <input type="number" id="nightEndHour" class="input" min="0" max="23" value="6" />
+                </label>
+                <label>夜間TTS音量倍率 (0.1〜1.0)
+                  <input type="number" id="nightTtsScale" class="input" min="0.1" max="1" step="0.05" value="0.45" />
+                </label>
+              </div>
+            </div>
+
+            <div class="card">
+              <h3>VRAM安全ウォッチャー / 省電力 &amp; バックアップ</h3>
+              <div class="toggle-grid">
+                <label class="checkbox-row">
+                  <input type="checkbox" id="chkVramWatchdog" />
+                  <span>VRAM高負荷時に自動軽量化（ゲームFPS保護）</span>
+                </label>
+                <label class="checkbox-row">
+                  <input type="checkbox" id="chkBatteryEco" />
+                  <span>バッテリー駆動時に自動Ecoモード（CPUスレッド制限）</span>
+                </label>
+              </div>
+              <div class="form-grid" style="margin-top: 8px">
+                <label>VRAMしきい値 (%)
+                  <input type="number" id="vramThresholdPct" class="input" min="60" max="98" value="88" />
+                </label>
+                <label>Eco時スレッド数
+                  <input type="number" id="ecoThreads" class="input" min="1" max="8" value="2" />
+                </label>
+              </div>
+              <div class="row gap-sm" style="margin-top: 10px; flex-wrap: wrap">
+                <button type="button" class="btn-secondary btn-sm" id="btnExportBackup">設定＆辞書バックアップ(JSON)</button>
+                <button type="button" class="btn-secondary btn-sm" id="btnImportBackup">バックアップから復元</button>
+                <input type="file" id="backupFileInput" accept=".json" style="display: none" />
               </div>
             </div>
           </div>
@@ -1036,6 +1321,33 @@
             <h3>直近の発話診断 (最大5件)</h3>
             <div id="diagnosticsList" class="diag-list">
               <div class="empty-state">まだ診断データがありません。発話するとここに録音時間・ピークdBFS・推論時間・RTFが表示されます。</div>
+            </div>
+          </div>
+
+          <div class="grid-2">
+            <div class="card">
+              <div class="row space-between">
+                <h3>録音WAVベンチマーク &amp; 自動パラメータ探索</h3>
+                <div class="row gap-sm">
+                  <button type="button" class="btn-primary btn-sm" id="btnRunBenchmark">一括テスト実行</button>
+                  <button type="button" class="btn-secondary btn-sm" id="btnRunAutoTuner">最適パラメータ探索</button>
+                </div>
+              </div>
+              <p class="hint">発話診断カードの「ベンチ保存」で正解テキスト付きのテスト音声を保存し、EQ/WSOLA/Beamを自動評価できます。</p>
+              <div id="autoTunerProposalBox" class="ab-result"></div>
+              <div id="benchResultBox" class="ab-result"></div>
+              <div id="benchCasesList" style="margin-top: 8px"></div>
+            </div>
+
+            <div class="card">
+              <div class="row space-between">
+                <h3>ローカル認識統計ダッシュボード</h3>
+                <div class="row gap-sm">
+                  <button type="button" class="btn-secondary btn-sm" id="btnRefreshStats">更新</button>
+                  <button type="button" class="btn-danger btn-sm" id="btnResetStats">リセット</button>
+                </div>
+              </div>
+              <div id="statsSummaryBox"></div>
             </div>
           </div>
         </section>

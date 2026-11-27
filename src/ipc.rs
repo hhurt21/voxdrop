@@ -1,4 +1,9 @@
 use crate::config::{ActivationMode, AppConfig, InputMode};
+use crate::gpu_diag::HardwareProfile;
+use crate::stats::{
+    AutoTunerProposal, BenchmarkCase, BenchmarkCaseResult, StatsSummaryDto,
+};
+use crate::stt::catalog::ModelCatalogItemDto;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +59,24 @@ pub enum ClientCommand {
     },
     TestHttpAsr { base_url: Option<String> },
     LaunchHttpAsr,
+    TestLlmCorrector { base_url: Option<String> },
+    LaunchLlmServer,
+    GetCatalogInventory,
+    DeleteModel { model_id: String },
+    ApplyWizardRecommendation,
+    SaveBenchmarkCase { diag_id: u64, expected_text: String },
+    DeleteBenchmarkCase { id: String },
+    RunBenchmarkSuite,
+    RunAutoTuner,
+    ApplyAutoTuner { eq_strength: f32, wsola_rate: f32, beam_size: i32 },
+    StartCalibrationWizard,
+    TogglePanicSafeMode,
+    ToggleTargetLock,
+    ExportBackup,
+    ImportBackup { json: String },
+    GetStats,
+    ResetStats,
+    CheckAppUpdate,
     ToggleOverlay,
     SetOverlayClickThrough { click_through: bool },
     DragOverlay,
@@ -158,6 +181,57 @@ pub enum BackendEvent {
         active_discord_target_id: Option<String>,
         active_discord_target_label: String,
         active_profile: Option<String>,
+        phase: String,
+        panic_mode: bool,
+        target_locked: bool,
+        noise_vad_engine: String,
+        noise_stt_engine: String,
+        night_mode_active: bool,
+        eco_mode_active: bool,
+        portable_mode: bool,
+    },
+    StreamingPreview {
+        draft: String,
+    },
+    CatalogInventory {
+        hardware: HardwareProfile,
+        items: Vec<ModelCatalogItemDto>,
+    },
+    StatsUpdated {
+        summary: StatsSummaryDto,
+    },
+    BenchmarkCasesUpdated {
+        cases: Vec<BenchmarkCase>,
+    },
+    BenchmarkSuiteResult {
+        results: Vec<BenchmarkCaseResult>,
+        avg_similarity: f32,
+    },
+    AutoTunerResult {
+        proposal: AutoTunerProposal,
+    },
+    CalibrationWizardResult {
+        score_note: String,
+        recommended_vad: f32,
+        recommended_eq: f32,
+        recommended_wsola: bool,
+        recommended_model: String,
+    },
+    BackupExported {
+        json: String,
+    },
+    AppUpdateAvailable {
+        current_tag: String,
+        latest_tag: String,
+        url: String,
+    },
+    LlmHealthResult {
+        ok: bool,
+        message: String,
+    },
+    PostSendError {
+        code: String,
+        detail: String,
     },
     AudioDevices {
         devices: Vec<String>,

@@ -161,12 +161,27 @@ pub fn navigate_and_focus_discord_target(
             let _ = discord::open_deep_link(&link);
             thread::sleep(Duration::from_millis(navigate_delay_ms.clamp(120, 1000)));
         }
-        let _ = window::ensure_allowed_foreground_ex(allowed, 700, false);
-        let _ = uia::focus_discord_chat_input_no_mouse(allowed, 500);
-        return Ok(format!(
-            "{}（ウィンドウメッセージ送信: SendInput不使用）",
-            discord::target_display_label(Some(target))
-        ));
+        let _ = window::ensure_allowed_foreground_ex(allowed, 800, false);
+        let render_hwnd = window::find_discord_render_hwnd(allowed).map(|(_, r)| r);
+        // Step 2: Detect & dismiss profile modal / invoke "メッセージ" button zero-mouse!
+        let _ = uia::recover_from_profile_modal_no_mouse(allowed, render_hwnd, 1100);
+        // Step 3-4: Strict composer filter + SetFocus() + HasKeyboardFocus poll!
+        let focus_res = uia::focus_main_composer_verified_no_mouse(allowed, 550);
+        let new_title = uia::get_discord_window_title(allowed).unwrap_or_default();
+        if let Ok(mut g) = LAST_NAVIGATED.lock() {
+            *g = Some((target.id.clone(), new_title));
+        }
+        return match focus_res {
+            Ok(()) => Ok(format!(
+                "{}（PostMessage送信準備完了: 入力欄フォーカス確定）",
+                discord::target_display_label(Some(target))
+            )),
+            Err(code) => Ok(format!(
+                "{}（PostMessage遷移注意 [{}]）",
+                discord::target_display_label(Some(target)),
+                code
+            )),
+        };
     }
     if guard.send_method == SendMethod::NoSendInput
         || (guard.send_method == SendMethod::SafeWhenGameActive && !already_allowed)
@@ -260,13 +275,23 @@ pub fn send_to_discord_target(
     integration: &DiscordIntegrationConfig,
 ) -> Result<String, String> {
     let formatted = discord::format_message_for_target(text, target);
+    let chunks = if formatted.is_empty() {
+        Vec::new()
+    } else {
+        discord::split_message_for_discord(&formatted, 1950)
+    };
 
     if let Some(t) = target {
         if press_enter && !t.webhook_url.trim().is_empty() {
-            if formatted.is_empty() {
+            if chunks.is_empty() {
                 return Ok("送信テキストが空のためスキップしました".into());
             }
-            discord::send_via_webhook(&t.webhook_url, &formatted)?;
+            for (idx, chunk) in chunks.iter().enumerate() {
+                discord::send_via_webhook(&t.webhook_url, chunk)?;
+                if idx + 1 < chunks.len() {
+                    thread::sleep(Duration::from_millis(120));
+                }
+            }
             return Ok(format!(
                 "{} へWebhook直接送信しました",
                 discord::target_display_label(Some(t))
@@ -279,10 +304,15 @@ pub fn send_to_discord_target(
             && t.kind == DiscordTargetKind::Channel
             && !t.channel_id.trim().is_empty()
         {
-            if formatted.is_empty() {
+            if chunks.is_empty() {
                 return Ok("送信テキストが空のためスキップしました".into());
             }
-            discord::send_via_bot_api(&integration.bot_token, &t.channel_id, &formatted)?;
+            for (idx, chunk) in chunks.iter().enumerate() {
+                discord::send_via_bot_api(&integration.bot_token, &t.channel_id, chunk)?;
+                if idx + 1 < chunks.len() {
+                    thread::sleep(Duration::from_millis(120));
+                }
+            }
             return Ok(format!(
                 "{} へ公式Bot直接送信しました",
                 discord::target_display_label(Some(t))
@@ -295,7 +325,7 @@ pub fn send_to_discord_target(
     let (already_allowed, _) = check_target(guard);
 
     if guard.send_method == SendMethod::WindowMessage {
-        if formatted.is_empty() && !press_enter {
+        if chunks.is_empty() && !press_enter {
             return Ok("送信テキストが空のためスキップしました".into());
         }
         if let Some(t) = target {
@@ -303,28 +333,85 @@ pub fn send_to_discord_target(
                 let _ = navigate_and_focus_discord_target(t, guard, navigate_delay_ms, true);
             }
         }
-        let focused = if already_allowed {
+        let focused_win = if already_allowed {
             true
         } else {
             window::ensure_allowed_foreground_ex(&guard.allowed_processes, 900, false).is_ok()
         };
-        let _ = uia::focus_discord_chat_input_no_mouse(&guard.allowed_processes, 350);
 
-        if focused {
-            if let Some((_, render_hwnd)) =
-                window::find_discord_render_hwnd(&guard.allowed_processes)
-            {
-                let res = input::post_text_window_message(render_hwnd, &formatted, press_enter);
+        let render_hwnd_opt = window::find_discord_render_hwnd(&guard.allowed_processes).map(|(_, r)| r);
+        if focused_win {
+            // Recover automatically if a user profile modal/popout opened instead of DM chat!
+            if let Err(code) = uia::recover_from_profile_modal_no_mouse(
+                &guard.allowed_processes,
+                render_hwnd_opt,
+                900,
+            ) {
+                if !formatted.is_empty() {
+                    let _ = input::copy_text_to_clipboard_only(&formatted);
+                }
+                return Err(format!(
+                    "PostMessage送信失敗 [{}]: プロフィールモーダルからDM入力欄へ遷移できませんでした（クリップボードへ退避済み）",
+                    code
+                ));
+            }
+            if let Err(code) = uia::focus_main_composer_verified_no_mouse(&guard.allowed_processes, 550) {
+                if !formatted.is_empty() {
+                    let _ = input::copy_text_to_clipboard_only(&formatted);
+                }
+                return Err(format!(
+                    "PostMessage送信失敗 [{}]: チャット入力欄のキーボードフォーカス確定に失敗（クリップボードへ退避済み）",
+                    code
+                ));
+            }
+
+            if let Some(render_hwnd) = render_hwnd_opt {
+                for (idx, chunk) in chunks.iter().enumerate() {
+                    let mut inserted = false;
+                    for attempt in 0..2 {
+                        if attempt > 0 {
+                            let _ = uia::focus_main_composer_verified_no_mouse(
+                                &guard.allowed_processes,
+                                350,
+                            );
+                        }
+                        input::post_chars_window_message(render_hwnd, chunk)?;
+                        thread::sleep(Duration::from_millis(80));
+                        match uia::read_main_composer_text_no_mouse(&guard.allowed_processes) {
+                            Some(val) if val.trim().is_empty() => {
+                                continue;
+                            }
+                            _ => {
+                                inserted = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !inserted {
+                        let _ = input::copy_text_to_clipboard_only(&formatted);
+                        return Err(
+                            "PostMessage送信失敗 [text_not_inserted]: 入力欄へのテキスト反映が確認できませんでした（クリップボードへ退避済み）"
+                                .into(),
+                        );
+                    }
+                    if press_enter {
+                        input::post_enter_window_message(render_hwnd)?;
+                        if idx + 1 < chunks.len() {
+                            thread::sleep(Duration::from_millis(120));
+                        }
+                    }
+                }
+                if chunks.is_empty() && press_enter {
+                    input::post_enter_window_message(render_hwnd)?;
+                }
                 if !already_allowed && guard.restore_previous_window && prev_hwnd != 0 {
                     maybe_restore_ex(Some(prev_hwnd), false);
                 }
-                if res.is_ok() {
-                    let label = discord::target_display_label(target);
-                    return Ok(format!(
-                        "{} → PostMessage送信完了（SendInput不使用）",
-                        label
-                    ));
-                }
+                let label = discord::target_display_label(target);
+                return Ok(format!(
+                    "{} → PostMessage送信・入力検証完了（SendInput不使用）",
+                    label
+                ));
             }
         }
 
@@ -332,11 +419,11 @@ pub fn send_to_discord_target(
         if !formatted.is_empty() {
             input::copy_text_to_clipboard_only(&formatted)?;
         }
-        return Ok("SendInput不使用モード: フォーカスできなかったためクリップボードへコピーしました".into());
+        return Ok("SendInput不使用モード [composer_not_found]: クリップボードへコピーしました".into());
     }
 
     if guard.should_avoid_send_input(already_allowed) {
-        if formatted.is_empty() {
+        if chunks.is_empty() {
             return Ok("セーフモード中のため空送信をスキップしました".into());
         }
         input::copy_text_to_clipboard_only(&formatted)?;
@@ -359,14 +446,28 @@ pub fn send_to_discord_target(
         let _ = uia::focus_discord_chat_input(&guard.allowed_processes, 250);
     }
 
-    let res = if formatted.is_empty() {
+    let res = if chunks.is_empty() {
         if press_enter {
             input::send_key_action(KeyAction::Enter)
         } else {
             Ok(())
         }
     } else {
-        input::paste_with_clipboard_restore(&formatted, press_enter, guard.clipboard_restore_delay_ms)
+        let mut last_res = Ok(());
+        for (idx, chunk) in chunks.iter().enumerate() {
+            last_res = input::paste_with_clipboard_restore(
+                chunk,
+                press_enter,
+                guard.clipboard_restore_delay_ms,
+            );
+            if last_res.is_err() {
+                break;
+            }
+            if idx + 1 < chunks.len() {
+                thread::sleep(Duration::from_millis(120));
+            }
+        }
+        last_res
     };
 
     if !already_allowed && guard.restore_previous_window && prev_hwnd != 0 {

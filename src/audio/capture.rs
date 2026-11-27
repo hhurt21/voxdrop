@@ -227,10 +227,13 @@ impl LinearResampler {
 enum ControlMsg {
     SetListening(bool),
     SetDevice(Option<String>),
+    SetFallbacks(Vec<String>),
     SetRuntimeDir(Option<PathBuf>),
     UpdateVad(VadConfig),
     UpdateNoiseCancel(NoiseCancelConfig),
+    SetStreamingPreview(u64),
     CalibrateNoise(u64),
+    RecoverOnError,
     Flush,
     Shutdown,
 }
@@ -251,11 +254,13 @@ impl AudioController {
         F: Fn(AudioEvent) + Send + Sync + 'static,
     {
         let (tx, rx) = mpsc::channel::<ControlMsg>();
+        let thread_tx = tx.clone();
         let callback = Arc::new(on_event);
 
         thread::spawn(move || {
             let mut active = false;
             let mut device_name = initial_device;
+            let mut fallbacks: Vec<String> = Vec::new();
             let mut runtime_dir: Option<PathBuf> = None;
             let mut silero_model_path = initial_vad.silero_model_path.clone();
             let vad_shared = Arc::new(Mutex::new(VadSegmenter::new(initial_vad)));
@@ -265,7 +270,66 @@ impl AudioController {
                 runtime_dir.as_deref(),
             )));
             let listening_flag = Arc::new(AtomicBool::new(false));
+            let preview_interval_ms = Arc::new(std::sync::atomic::AtomicU64::new(1700));
             let mut active_stream: Option<Stream> = None;
+            let self_tx = thread_tx.clone();
+
+            let open_with_fallback = |pref: Option<&str>, fbs: &[String]| -> Result<(Stream, String), String> {
+                match start_stream(
+                    pref,
+                    vad_shared.clone(),
+                    denoiser_shared.clone(),
+                    silero_shared.clone(),
+                    listening_flag.clone(),
+                    preview_interval_ms.clone(),
+                    callback.clone(),
+                    self_tx.clone(),
+                ) {
+                    Ok(res) => Ok(res),
+                    Err(first_err) => {
+                        for fb in fbs {
+                            if Some(fb.as_str()) == pref {
+                                continue;
+                            }
+                            if let Ok((s, actual)) = start_stream(
+                                Some(fb.as_str()),
+                                vad_shared.clone(),
+                                denoiser_shared.clone(),
+                                silero_shared.clone(),
+                                listening_flag.clone(),
+                                preview_interval_ms.clone(),
+                                callback.clone(),
+                                self_tx.clone(),
+                            ) {
+                                callback(AudioEvent::DeviceSwitched {
+                                    from: pref.map(|x| x.to_string()),
+                                    to: actual.clone(),
+                                });
+                                return Ok((s, actual));
+                            }
+                        }
+                        if pref.is_some() {
+                            if let Ok((s, actual)) = start_stream(
+                                None,
+                                vad_shared.clone(),
+                                denoiser_shared.clone(),
+                                silero_shared.clone(),
+                                listening_flag.clone(),
+                                preview_interval_ms.clone(),
+                                callback.clone(),
+                                self_tx.clone(),
+                            ) {
+                                callback(AudioEvent::DeviceSwitched {
+                                    from: pref.map(|x| x.to_string()),
+                                    to: actual.clone(),
+                                });
+                                return Ok((s, actual));
+                            }
+                        }
+                        Err(first_err)
+                    }
+                }
+            };
 
             while let Ok(msg) = rx.recv() {
                 match msg {
@@ -293,15 +357,8 @@ impl AudioController {
                                     det.reset();
                                 }
                             }
-                            match start_stream(
-                                device_name.as_deref(),
-                                vad_shared.clone(),
-                                denoiser_shared.clone(),
-                                silero_shared.clone(),
-                                listening_flag.clone(),
-                                callback.clone(),
-                            ) {
-                                Ok(s) => {
+                            match open_with_fallback(device_name.as_deref(), &fallbacks) {
+                                Ok((s, _actual)) => {
                                     drop(active_stream.replace(s));
                                 }
                                 Err(err) => {
@@ -355,16 +412,32 @@ impl AudioController {
                                     det.reset();
                                 }
                             }
-                            match start_stream(
-                                device_name.as_deref(),
-                                vad_shared.clone(),
-                                denoiser_shared.clone(),
-                                silero_shared.clone(),
-                                listening_flag.clone(),
-                                callback.clone(),
-                            ) {
-                                Ok(s) => drop(active_stream.replace(s)),
+                            match open_with_fallback(device_name.as_deref(), &fallbacks) {
+                                Ok((s, _actual)) => drop(active_stream.replace(s)),
                                 Err(err) => callback(AudioEvent::Error(err)),
+                            }
+                        }
+                    }
+                    ControlMsg::SetFallbacks(new_fbs) => {
+                        fallbacks = new_fbs;
+                    }
+                    ControlMsg::SetStreamingPreview(ms) => {
+                        preview_interval_ms.store(ms, Ordering::Relaxed);
+                    }
+                    ControlMsg::RecoverOnError => {
+                        if active {
+                            drop(active_stream.take());
+                            thread::sleep(Duration::from_millis(120));
+                            match open_with_fallback(device_name.as_deref(), &fallbacks) {
+                                Ok((s, actual)) => {
+                                    device_name = Some(actual);
+                                    drop(active_stream.replace(s));
+                                }
+                                Err(err) => {
+                                    active = false;
+                                    listening_flag.store(false, Ordering::SeqCst);
+                                    callback(AudioEvent::Error(err));
+                                }
                             }
                         }
                     }
@@ -431,6 +504,14 @@ impl AudioController {
         let _ = self.tx.send(ControlMsg::SetDevice(device));
     }
 
+    pub fn set_fallbacks(&self, fallbacks: Vec<String>) {
+        let _ = self.tx.send(ControlMsg::SetFallbacks(fallbacks));
+    }
+
+    pub fn set_streaming_preview_ms(&self, ms: u64) {
+        let _ = self.tx.send(ControlMsg::SetStreamingPreview(ms));
+    }
+
     pub fn set_runtime_dir(&self, dir: Option<PathBuf>) {
         let _ = self.tx.send(ControlMsg::SetRuntimeDir(dir));
     }
@@ -477,12 +558,15 @@ fn start_stream<F>(
     denoiser_shared: Arc<Mutex<AudioDenoiser>>,
     silero_shared: Arc<Mutex<Option<SileroVadDetector>>>,
     listening_flag: Arc<AtomicBool>,
+    preview_interval_ms: Arc<std::sync::atomic::AtomicU64>,
     callback: Arc<F>,
-) -> Result<Stream, String>
+    ctrl_tx: mpsc::Sender<ControlMsg>,
+) -> Result<(Stream, String), String>
 where
     F: Fn(AudioEvent) + Send + Sync + 'static,
 {
     let device = find_input_device(preferred_device)?;
+    let actual_name = device.name().unwrap_or_else(|_| "既定のマイク".into());
     let supported = device
         .default_input_config()
         .map_err(|e| format!("マイク設定の取得に失敗しました: {}", e))?;
@@ -592,7 +676,8 @@ where
                 Err(_) => None,
             };
 
-            let (rms, is_speaking, events, noise_floor, effective_threshold) = match vad_shared.lock()
+            let pv_ms = preview_interval_ms.load(Ordering::Relaxed);
+            let (rms, is_speaking, events, preview_opt, noise_floor, effective_threshold) = match vad_shared.lock()
             {
                 Ok(mut v) => {
                     let (r, sp, evs) = v.push_frame_dual(
@@ -602,10 +687,19 @@ where
                         rnnoise_active,
                         silero_speech,
                     );
-                    (r, sp, evs, v.noise_floor(), v.effective_start_threshold())
+                    let pv = if pv_ms >= 900 && evs.is_empty() {
+                        v.take_streaming_preview_if_ready(pv_ms)
+                    } else {
+                        None
+                    };
+                    (r, sp, evs, pv, v.noise_floor(), v.effective_start_threshold())
                 }
                 Err(_) => return,
             };
+
+            if let Some(pv_samples) = preview_opt {
+                callback(AudioEvent::UtterancePreview(pv_samples));
+            }
 
             let display_vad_prob = if silero_speech == Some(true) {
                 vad_prob.max(0.85)
@@ -647,8 +741,13 @@ where
 
     let err_cb = {
         let callback = callback.clone();
+        let ctrl_tx = ctrl_tx.clone();
         move |err: cpal::StreamError| {
-            callback(AudioEvent::Error(format!("音声ストリームエラー: {}", err)));
+            callback(AudioEvent::Error(format!(
+                "音声ストリームエラー（自動切替を試行中）: {}",
+                err
+            )));
+            let _ = ctrl_tx.send(ControlMsg::RecoverOnError);
         }
     };
 
@@ -697,7 +796,7 @@ where
         .play()
         .map_err(|e| format!("マイクストリームの開始に失敗しました: {}", e))?;
 
-    Ok(stream)
+    Ok((stream, actual_name))
 }
 
 #[cfg(test)]
