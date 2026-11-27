@@ -449,6 +449,43 @@ impl WpnWatcher {
 mod tests {
     use super::*;
 
+    /// 実機の wpndatabase.db を使う確認。`tools/fake_discord_toast.ps1` で Discord 名義の偽 DM 通知を出し、
+    /// 監視が本文つきで受け取れるかを見る。`cargo test wpn_live -- --ignored --nocapture` で走らせ、
+    /// 終わったら `tools/fake_discord_toast.ps1 remove` で通知センターから消す。
+    #[test]
+    #[ignore]
+    fn wpn_live_probe_receives_fake_discord_toast() {
+        let script = std::env::var("VOXDROP_PROBE_TOAST").unwrap_or_else(|_| {
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tools/fake_discord_toast.ps1").to_string()
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx = std::sync::Mutex::new(tx);
+        let w = WpnWatcher::spawn(true, move |raw| {
+            let _ = tx.lock().unwrap().send(raw);
+        });
+        thread::sleep(Duration::from_millis(1500));
+        let st = std::time::Instant::now();
+        let out = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", &script])
+            .output()
+            .expect("powershell");
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let raw = rx
+            .recv_timeout(Duration::from_secs(8))
+            .expect("WPN 監視が偽通知を受け取れなかった");
+        println!("受信まで {:?}: {:?}", st.elapsed(), raw.texts);
+        w.shutdown();
+        let cfg = crate::config::DiscordTtsConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let mut dedup = crate::notification::discord_filter::NotificationDeduplicator::new(8);
+        let parsed =
+            crate::notification::discord_filter::filter_and_format_toast(&raw, &cfg, &mut dedup)
+                .expect("フィルタで落ちた");
+        println!("読み上げ文: {:?} / 送信者: {:?}", parsed.speech_text, parsed.sender);
+    }
+
     #[test]
     fn parses_wpn_discord_toast_xml_and_unescapes_entities() {
         let dm_xml = r#"<toast launch="discord://-/channels/@me/123456789012345678/999"><visual><binding template="ToastGeneric"><text>Taro</text><text>A &amp; B &lt;3&#10;元気？</text></binding></visual></toast>"#;

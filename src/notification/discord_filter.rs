@@ -54,12 +54,12 @@ impl NotificationDeduplicator {
             self.entries.pop_front();
         }
         self.entries
-            .push_back((key, sender.trim().to_ascii_lowercase(), now));
+            .push_back((key, normalize_sender_key(sender), now));
         false
     }
 
     pub fn seen_sender_recently(&self, sender: &str, window_ms: u64, now: Instant) -> bool {
-        let s = sender.trim().to_ascii_lowercase();
+        let s = normalize_sender_key(sender);
         let window = Duration::from_millis(window_ms);
         self.entries
             .iter()
@@ -67,7 +67,27 @@ impl NotificationDeduplicator {
     }
 }
 
+/// Discord の通知タイトルは名前を `U+2068 … U+2069`（双方向テキストの分離記号）で囲む。
+/// 見えない記号のせいで同じ相手が別人扱いになるので、比較・読み上げの前に取り除く。
+pub fn strip_bidi_controls(s: &str) -> String {
+    s.chars()
+        .filter(|c| {
+            !matches!(
+                *c,
+                '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}'
+            )
+        })
+        .collect()
+}
+
+fn normalize_sender_key(sender: &str) -> String {
+    strip_bidi_controls(sender).trim().to_lowercase()
+}
+
 fn hash_pair(a: &str, b: &str) -> u64 {
+    let a = normalize_sender_key(a);
+    let b = strip_bidi_controls(b);
+    let b = b.trim();
     let mut hasher = DefaultHasher::new();
     a.hash(&mut hasher);
     0xffu8.hash(&mut hasher);
@@ -184,7 +204,8 @@ pub fn sanitize_message_for_tts(raw: &str, url_replacement: &str, max_chars: usi
     let re_mention = RE_MENTION.get_or_init(|| Regex::new(r"<(?:@!?|@&|#)\d+>").unwrap());
     let re_ws = RE_MULTI_WS.get_or_init(|| Regex::new(r"[\r\n\t ]+").unwrap());
 
-    let mut text = re_code.replace_all(raw, "コード省略").into_owned();
+    let raw = strip_bidi_controls(raw);
+    let mut text = re_code.replace_all(&raw, "コード省略").into_owned();
     let url_rep = if url_replacement.trim().is_empty() {
         "URL省略"
     } else {
@@ -241,12 +262,12 @@ pub fn format_speech_text(sender: &str, sanitized_body: &str, cfg: &DiscordTtsCo
 }
 
 fn sender_matches_list(sender: &str, list: &[String]) -> bool {
-    let s = sender.trim().to_ascii_lowercase();
+    let s = normalize_sender_key(sender);
     if s.is_empty() {
         return false;
     }
     list.iter()
-        .map(|x| x.trim().to_ascii_lowercase())
+        .map(|x| normalize_sender_key(x))
         .filter(|x| !x.is_empty())
         .any(|pat| s == pat || s.contains(&pat))
 }
@@ -272,7 +293,8 @@ pub fn filter_and_format_toast_at(
 
     let mut content_lines: Vec<String> = Vec::new();
     for line in &raw.texts {
-        let trimmed = line.trim();
+        let cleaned = strip_bidi_controls(line);
+        let trimmed = cleaned.trim();
         if trimmed.is_empty() {
             continue;
         }
@@ -367,6 +389,41 @@ pub fn filter_and_format_toast_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strips_discord_bidi_isolates_so_badge_and_toast_match() {
+        let cfg = DiscordTtsConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let mut dedup = NotificationDeduplicator::new(8);
+        let now = Instant::now();
+        let dm = filter_and_format_toast_at(
+            &toast(&["Discord", "\u{2068}Suicune\u{2069}", "こんにちは"]),
+            &cfg,
+            &mut dedup,
+            now,
+        )
+        .expect("dm");
+        assert_eq!(dm.sender, "Suicune");
+        assert_eq!(dm.speech_text, "Suicuneさんから。こんにちは");
+        // UIA のバッジ側は記号なし・大文字小文字違いでも同じ相手として扱う
+        assert!(dedup.seen_sender_recently("suicune", 5000, now));
+        // UIA の開いている DM 画面で同じ本文を拾っても二重に読まない
+        assert!(dedup.is_duplicate_and_record("Suicune", "こんにちは", 4000, now));
+
+        let srv = filter_and_format_toast_at(
+            &toast(&[
+                "Discord",
+                "\u{2068}Dyn V6\u{2069} (\u{2068}#announcements\u{2069}, \u{2068}📣 Info\u{2069})",
+                "お知らせ",
+            ]),
+            &cfg,
+            &mut dedup,
+            now,
+        );
+        assert!(srv.is_none(), "サーバー通知は DM のみ設定で読まない");
+    }
 
     fn toast(texts: &[&str]) -> RawToastNotification {
         RawToastNotification {

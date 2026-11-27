@@ -9,7 +9,11 @@ use discord_filter::{
 };
 use discord_uia_watcher::{DiscordUiaWatcher, UiaDmEvent};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::thread;
+use std::time::{Duration, Instant};
+
+/// 未読バッジを見つけてから、本文つきの Windows 通知を待つ時間（ms）。
+const BADGE_GRACE_MS: u64 = 2500;
 use toast_watcher::{RawToastNotification, ToastWatcher};
 use wpn_watcher::WpnWatcher;
 
@@ -131,15 +135,16 @@ impl NotificationController {
             if !cfg.enabled || !cfg.read_without_windows_notifications {
                 return;
             }
-            let Ok(mut dedup_guard) = dedup_uia.lock() else {
-                return;
-            };
 
             match ev {
                 UiaDmEvent::OpenDmMessage { sender, body } => {
+                    let sender = discord_filter::strip_bidi_controls(&sender).trim().to_string();
                     if !discord_filter::sender_permitted(&sender, &cfg) {
                         return;
                     }
+                    let Ok(mut dedup_guard) = dedup_uia.lock() else {
+                        return;
+                    };
                     if dedup_guard.is_duplicate_and_record(
                         &sender,
                         &body,
@@ -166,41 +171,56 @@ impl NotificationController {
                     });
                 }
                 UiaDmEvent::UnreadBadge { sender, count } => {
+                    let sender = discord_filter::strip_bidi_controls(&sender).trim().to_string();
                     if !discord_filter::sender_permitted(&sender, &cfg) {
                         return;
                     }
-                    // If a toast/WPN for this sender was just processed in the last 5 seconds, skip duplicate
-                    if dedup_guard.seen_sender_recently(&sender, 5000, Instant::now()) {
-                        return;
-                    }
-                    let badge_key = format!("__badge_{}", count);
-                    if dedup_guard.is_duplicate_and_record(
-                        &sender,
-                        &badge_key,
-                        cfg.dedup_window_ms.max(5000),
-                        Instant::now(),
-                    ) {
-                        return;
-                    }
-                    let body = if count <= 1 {
-                        "新しいDMが届きました".to_string()
-                    } else {
-                        format!("新しいDMが{}件届きました", count)
-                    };
-                    if cfg.debug_log_toasts {
-                        let line = format!("[UIA UnreadBadge] {}: {}", sender, body);
-                        eprintln!("{}", line);
-                        cb_uia(NotificationEvent::DebugToast(line));
-                    }
-                    let speech_text = if cfg.read_sender_name {
-                        format!("{}さんから。{}", sender, body)
-                    } else {
-                        body.clone()
-                    };
-                    cb_uia(NotificationEvent::SpeakText {
-                        sender,
-                        body,
-                        speech_text,
+                    // バッジは本文を持たない。Windows 通知（本文つき）は少し遅れて届くことがあるので、
+                    // 待ってから「その相手の本文をもう読んだか」を見て、読んでいなければ件数だけ伝える。
+                    let dedup_later = dedup_uia.clone();
+                    let cb_later = cb_uia.clone();
+                    thread::spawn(move || {
+                        thread::sleep(Duration::from_millis(BADGE_GRACE_MS));
+                        let Ok(mut dedup_guard) = dedup_later.lock() else {
+                            return;
+                        };
+                        let now = Instant::now();
+                        if dedup_guard.seen_sender_recently(&sender, BADGE_GRACE_MS + 5000, now) {
+                            return;
+                        }
+                        let badge_key = format!("__badge_{}", count);
+                        if dedup_guard.is_duplicate_and_record(
+                            &sender,
+                            &badge_key,
+                            cfg.dedup_window_ms.max(5000),
+                            now,
+                        ) {
+                            return;
+                        }
+                        drop(dedup_guard);
+                        let body = if count <= 1 {
+                            "新しいDMが届きました".to_string()
+                        } else {
+                            format!("新しいDMが{}件届きました", count)
+                        };
+                        if cfg.debug_log_toasts {
+                            let line = format!(
+                                "[UIA UnreadBadge] {}: {}（本文つきの Windows 通知が来なかったため件数のみ）",
+                                sender, body
+                            );
+                            eprintln!("{}", line);
+                            cb_later(NotificationEvent::DebugToast(line));
+                        }
+                        let speech_text = if cfg.read_sender_name {
+                            format!("{}さんから。{}", sender, body)
+                        } else {
+                            body.clone()
+                        };
+                        cb_later(NotificationEvent::SpeakText {
+                            sender,
+                            body,
+                            speech_text,
+                        });
                     });
                 }
                 UiaDmEvent::Debug(_) => {}
