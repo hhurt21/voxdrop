@@ -809,6 +809,9 @@
     $("llmApiKey").value = llm.api_key || "";
     $("chkLlmAutoLaunch").checked = !!llm.auto_launch;
     $("chkLlmStopExit").checked = llm.stop_on_exit !== false;
+    if ($("llmModelFileSelect") && llm.model_file) {
+      $("llmModelFileSelect").value = llm.model_file;
+    }
 
     renderPairList("snippetRows", cfg.snippets || [], "trigger", "expansion", "呼び出しトリガー", "展開する定型文");
     renderPairList("emojiAliasRows", cfg.emoji_aliases || [], "spoken", "emoji", "発話ワード (例: くさ)", "絵文字 (例: 😂)");
@@ -1171,7 +1174,7 @@
             base_url: $("llmBaseUrl").value.trim() || "http://127.0.0.1:8081",
             endpoint_path: $("llmEndpointPath").value.trim() || "/v1/chat/completions",
             model: $("llmModel").value.trim() || "qwen3-1.7b",
-            model_file: ((currentConfig.stt && currentConfig.stt.accuracy && currentConfig.stt.accuracy.llm && currentConfig.stt.accuracy.llm.model_file) || ""),
+            model_file: ($("llmModelFileSelect") && $("llmModelFileSelect").value) || ((currentConfig.stt && currentConfig.stt.accuracy && currentConfig.stt.accuracy.llm && currentConfig.stt.accuracy.llm.model_file) || ""),
             api_key: $("llmApiKey").value.trim(),
             server_exe_path: $("llmExePath").value.trim(),
             server_args: $("llmArgs").value.trim(),
@@ -1955,6 +1958,78 @@
     saveNow();
     send({ type: "LaunchLlmServer" });
   });
+  if ($("btnJumpLocalLlmTab")) {
+    $("btnJumpLocalLlmTab").addEventListener("click", () => {
+      const nav = document.querySelector('.nav-btn[data-tab="local-llm"]');
+      if (nav) nav.click();
+    });
+  }
+  if ($("btnDownloadLlamaServer")) {
+    $("btnDownloadLlamaServer").addEventListener("click", () => {
+      send({ type: "DownloadModel", model_id: "llama-server-vulkan", custom_url: null, custom_filename: null });
+    });
+  }
+  if ($("btnDownloadLlm17b")) {
+    $("btnDownloadLlm17b").addEventListener("click", () => {
+      send({ type: "DownloadModel", model_id: "qwen3-1.7b-llm", custom_url: null, custom_filename: null });
+    });
+  }
+  if ($("btnDownloadLlm4b")) {
+    $("btnDownloadLlm4b").addEventListener("click", () => {
+      send({ type: "DownloadModel", model_id: "qwen3-4b-llm", custom_url: null, custom_filename: null });
+    });
+  }
+  if ($("llmModelFileSelect")) {
+    $("llmModelFileSelect").addEventListener("change", () => {
+      const v = $("llmModelFileSelect").value;
+      if (v) {
+        if (v.toLowerCase().includes("4b")) $("llmModel").value = "qwen3-4b";
+        else if (v.toLowerCase().includes("1.7b")) $("llmModel").value = "qwen3-1.7b";
+      }
+      saveNow();
+    });
+  }
+  if ($("btnLlmPresetLlamaServer")) {
+    $("btnLlmPresetLlamaServer").addEventListener("click", () => {
+      $("llmBaseUrl").value = "http://127.0.0.1:8081";
+      $("llmEndpointPath").value = "/v1/chat/completions";
+      $("chkLlmAutoLaunch").checked = true;
+      saveNow();
+      showToast("llama-server プリセット (:8081) を適用しました", "ok");
+    });
+  }
+  if ($("btnLlmPresetOllama")) {
+    $("btnLlmPresetOllama").addEventListener("click", () => {
+      $("llmBaseUrl").value = "http://127.0.0.1:11434";
+      $("llmEndpointPath").value = "/v1/chat/completions";
+      $("llmModel").value = "qwen3:1.7b";
+      $("chkLlmAutoLaunch").checked = false;
+      saveNow();
+      showToast("Ollama プリセット (:11434) を適用しました", "ok");
+    });
+  }
+  if ($("btnLlmPresetLmStudio")) {
+    $("btnLlmPresetLmStudio").addEventListener("click", () => {
+      $("llmBaseUrl").value = "http://127.0.0.1:1234";
+      $("llmEndpointPath").value = "/v1/chat/completions";
+      $("chkLlmAutoLaunch").checked = false;
+      saveNow();
+      showToast("LM Studio プリセット (:1234) を適用しました", "ok");
+    });
+  }
+  if ($("btnTestLlmSample")) {
+    $("btnTestLlmSample").addEventListener("click", () => {
+      const text = ($("llmTestInput") && $("llmTestInput").value.trim()) || "ばんだるかってミッド見よう";
+      if ($("llmTestInput") && !$("llmTestInput").value.trim()) $("llmTestInput").value = text;
+      saveNow();
+      const box = $("llmTestOutput");
+      if (box) {
+        box.className = "ab-result show";
+        box.textContent = "ローカルLLMで補正中...";
+      }
+      send({ type: "TestLlmSample", text });
+    });
+  }
 
   $("btnRefreshCatalog").addEventListener("click", () => send({ type: "GetCatalogInventory" }));
   $("chkAutoApplyPreset").addEventListener("change", saveNow);
@@ -2842,6 +2917,30 @@
         const qBadge = $("qwen3StatusBadge");
         qBadge.textContent = ev.qwen3_installed ? "Qwen3-ASR: 導入済み" : "Qwen3-ASR: 未導入";
         qBadge.className = "pill " + (ev.qwen3_installed ? "ok" : "");
+
+        const llmSel = $("llmModelFileSelect");
+        if (llmSel) {
+          const llmPrev = ev.selected_llm_model != null ? ev.selected_llm_model : llmSel.value || "";
+          llmSel.innerHTML = '<option value="">自動（最初に検出した .gguf）</option>';
+          (ev.llm_models || []).forEach((name) => {
+            const opt = document.createElement("option");
+            opt.value = name;
+            opt.textContent = name;
+            llmSel.appendChild(opt);
+          });
+          llmSel.value = llmPrev;
+        }
+        const rtBadge = $("llmRuntimeBadge");
+        if (rtBadge) {
+          rtBadge.textContent = ev.llama_server_path ? "llama-server: 検出済み" : "llama-server: 未導入";
+          rtBadge.className = "pill " + (ev.llama_server_path ? "ok" : "warn");
+        }
+        const cntBadge = $("llmModelCountBadge");
+        if (cntBadge) {
+          const cnt = (ev.llm_models || []).length;
+          cntBadge.textContent = `GGUFモデル: ${cnt}件`;
+          cntBadge.className = "pill " + (cnt > 0 ? "ok" : "");
+        }
         break;
       }
       case "Toast":
@@ -2945,6 +3044,15 @@
         $("dlProgressWrap").style.display = "block";
         $("dlProgressText").textContent = `[${ev.model_id}] ${ev.message || ""}`;
         $("dlProgressBar").style.width = Math.min(100, Math.max(0, ev.progress || 0)) + "%";
+        if (
+          $("llmSetupProgressWrap") &&
+          ev.model_id &&
+          (ev.model_id.includes("llm") || ev.model_id.includes("llama-server"))
+        ) {
+          $("llmSetupProgressWrap").style.display = "block";
+          $("llmSetupProgressText").textContent = `[${ev.model_id}] ${ev.message || ""}`;
+          $("llmSetupProgressBar").style.width = Math.min(100, Math.max(0, ev.progress || 0)) + "%";
+        }
         if (ev.done) {
           showToast(ev.message || (ev.ok ? "モデル取得完了" : "取得失敗"), ev.ok ? "ok" : "error");
           if (ev.ok) {
@@ -3073,6 +3181,16 @@
           badge.className = "pill " + (ev.ok ? "ok" : "warn");
         }
         showToast(ev.message, ev.ok ? "ok" : "error");
+        break;
+      }
+      case "LlmSampleResult": {
+        const box = $("llmTestOutput");
+        if (box) {
+          box.className = "ab-result show" + (ev.ok ? "" : " err");
+          box.textContent = ev.ok
+            ? `入力: 「${ev.input}」 → 補正 (${ev.elapsed_ms}ms): 「${ev.output}」`
+            : `エラー (${ev.elapsed_ms}ms): ${ev.error || "LLM呼び出し失敗"}`;
+        }
         break;
       }
       case "PostSendError":

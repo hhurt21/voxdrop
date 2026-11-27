@@ -146,6 +146,8 @@ type FnWhisperContextDefaultParamsByRef = unsafe extern "C" fn() -> *mut Whisper
 type FnWhisperFreeContextParams = unsafe extern "C" fn(*mut WhisperContextParams);
 type FnWhisperInitFromFileWithParams =
     unsafe extern "C" fn(*const c_char, WhisperContextParams) -> *mut c_void;
+type FnWhisperInitFromBufferWithParams =
+    unsafe extern "C" fn(*mut c_void, usize, WhisperContextParams) -> *mut c_void;
 type FnWhisperFree = unsafe extern "C" fn(*mut c_void);
 type FnWhisperFullDefaultParamsByRef = unsafe extern "C" fn(c_int) -> *mut WhisperFullParams;
 type FnWhisperFreeParams = unsafe extern "C" fn(*mut WhisperFullParams);
@@ -160,6 +162,7 @@ struct WhisperDllFns {
     ctx_default_params_by_ref: FnWhisperContextDefaultParamsByRef,
     free_ctx_params: FnWhisperFreeContextParams,
     init_from_file_with_params: FnWhisperInitFromFileWithParams,
+    init_from_buffer_with_params: Option<FnWhisperInitFromBufferWithParams>,
     free_ctx: FnWhisperFree,
     full_default_params_by_ref: FnWhisperFullDefaultParamsByRef,
     free_params: FnWhisperFreeParams,
@@ -203,6 +206,34 @@ pub struct ResidentWhisperRecognizer {
     device_name: String,
 }
 
+type FnGetShortPathNameW = unsafe extern "system" fn(PCWSTR, *mut u16, u32) -> u32;
+
+fn c_compatible_windows_path(path: &Path) -> String {
+    let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let raw = abs.to_string_lossy();
+    let clean = raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_string();
+    if clean.is_ascii() {
+        return clean;
+    }
+    unsafe {
+        if let Ok(hmod) = windows::Win32::System::LibraryLoader::LoadLibraryW(windows::core::w!("kernel32.dll")) {
+            if let Some(sym) = GetProcAddress(hmod, PCSTR(b"GetShortPathNameW\0".as_ptr())) {
+                let get_short: FnGetShortPathNameW = std::mem::transmute(sym);
+                let in_w: Vec<u16> = clean.encode_utf16().chain(std::iter::once(0)).collect();
+                let mut out_w = vec![0u16; 1024];
+                let n = get_short(PCWSTR(in_w.as_ptr()), out_w.as_mut_ptr(), out_w.len() as u32);
+                if n > 0 && (n as usize) < out_w.len() {
+                    let short = String::from_utf16_lossy(&out_w[..n as usize]);
+                    if !short.is_empty() {
+                        return short;
+                    }
+                }
+            }
+        }
+    }
+    clean
+}
+
 impl ResidentWhisperRecognizer {
     pub fn load(
         dll_path: &Path,
@@ -211,7 +242,8 @@ impl ResidentWhisperRecognizer {
         threads: u32,
     ) -> Result<Self, String> {
         let (fns, has_vulkan, gpu_desc) = load_whisper_dll(dll_path)?;
-        let model_c = CString::new(model_path.to_string_lossy().as_ref())
+        let compat_model_path = c_compatible_windows_path(model_path);
+        let model_c = CString::new(compat_model_path.as_str())
             .map_err(|_| "モデルパスに不正な文字が含まれています".to_string())?;
         let lang_str = if language.trim().is_empty() {
             "ja"
@@ -242,13 +274,29 @@ impl ResidentWhisperRecognizer {
                     used_gpu = false;
                     ptr_ctx = (fns.init_from_file_with_params)(model_c.as_ptr(), cparams);
                 }
+                if ptr_ctx.is_null() {
+                    if let Some(init_buf) = fns.init_from_buffer_with_params {
+                        if let Ok(mut bytes) = std::fs::read(model_path) {
+                            cparams.use_gpu = has_vulkan;
+                            cparams.flash_attn = has_vulkan;
+                            used_gpu = has_vulkan;
+                            ptr_ctx = init_buf(bytes.as_mut_ptr() as *mut c_void, bytes.len(), cparams);
+                            if ptr_ctx.is_null() && has_vulkan {
+                                cparams.use_gpu = false;
+                                cparams.flash_attn = false;
+                                used_gpu = false;
+                                ptr_ctx = init_buf(bytes.as_mut_ptr() as *mut c_void, bytes.len(), cparams);
+                            }
+                        }
+                    }
+                }
                 (ptr_ctx, used_gpu)
             }
         };
 
         if ctx.is_null() {
             return Err(format!(
-                "whisper.dll でモデルを読み込めませんでした: {}",
+                "whisper.dll でモデルを読み込めませんでした ({}): ファイル破損またはパス文字コード非対応の可能性があります",
                 model_path.display()
             ));
         }
@@ -762,7 +810,7 @@ fn load_whisper_dll(dll_path: &Path) -> Result<(WhisperDllFns, bool, Option<Stri
             None,
             LOAD_WITH_ALTERED_SEARCH_PATH,
         )
-        .map_err(|e| format!("whisper.dll の読み込みに失敗しました ({}): {}", clean_path, e))?;
+        .map_err(|e| format!("whisper.dll の読み込みに失敗しました ({}) [依存ランタイムまたはVC++再頒布可能パッケージ不足の可能性]: {}", clean_path, e))?;
 
         let res = (|| -> Result<WhisperDllFns, String> {
             Ok(WhisperDllFns {
@@ -776,6 +824,11 @@ fn load_whisper_dll(dll_path: &Path) -> Result<(WhisperDllFns, bool, Option<Stri
                     hmodule,
                     b"whisper_init_from_file_with_params\0",
                 )?,
+                init_from_buffer_with_params: load_sym(
+                    hmodule,
+                    b"whisper_init_from_buffer_with_params\0",
+                )
+                .ok(),
                 free_ctx: load_sym(hmodule, b"whisper_free\0")?,
                 full_default_params_by_ref: load_sym(
                     hmodule,

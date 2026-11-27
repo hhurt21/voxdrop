@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 pub const BUNDLE_MAGIC: &[u8; 16] = b"VOXDROP_BNDL_V01";
 const FOOTER_SIZE: u64 = 24; // [payload_len: u64 LE][magic: 16 bytes]
 
-/// Returns the local runtime cache directory (`%LOCALAPPDATA%\VoxDrop\runtime\v6`).
+/// Returns the local runtime cache directory (`%LOCALAPPDATA%\VoxDrop\runtime\v7`).
 pub fn runtime_cache_dir() -> PathBuf {
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
         let trimmed = local.trim();
@@ -14,10 +14,10 @@ pub fn runtime_cache_dir() -> PathBuf {
             return PathBuf::from(trimmed)
                 .join("VoxDrop")
                 .join("runtime")
-                .join("v6");
+                .join("v7");
         }
     }
-    std::env::temp_dir().join("VoxDrop").join("runtime").join("v6")
+    std::env::temp_dir().join("VoxDrop").join("runtime").join("v7")
 }
 
 /// Checks if the running `voxdrop.exe` carries an appended self-contained runtime bundle
@@ -55,13 +55,14 @@ pub fn extract_bundle_from_file(exe_path: &Path, target_dir: &Path) -> Result<Op
     }
 
     let marker_path = target_dir.join(".bundle_ready");
-    let expected_marker = format!("v1:{}", payload_len);
+    let expected_header = format!("v2:{}", payload_len);
     if let Ok(existing) = fs::read_to_string(&marker_path) {
-        if existing.trim() == expected_marker
-            && (target_dir.join("bin").join("whisper.dll").is_file()
-                || target_dir.join("bin").join("sherpa-onnx-c-api.dll").is_file())
-        {
-            return Ok(Some(target_dir.to_path_buf()));
+        let mut lines = existing.lines();
+        if lines.next().map(str::trim) == Some(expected_header.as_str()) {
+            let listed: Vec<&str> = lines.map(str::trim).filter(|l| !l.is_empty()).collect();
+            if !listed.is_empty() && listed.iter().all(|rel| target_dir.join(rel).is_file()) {
+                return Ok(Some(target_dir.to_path_buf()));
+            }
         }
     }
 
@@ -80,6 +81,7 @@ pub fn extract_bundle_from_file(exe_path: &Path, target_dir: &Path) -> Result<Op
         .read_exact(&mut count_buf)
         .map_err(|e| format!("内蔵ランタイムのヘッダ展開に失敗しました: {}", e))?;
     let file_count = u32::from_le_bytes(count_buf);
+    let mut extracted_files: Vec<String> = Vec::with_capacity(file_count as usize);
 
     for _ in 0..file_count {
         let mut plen_buf = [0u8; 4];
@@ -123,9 +125,15 @@ pub fn extract_bundle_from_file(exe_path: &Path, target_dir: &Path) -> Result<Op
                 .map_err(|e| format!("展開データの書き込みに失敗 ({}): {}", rel_path, e))?;
             remaining -= chunk as u64;
         }
+        extracted_files.push(rel_path);
     }
 
-    fs::write(&marker_path, expected_marker)
+    let mut manifest = expected_header;
+    for rel in extracted_files {
+        manifest.push('\n');
+        manifest.push_str(&rel);
+    }
+    fs::write(&marker_path, manifest)
         .map_err(|e| format!("完了マーカーの書き込みに失敗: {}", e))?;
 
     Ok(Some(target_dir.to_path_buf()))

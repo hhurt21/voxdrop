@@ -6,9 +6,10 @@ use crate::processor::phonetic::to_normalized_mora;
 use crate::stt::http_asr::parse_url;
 use std::ffi::c_void;
 use std::os::windows::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Networking::WinHttp::{
     WinHttpAddRequestHeaders, WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest,
@@ -331,29 +332,103 @@ pub fn check_llm_health(base_url: &str) -> Result<String, String> {
     }
 }
 
-pub fn ensure_llm_server_running(cfg: &LlmCorrectionConfig) -> Result<String, String> {
+/// Splits a Windows CLI argument string honoring `"quoted paths with spaces"`.
+pub fn parse_windows_args(raw: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut has_token = false;
+    for ch in raw.chars() {
+        match ch {
+            '"' => {
+                in_quotes = !in_quotes;
+                has_token = true;
+            }
+            c if c.is_whitespace() && !in_quotes => {
+                if has_token {
+                    args.push(std::mem::take(&mut current));
+                    has_token = false;
+                }
+            }
+            c => {
+                current.push(c);
+                has_token = true;
+            }
+        }
+    }
+    if has_token {
+        args.push(current);
+    }
+    args
+}
+
+pub fn ensure_llm_server_running_with_dirs(
+    cfg: &LlmCorrectionConfig,
+    stt_cfg: &crate::config::SttConfig,
+    runtime_dir: Option<&Path>,
+) -> Result<String, String> {
     if check_llm_health(&cfg.base_url).is_ok() {
         return Ok("ローカルLLMサーバーは既に稼働中です".into());
     }
-    let exe = cfg.server_exe_path.trim();
-    if exe.is_empty() || !Path::new(exe).is_file() {
-        return Err("ローカルLLMサーバー実行ファイルが見つかりません".into());
+    let discovered_exe = crate::stt::local::discover_llama_server_exe(stt_cfg, runtime_dir);
+    let exe_path = if !cfg.server_exe_path.trim().is_empty() && Path::new(cfg.server_exe_path.trim()).is_file() {
+        PathBuf::from(cfg.server_exe_path.trim())
+    } else if let Some(p) = discovered_exe {
+        p
+    } else {
+        return Err("llama-server.exe が見つかりません。「ローカルLLM補正」タブの「llama-server (Vulkan) を自動ダウンロード」を押してください".into());
+    };
+
+    let mut args = parse_windows_args(&cfg.server_args);
+    if args.is_empty() {
+        let gguf = crate::stt::local::find_llm_model_path(&cfg.model_file, stt_cfg, runtime_dir)
+            .ok_or_else(|| {
+                "GGUF モデルが見つかりません。「ローカルLLM補正」タブから Qwen3-1.7B または 4B をダウンロードしてください".to_string()
+            })?;
+        let port = parse_url(&cfg.base_url).map(|p| p.port).unwrap_or(8081);
+        args = vec![
+            "-m".into(),
+            gguf.display().to_string(),
+            "--host".into(),
+            "127.0.0.1".into(),
+            "--port".into(),
+            port.to_string(),
+            "-ngl".into(),
+            "99".into(),
+            "-c".into(),
+            "2048".into(),
+        ];
     }
-    let mut cmd = Command::new(exe);
+
+    let mut cmd = Command::new(&exe_path);
     cmd.creation_flags(CREATE_NO_WINDOW);
+    if let Some(parent) = exe_path.parent() {
+        cmd.current_dir(parent);
+    }
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-    if !cfg.server_args.trim().is_empty() {
-        for a in cfg.server_args.split_whitespace() {
-            cmd.arg(a);
-        }
+    for a in &args {
+        cmd.arg(a);
     }
     let child = cmd
         .spawn()
-        .map_err(|e| format!("ローカルLLMサーバー起動失敗: {}", e))?;
+        .map_err(|e| format!("ローカルLLMサーバー起動失敗 ({}): {}", exe_path.display(), e))?;
     if let Ok(mut g) = OWNED_LLM_CHILD.lock() {
         *g = Some(child);
     }
-    Ok("ローカルLLMサーバーをヘッドレス起動しました".into())
+
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(350));
+        if check_llm_health(&cfg.base_url).is_ok() {
+            return Ok("ローカルLLMサーバーを起動し接続を確認しました".into());
+        }
+    }
+    Ok("ローカルLLMサーバーを起動しました（モデル読込中の可能性があります）".into())
+}
+
+#[allow(dead_code)]
+pub fn ensure_llm_server_running(cfg: &LlmCorrectionConfig) -> Result<String, String> {
+    ensure_llm_server_running_with_dirs(cfg, &crate::config::SttConfig::default(), None)
 }
 
 pub fn stop_llm_server_if_started_by_us() {
@@ -397,5 +472,24 @@ mod tests {
         assert!(p.contains("STT2"));
         assert!(p.contains("VALORANT"));
         assert!(p.contains("ばんだる->ヴァンダル"));
+    }
+
+    #[test]
+    fn parses_windows_cli_args_preserving_quoted_paths() {
+        let raw = r#"-m "C:\Users\山田 太郎\AppData\Local\VoxDrop\models\Qwen3-1.7B-Q4_K_M.gguf" --host 127.0.0.1 --port 8081 -ngl 99"#;
+        let args = parse_windows_args(raw);
+        assert_eq!(
+            args,
+            vec![
+                "-m",
+                r"C:\Users\山田 太郎\AppData\Local\VoxDrop\models\Qwen3-1.7B-Q4_K_M.gguf",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "8081",
+                "-ngl",
+                "99"
+            ]
+        );
     }
 }

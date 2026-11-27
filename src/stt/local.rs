@@ -97,18 +97,82 @@ enum SherpaModelKind {
     },
 }
 
-/// Checks whether a sherpa-onnx Qwen3-ASR model directory is installed under `model_dir`.
+/// Returns user-writable external models directory (`%LOCALAPPDATA%\VoxDrop\models`).
+pub fn user_models_dir() -> PathBuf {
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        let trimmed = local.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed).join("VoxDrop").join("models");
+        }
+    }
+    std::env::temp_dir().join("VoxDrop").join("models")
+}
+
+/// Checks whether a sherpa-onnx Qwen3-ASR model directory is installed under any model search dir.
 pub fn has_qwen3_asr_model(cfg: &SttConfig, runtime_dir: Option<&Path>) -> bool {
-    let Some(dir) = resolve_model_dir(&cfg.model_dir, runtime_dir) else {
-        return false;
-    };
-    discover_sherpa_qwen3_model(&dir).is_some()
+    resolve_model_search_dirs(&cfg.model_dir, runtime_dir)
+        .into_iter()
+        .any(|dir| discover_sherpa_qwen3_model(&dir).is_some())
+}
+
+/// Resolves all existing model directories to search across (ordered by priority, deduplicated).
+pub fn resolve_model_search_dirs(configured: &str, runtime_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut raw_candidates: Vec<PathBuf> = Vec::new();
+    let trimmed = configured.trim();
+    if let Some(p_dir) = crate::config::AppConfig::portable_dir() {
+        let sub = if trimmed.is_empty() {
+            p_dir.join("models")
+        } else if Path::new(trimmed).is_absolute() {
+            PathBuf::from(trimmed)
+        } else {
+            p_dir.join(trimmed)
+        };
+        raw_candidates.push(sub);
+    }
+    if !trimmed.is_empty() {
+        let raw = PathBuf::from(trimmed);
+        raw_candidates.push(raw.clone());
+        if raw.is_relative() {
+            if let Some(dir) = exe_dir() {
+                raw_candidates.push(dir.join(&raw));
+                if let Some(parent) = dir.parent().and_then(|p| p.parent()) {
+                    raw_candidates.push(parent.join(&raw));
+                }
+            }
+        }
+    } else {
+        raw_candidates.push(PathBuf::from("models"));
+        if let Some(dir) = exe_dir() {
+            raw_candidates.push(dir.join("models"));
+        }
+    }
+    raw_candidates.push(user_models_dir());
+    if let Some(rt) = runtime_dir {
+        raw_candidates.push(rt.join("models"));
+    }
+    raw_candidates.push(crate::runtime::runtime_cache_dir().join("models"));
+
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for cand in raw_candidates {
+        if !cand.exists() || !cand.is_dir() {
+            continue;
+        }
+        let norm = fs::canonicalize(&cand)
+            .unwrap_or_else(|_| cand.clone())
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        if seen.insert(norm) {
+            out.push(cand);
+        }
+    }
+    out
 }
 
 /// Resolves the writable target directory for downloading external models.
 pub fn resolve_download_model_dir(configured: &str, runtime_dir: Option<&Path>) -> PathBuf {
+    let trimmed = configured.trim();
     if let Some(p_dir) = crate::config::AppConfig::portable_dir() {
-        let trimmed = configured.trim();
         return if trimmed.is_empty() {
             p_dir.join("models")
         } else if Path::new(trimmed).is_absolute() {
@@ -117,26 +181,121 @@ pub fn resolve_download_model_dir(configured: &str, runtime_dir: Option<&Path>) 
             p_dir.join(trimmed)
         };
     }
-    let raw = PathBuf::from(configured.trim());
-    if !configured.trim().is_empty() && (raw.is_absolute() || raw.exists()) {
+    let raw = PathBuf::from(trimmed);
+    if !trimmed.is_empty() && raw.is_absolute() {
+        return raw;
+    }
+    if runtime_dir.is_some() {
+        return user_models_dir();
+    }
+    if !trimmed.is_empty() && raw.exists() {
         return raw;
     }
     if let Some(dir) = exe_dir() {
-        let candidate = dir.join(if configured.trim().is_empty() {
-            "models"
-        } else {
-            configured.trim()
-        });
+        let candidate = dir.join(if trimmed.is_empty() { "models" } else { trimmed });
         if candidate.exists() {
             return candidate;
         }
     }
-    if !configured.trim().is_empty() {
-        return raw;
+    user_models_dir()
+}
+
+pub fn list_available_llm_gguf_models(cfg: &SttConfig, runtime_dir: Option<&Path>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for dir in resolve_model_search_dirs(&cfg.model_dir, runtime_dir) {
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_file() {
+                    if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                        let lower = name.to_ascii_lowercase();
+                        if lower.ends_with(".gguf") && !lower.contains("asr") && seen.insert(lower) {
+                            out.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
     }
-    runtime_dir
-        .map(|rt| rt.join("models"))
-        .unwrap_or_else(|| PathBuf::from("models"))
+    out.sort();
+    out
+}
+
+pub fn find_llm_model_path(
+    model_file: &str,
+    cfg: &SttConfig,
+    runtime_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    let requested = model_file.trim();
+    if !requested.is_empty() {
+        let direct = Path::new(requested);
+        if direct.is_file() {
+            return Some(direct.to_path_buf());
+        }
+    }
+    let dirs = resolve_model_search_dirs(&cfg.model_dir, runtime_dir);
+    if !requested.is_empty() {
+        for d in &dirs {
+            let candidate = d.join(requested);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    for d in &dirs {
+        if let Ok(entries) = fs::read_dir(d) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_file() {
+                    if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                        let lower = name.to_ascii_lowercase();
+                        if lower.ends_with(".gguf") && !lower.contains("asr") {
+                            return Some(p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn discover_llama_server_exe(cfg: &SttConfig, runtime_dir: Option<&Path>) -> Option<PathBuf> {
+    let mut dirs = resolve_model_search_dirs(&cfg.model_dir, runtime_dir);
+    let dl_dir = resolve_download_model_dir(&cfg.model_dir, runtime_dir);
+    if !dirs.iter().any(|d| d == &dl_dir) {
+        dirs.insert(0, dl_dir);
+    }
+    for d in &dirs {
+        for rel in [
+            "llama-server/llama-server.exe",
+            "llama-server.exe",
+            "llama-b12811-bin-win-vulkan-x64/llama-server.exe",
+        ] {
+            let p = d.join(rel);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+        // Scan 1-level subdirectories in case archive unpacked under a versioned folder name
+        if let Ok(entries) = fs::read_dir(d) {
+            for e in entries.flatten() {
+                let sub = e.path();
+                if sub.is_dir() {
+                    let cand = sub.join("llama-server.exe");
+                    if cand.is_file() {
+                        return Some(cand);
+                    }
+                    let nested = sub.join("build").join("bin").join("llama-server.exe");
+                    if nested.is_file() {
+                        return Some(nested);
+                    }
+                }
+            }
+        }
+    }
+    find_file_in_search_dirs("", &["llama-server.exe", "llama-server"], runtime_dir)
 }
 
 pub fn discover_stt_denoiser(
@@ -147,26 +306,21 @@ pub fn discover_stt_denoiser(
 ) -> Option<Arc<crate::stt::sherpa_ffi::ResidentSherpaDenoiser>> {
     use crate::config::NoiseEngineKind;
     let names: &[&str] = match kind {
-        NoiseEngineKind::DpdfNet16k => &["dpdfnet2.onnx", "dpdfnet_baseline_16k.onnx"],
-        NoiseEngineKind::DpdfNet48k => &["dpdfnet_48k.onnx"],
+        NoiseEngineKind::DpdfNet16k => &[
+            "dpdfnet2.onnx",
+            "dpdfnet_baseline.onnx",
+            "dpdfnet_baseline_16k.onnx",
+        ],
+        NoiseEngineKind::DpdfNet48k => &["dpdfnet2_48khz_hr.onnx", "dpdfnet_48k.onnx"],
         NoiseEngineKind::Gtcrn16k => &["gtcrn_simple.onnx", "gtcrn.onnx"],
         NoiseEngineKind::DeepFilterNet3 => &["deepfilternet3.onnx"],
         NoiseEngineKind::Rnnoise | NoiseEngineKind::OffHpf => return None,
     };
     let dll = find_file_in_search_dirs("", &["sherpa-onnx-c-api.dll"], runtime_dir)?;
-    let models_dir = resolve_download_model_dir(&cfg.model_dir, runtime_dir);
-    let model_path = names
+    let search_dirs = resolve_model_search_dirs(&cfg.model_dir, runtime_dir);
+    let model_path = search_dirs
         .iter()
-        .map(|n| models_dir.join(n))
-        .find(|p| p.is_file())
-        .or_else(|| {
-            runtime_dir.and_then(|rt| {
-                names
-                    .iter()
-                    .map(|n| rt.join("models").join(n))
-                    .find(|p| p.is_file())
-            })
-        })?;
+        .find_map(|d| names.iter().map(|n| d.join(n)).find(|p| p.is_file()))?;
     crate::stt::sherpa_ffi::ResidentSherpaDenoiser::load(
         &dll,
         kind.as_str(),
@@ -180,10 +334,17 @@ pub fn discover_stt_denoiser(
 
 /// Lists available GGML Whisper `.bin` model filenames ordered by quality priority.
 pub fn list_available_ggml_models(cfg: &SttConfig, runtime_dir: Option<&Path>) -> Vec<String> {
-    let Some(model_dir) = resolve_model_dir(&cfg.model_dir, runtime_dir) else {
-        return Vec::new();
-    };
-    let mut candidates = collect_ggml_models(&model_dir);
+    let mut candidates = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for model_dir in resolve_model_search_dirs(&cfg.model_dir, runtime_dir) {
+        for p in collect_ggml_models(&model_dir) {
+            if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                if seen.insert(name.to_ascii_lowercase()) {
+                    candidates.push(p);
+                }
+            }
+        }
+    }
     candidates.sort_by(|a, b| score_ggml_model(b).cmp(&score_ggml_model(a)));
     candidates
         .into_iter()
@@ -268,12 +429,24 @@ pub struct WhisperResidentEngine {
 }
 
 impl WhisperResidentEngine {
-    pub fn discover(cfg: &SttConfig, runtime_dir: Option<&Path>) -> Option<Self> {
-        let dll_path = find_file_in_search_dirs("", &["whisper.dll"], runtime_dir)?;
-        let model_dir = resolve_model_dir(&cfg.model_dir, runtime_dir)?;
-        let mut candidates = collect_ggml_models(&model_dir);
+    pub fn discover(cfg: &SttConfig, runtime_dir: Option<&Path>) -> Result<Self, String> {
+        let dll_path = find_file_in_search_dirs("", &["whisper.dll"], runtime_dir)
+            .ok_or_else(|| "whisper.dll が実行ディレクトリまたはキャッシュに見つかりません".to_string())?;
+        let dirs = resolve_model_search_dirs(&cfg.model_dir, runtime_dir);
+        let mut candidates = Vec::new();
+        for model_dir in &dirs {
+            candidates.extend(collect_ggml_models(model_dir));
+        }
         if candidates.is_empty() {
-            return None;
+            let searched = dirs
+                .iter()
+                .map(|d| d.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "GGML .bin モデルが見つかりません (探索先: {})",
+                if searched.is_empty() { cfg.model_dir.as_str() } else { &searched }
+            ));
         }
         candidates.sort_by(|a, b| score_ggml_model(b).cmp(&score_ggml_model(a)));
 
@@ -320,23 +493,16 @@ impl WhisperResidentEngine {
             "Whisper GGML"
         };
 
-        match ResidentWhisperRecognizer::load(&dll_path, &model_path, language, cfg.threads) {
-            Ok(recognizer) => {
-                let accel = if recognizer.is_gpu_accelerated() {
-                    "Vulkan GPU高速"
-                } else {
-                    "AVX2 CPU"
-                };
-                Some(Self {
-                    label: format!("{} ({})", model_title, accel),
-                    recognizer,
-                })
-            }
-            Err(err) => {
-                eprintln!("[whisper resident warning] {}", err);
-                None
-            }
-        }
+        let recognizer = ResidentWhisperRecognizer::load(&dll_path, &model_path, language, cfg.threads)?;
+        let accel = if recognizer.is_gpu_accelerated() {
+            "Vulkan GPU高速"
+        } else {
+            "AVX2 CPU"
+        };
+        Ok(Self {
+            label: format!("{} ({})", model_title, accel),
+            recognizer,
+        })
     }
 }
 
@@ -403,21 +569,25 @@ pub struct SherpaResidentEngine {
 }
 
 impl SherpaResidentEngine {
-    pub fn discover_qwen3(cfg: &SttConfig, runtime_dir: Option<&Path>) -> Option<Self> {
+    pub fn discover_qwen3(cfg: &SttConfig, runtime_dir: Option<&Path>) -> Result<Self, String> {
         let dll_path = find_file_in_search_dirs(
             "",
             &["sherpa-onnx-c-api.dll"],
             runtime_dir,
-        )?;
-        let model_dir = resolve_model_dir(&cfg.model_dir, runtime_dir)?;
+        )
+        .ok_or_else(|| "sherpa-onnx-c-api.dll が見つかりません".to_string())?;
+        let dirs = resolve_model_search_dirs(&cfg.model_dir, runtime_dir);
         let SherpaModelKind::Qwen3Asr {
             conv_frontend,
             encoder,
             decoder,
             tokenizer,
-        } = discover_sherpa_qwen3_model(&model_dir)?
+        } = dirs.iter().find_map(|d| discover_sherpa_qwen3_model(d))
+            .ok_or_else(|| {
+                "Qwen3-ASR モデル（conv_frontend.onnx / encoder / decoder / tokenizer）が見つかりません（詳細設定からダウンロードしてください）".to_string()
+            })?
         else {
-            return None;
+            return Err("Qwen3-ASR モデル種別が一致しません".into());
         };
 
         let spec = ResidentModelSpec::Qwen3Asr {
@@ -427,30 +597,35 @@ impl SherpaResidentEngine {
             tokenizer: &tokenizer,
             hotwords: "",
         };
-        match ResidentSherpaRecognizer::load(&dll_path, spec, None, cfg.threads) {
-            Ok(recognizer) => {
-                let label = format!("sherpa-onnx Qwen3-ASR 0.6B ({})", recognizer.device_name());
-                Some(Self {
-                    label,
-                    is_qwen3: true,
-                    recognizer,
-                })
-            }
-            Err(err) => {
-                eprintln!("[qwen3-asr resident warning] {}", err);
-                None
-            }
-        }
+        let recognizer = ResidentSherpaRecognizer::load(&dll_path, spec, None, cfg.threads)?;
+        let label = format!("sherpa-onnx Qwen3-ASR 0.6B ({})", recognizer.device_name());
+        Ok(Self {
+            label,
+            is_qwen3: true,
+            recognizer,
+        })
     }
 
-    pub fn discover(cfg: &SttConfig, runtime_dir: Option<&Path>) -> Option<Self> {
+    pub fn discover(cfg: &SttConfig, runtime_dir: Option<&Path>) -> Result<Self, String> {
         let dll_path = find_file_in_search_dirs(
             "",
             &["sherpa-onnx-c-api.dll"],
             runtime_dir,
-        )?;
-        let model_dir = resolve_model_dir(&cfg.model_dir, runtime_dir)?;
-        let model_kind = discover_sherpa_model(&model_dir)?;
+        )
+        .ok_or_else(|| "sherpa-onnx-c-api.dll が見つかりません".to_string())?;
+        let dirs = resolve_model_search_dirs(&cfg.model_dir, runtime_dir);
+        let model_kind = dirs
+            .iter()
+            .find_map(|d| discover_sherpa_model(d))
+            .ok_or_else(|| {
+                format!(
+                    "sherpa-onnx 対応モデルが見つかりません (探索先: {})",
+                    dirs.iter()
+                        .map(|d| d.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
         let language = if cfg.language.trim().is_empty() {
             "ja"
         } else {
@@ -532,12 +707,16 @@ impl SherpaResidentEngine {
         };
 
         // Prefer DPDFNet2 (high-fidelity neural speech enhancement with safe attenuation limit) over GTCRN
-        let dpdfnet_path = find_file_matching(&model_dir, |n| {
-            let l = n.to_ascii_lowercase();
-            l.starts_with("dpdfnet") && l.ends_with(".onnx")
+        let dpdfnet_path = dirs.iter().find_map(|d| {
+            find_file_matching(d, |n| {
+                let l = n.to_ascii_lowercase();
+                l.starts_with("dpdfnet") && l.ends_with(".onnx")
+            })
         });
-        let gtcrn_path = find_file_matching(&model_dir, |n| {
-            n.eq_ignore_ascii_case("gtcrn_simple.onnx")
+        let gtcrn_path = dirs.iter().find_map(|d| {
+            find_file_matching(d, |n| {
+                n.eq_ignore_ascii_case("gtcrn_simple.onnx")
+            })
         });
         let denoiser_spec = if let Some(ref p) = dpdfnet_path {
             Some(SpeechDenoiserSpec::DpdfNet {
@@ -550,26 +729,19 @@ impl SherpaResidentEngine {
             None
         };
 
-        match ResidentSherpaRecognizer::load(&dll_path, spec, denoiser_spec, cfg.threads) {
-            Ok(recognizer) => {
-                let full_label = if is_qwen3 {
-                    format!("{} ({})", label, recognizer.device_name())
-                } else if let Some(dn) = recognizer.denoiser_name() {
-                    format!("{} + {}", label, dn)
-                } else {
-                    label
-                };
-                Some(Self {
-                    label: full_label,
-                    is_qwen3,
-                    recognizer,
-                })
-            }
-            Err(err) => {
-                eprintln!("[stt resident warning] {}", err);
-                None
-            }
-        }
+        let recognizer = ResidentSherpaRecognizer::load(&dll_path, spec, denoiser_spec, cfg.threads)?;
+        let full_label = if is_qwen3 {
+            format!("{} ({})", label, recognizer.device_name())
+        } else if let Some(dn) = recognizer.denoiser_name() {
+            format!("{} + {}", label, dn)
+        } else {
+            label
+        };
+        Ok(Self {
+            label: full_label,
+            is_qwen3,
+            recognizer,
+        })
     }
 }
 
@@ -626,8 +798,9 @@ impl SherpaOnnxEngine {
             &["sherpa-onnx-offline.exe", "sherpa-onnx-offline"],
             runtime_dir,
         )?;
-        let model_dir = resolve_model_dir(&cfg.model_dir, runtime_dir)?;
-        let model_kind = discover_sherpa_model(&model_dir)?;
+        let model_kind = resolve_model_search_dirs(&cfg.model_dir, runtime_dir)
+            .into_iter()
+            .find_map(|d| discover_sherpa_model(&d))?;
         Some(Self {
             exe_path,
             model_kind,
@@ -764,11 +937,14 @@ impl WhisperCliEngine {
             &["whisper-cli.exe", "whisper-cli", "main.exe"],
             runtime_dir,
         )?;
-        let model_dir = resolve_model_dir(&cfg.model_dir, runtime_dir)?;
-        let model_path = find_file_matching(&model_dir, |name| {
-            let lower = name.to_ascii_lowercase();
-            lower.ends_with(".bin") && (lower.contains("ggml") || lower.contains("whisper"))
-        })?;
+        let model_path = resolve_model_search_dirs(&cfg.model_dir, runtime_dir)
+            .into_iter()
+            .find_map(|d| {
+                find_file_matching(&d, |name| {
+                    let lower = name.to_ascii_lowercase();
+                    lower.ends_with(".bin") && (lower.contains("ggml") || lower.contains("whisper"))
+                })
+            })?;
         Some(Self {
             exe_path,
             model_path,
@@ -862,49 +1038,45 @@ pub fn create_local_engine(cfg: &SttConfig, runtime_dir: Option<&Path>) -> Arc<d
             reason: String::new(),
         }),
         "whisper-cpp" | "whisper" => {
-            if let Some(e) = WhisperResidentEngine::discover(cfg, runtime_dir) {
-                Arc::new(e)
-            } else if let Some(e) = WhisperCliEngine::discover(cfg, runtime_dir) {
-                Arc::new(e)
-            } else {
-                Arc::new(MockSttEngine {
-                    explicit_mock: false,
-                    reason: format!(
-                        "whisper.dll または GGML .bin モデルが '{}' に見つかりません",
-                        cfg.model_dir
-                    ),
-                })
+            match WhisperResidentEngine::discover(cfg, runtime_dir) {
+                Ok(e) => Arc::new(e),
+                Err(res_err) => {
+                    if let Some(e) = WhisperCliEngine::discover(cfg, runtime_dir) {
+                        Arc::new(e)
+                    } else {
+                        Arc::new(MockSttEngine {
+                            explicit_mock: false,
+                            reason: res_err,
+                        })
+                    }
+                }
             }
         }
         "sherpa-qwen3" | "qwen3-asr" => {
-            if let Some(e) = SherpaResidentEngine::discover_qwen3(cfg, runtime_dir) {
-                Arc::new(e)
-            } else {
-                Arc::new(MockSttEngine {
+            match SherpaResidentEngine::discover_qwen3(cfg, runtime_dir) {
+                Ok(e) => Arc::new(e),
+                Err(err) => Arc::new(MockSttEngine {
                     explicit_mock: false,
-                    reason: format!(
-                        "Qwen3-ASR モデル（conv_frontend.onnx / encoder / decoder / tokenizer）が '{}' に見つかりません（詳細設定からダウンロードしてください）",
-                        cfg.model_dir
-                    ),
-                })
+                    reason: err,
+                }),
             }
         }
         "local-http" | "http-asr" => {
             Arc::new(LocalHttpAsrEngine::new(cfg.http_asr.clone(), &cfg.language))
         }
         "sherpa-onnx" => {
-            if let Some(e) = SherpaResidentEngine::discover(cfg, runtime_dir) {
-                Arc::new(e)
-            } else if let Some(e) = SherpaOnnxEngine::discover(cfg, runtime_dir) {
-                Arc::new(e)
-            } else {
-                Arc::new(MockSttEngine {
-                    explicit_mock: false,
-                    reason: format!(
-                        "sherpa-onnx ランタイムまたはモデルが '{}' に見つかりません",
-                        cfg.model_dir
-                    ),
-                })
+            match SherpaResidentEngine::discover(cfg, runtime_dir) {
+                Ok(e) => Arc::new(e),
+                Err(res_err) => {
+                    if let Some(e) = SherpaOnnxEngine::discover(cfg, runtime_dir) {
+                        Arc::new(e)
+                    } else {
+                        Arc::new(MockSttEngine {
+                            explicit_mock: false,
+                            reason: res_err,
+                        })
+                    }
+                }
             }
         }
         "whisper-cli" => {
@@ -922,22 +1094,23 @@ pub fn create_local_engine(cfg: &SttConfig, runtime_dir: Option<&Path>) -> Arc<d
         }
         _ => {
             // Prefer Vulkan-GPU Resident Whisper first, then Resident sherpa-onnx DLL, then CLI fallbacks.
-            if let Some(e) = WhisperResidentEngine::discover(cfg, runtime_dir) {
-                Arc::new(e)
-            } else if let Some(e) = SherpaResidentEngine::discover(cfg, runtime_dir) {
-                Arc::new(e)
-            } else if let Some(e) = SherpaOnnxEngine::discover(cfg, runtime_dir) {
-                Arc::new(e)
-            } else if let Some(e) = WhisperCliEngine::discover(cfg, runtime_dir) {
-                Arc::new(e)
-            } else {
-                Arc::new(MockSttEngine {
-                    explicit_mock: false,
-                    reason: format!(
-                        "ローカルSTTモデル未検出: '{}' にモデルを配置してください",
-                        cfg.model_dir
-                    ),
-                })
+            match WhisperResidentEngine::discover(cfg, runtime_dir) {
+                Ok(e) => Arc::new(e),
+                Err(w_err) => match SherpaResidentEngine::discover(cfg, runtime_dir) {
+                    Ok(e) => Arc::new(e),
+                    Err(s_err) => {
+                        if let Some(e) = SherpaOnnxEngine::discover(cfg, runtime_dir) {
+                            Arc::new(e)
+                        } else if let Some(e) = WhisperCliEngine::discover(cfg, runtime_dir) {
+                            Arc::new(e)
+                        } else {
+                            Arc::new(MockSttEngine {
+                                explicit_mock: false,
+                                reason: format!("{} / {}", w_err, s_err),
+                            })
+                        }
+                    }
+                },
             }
         }
     }
@@ -947,39 +1120,6 @@ fn exe_dir() -> Option<PathBuf> {
     std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-}
-
-fn resolve_model_dir(configured: &str, runtime_dir: Option<&Path>) -> Option<PathBuf> {
-    let raw = PathBuf::from(configured.trim());
-    if raw.exists() {
-        return Some(raw);
-    }
-    if raw.is_relative() {
-        if let Some(dir) = exe_dir() {
-            let candidate = dir.join(&raw);
-            if candidate.exists() {
-                return Some(candidate);
-            }
-            if let Some(parent) = dir.parent().and_then(|p| p.parent()) {
-                let candidate2 = parent.join(&raw);
-                if candidate2.exists() {
-                    return Some(candidate2);
-                }
-            }
-        }
-    }
-    // Check embedded self-extracted standalone runtime cache (and default shared cache for lite exe)
-    if let Some(rt) = runtime_dir {
-        let rt_models = rt.join("models");
-        if rt_models.exists() {
-            return Some(rt_models);
-        }
-    }
-    let shared_models = crate::runtime::runtime_cache_dir().join("models");
-    if shared_models.exists() {
-        return Some(shared_models);
-    }
-    None
 }
 
 fn find_file_in_search_dirs(
@@ -1460,5 +1600,30 @@ Elapsed seconds: 0.12
         let eng = create_local_engine(&cfg, None);
         assert_eq!(eng.id(), "local-http");
         assert!(eng.device_name().contains("HTTP"));
+    }
+
+    #[test]
+    fn resolve_model_search_dirs_includes_runtime_when_configured_empty_dir_exists() {
+        let base = std::env::temp_dir().join(format!("voxdrop_multidir_{}", std::process::id()));
+        let empty_cfg_dir = base.join("empty_models");
+        let rt_dir = base.join("runtime");
+        let rt_models = rt_dir.join("models");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&empty_cfg_dir).unwrap();
+        fs::create_dir_all(&rt_models).unwrap();
+        fs::write(rt_models.join("ggml-large-v3-turbo-q8_0.bin"), b"stub").unwrap();
+
+        let mut cfg = SttConfig::default();
+        cfg.model_dir = empty_cfg_dir.to_string_lossy().into_owned();
+        let dirs = resolve_model_search_dirs(&cfg.model_dir, Some(&rt_dir));
+        assert!(dirs.iter().any(|d| d == &empty_cfg_dir));
+        assert!(dirs.iter().any(|d| d == &rt_models));
+        let listed = list_available_ggml_models(&cfg, Some(&rt_dir));
+        assert!(listed.contains(&"ggml-large-v3-turbo-q8_0.bin".to_string()));
+
+        let dl = resolve_download_model_dir("models", Some(&rt_dir));
+        assert_eq!(dl, user_models_dir());
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

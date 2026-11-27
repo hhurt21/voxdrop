@@ -148,6 +148,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Bundle MSVC/OpenMP runtime DLLs required by whisper.dll / ggml-*.dll / onnxruntime.dll
+    // so clean Windows PCs without VC++ Redistributable installed can load the runtime immediately.
+    let sys32 = env::var("SystemRoot")
+        .map(|r| PathBuf::from(r).join("System32"))
+        .unwrap_or_else(|_| PathBuf::from(r"C:\Windows\System32"));
+    for msvc_dll in [
+        "vcomp140.dll",
+        "msvcp140.dll",
+        "msvcp140_1.dll",
+        "vcruntime140.dll",
+        "vcruntime140_1.dll",
+    ] {
+        let in_bin = bin_dir.join(msvc_dll);
+        let in_sys = sys32.join(msvc_dll);
+        if in_bin.is_file() {
+            files.push((format!("bin/{}", msvc_dll), in_bin));
+        } else if in_sys.is_file() {
+            files.push((format!("bin/{}", msvc_dll), in_sys));
+        } else {
+            eprintln!("Warning: optional MSVC runtime DLL not found in bin/ or System32: {}", msvc_dll);
+        }
+    }
+
     println!(
         "Packing {} runtime files (max compression) into standalone {} ...",
         files.len(),

@@ -427,16 +427,26 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
 
 /// Loads 3-tier merged catalog: `model_catalog_overrides.json` > `catalog_cache.json` > `embedded`.
 pub fn load_merged_catalog(data_dir: &Path) -> Vec<ResolvedCatalogModel> {
+    let embedded_manifest = parse_and_validate_manifest(include_str!("../../models_catalog.json")).ok();
+    let embedded_updated = embedded_manifest
+        .as_ref()
+        .map(|m| m.updated_at.as_str())
+        .unwrap_or("");
     let mut base = embedded_catalog_entries();
 
-    // Tier 2: catalog_cache.json overrides matching IDs and appends newly announced models
+    // Tier 2: catalog_cache.json overrides matching IDs only when it is >= embedded updated_at
     if let Ok(raw) = fs::read_to_string(cache_path(data_dir)) {
         if let Ok(manifest) = parse_and_validate_manifest(&raw) {
-            for cached in manifest.models {
-                if let Some(slot) = base.iter_mut().find(|e| e.id == cached.id) {
-                    *slot = cached;
-                } else {
-                    base.push(cached);
+            let cache_fresh = manifest.updated_at.is_empty()
+                || embedded_updated.is_empty()
+                || manifest.updated_at.as_str() >= embedded_updated;
+            if cache_fresh {
+                for cached in manifest.models {
+                    if let Some(slot) = base.iter_mut().find(|e| e.id == cached.id) {
+                        *slot = cached;
+                    } else {
+                        base.push(cached);
+                    }
                 }
             }
         }
@@ -716,6 +726,20 @@ pub fn build_recommended_bundles(
         .collect()
 }
 
+pub fn apply_preset_with_snapshot_in_dirs(
+    cfg: &mut AppConfig,
+    model: &ResolvedCatalogModel,
+    model_dirs: &[PathBuf],
+) -> (PresetRollbackSnapshot, String) {
+    let primary_dir = model_dirs
+        .iter()
+        .find(|d| find_matched_path(d, &model.entry).is_some())
+        .map(|p| p.as_path())
+        .or_else(|| model_dirs.first().map(|p| p.as_path()))
+        .unwrap_or_else(|| Path::new("."));
+    apply_preset_with_snapshot(cfg, model, primary_dir)
+}
+
 pub fn apply_preset_with_snapshot(
     cfg: &mut AppConfig,
     model: &ResolvedCatalogModel,
@@ -802,13 +826,43 @@ pub fn apply_preset_with_snapshot(
             changes.insert(0, format!("STT={}", e.display_name));
         }
         ModelCategory::LlmCorrection => {
-            cfg.stt.accuracy.llm.enabled = true;
-            if let Some(matched) = find_matched_path(models_dir, e) {
-                if let Some(fname) = matched.file_name().and_then(|s| s.to_str()) {
-                    cfg.stt.accuracy.llm.model_file = fname.to_string();
+            if e.id == "llama-server-vulkan" {
+                if let Some(matched) = find_matched_path(models_dir, e) {
+                    let exe_path = if matched.is_dir() {
+                        matched.join("llama-server.exe")
+                    } else {
+                        matched
+                    };
+                    if exe_path.is_file() {
+                        cfg.stt.accuracy.llm.server_exe_path = exe_path.display().to_string();
+                        cfg.stt.accuracy.llm.auto_launch = true;
+                        changes.push("llama-server パスを自動設定 + 自動起動 ON".into());
+                    }
                 }
+            } else {
+                cfg.stt.accuracy.llm.enabled = true;
+                cfg.stt.accuracy.llm.model = e.id.clone();
+                if let Some(matched) = find_matched_path(models_dir, e) {
+                    if let Some(fname) = matched.file_name().and_then(|s| s.to_str()) {
+                        cfg.stt.accuracy.llm.model_file = fname.to_string();
+                    }
+                    let port = crate::stt::http_asr::parse_url(&cfg.stt.accuracy.llm.base_url)
+                        .map(|p| p.port)
+                        .unwrap_or(8081);
+                    cfg.stt.accuracy.llm.server_args = format!(
+                        "-m \"{}\" --host 127.0.0.1 --port {} -ngl 99 -c 2048",
+                        matched.display(),
+                        port
+                    );
+                }
+                if cfg.stt.accuracy.llm.server_exe_path.trim().is_empty() {
+                    if let Some(exe) = crate::stt::local::discover_llama_server_exe(&cfg.stt, None) {
+                        cfg.stt.accuracy.llm.server_exe_path = exe.display().to_string();
+                        cfg.stt.accuracy.llm.auto_launch = true;
+                    }
+                }
+                changes.push(format!("ローカルLLM補正を有効化 ({})", e.display_name));
             }
-            changes.push(format!("ローカルLLM補正を有効化 ({})", e.display_name));
         }
         ModelCategory::Vad => {}
     }
@@ -932,8 +986,12 @@ pub fn is_entry_in_use(entry: &CatalogManifestEntry, cfg: &AppConfig) -> bool {
             (eng == "auto" || eng == "whisper-cpp")
                 && (mf.is_empty() || mf.contains("large-v3-turbo"))
         }
-        "whisper-large-v3-q8" => mf.contains("large-v3-q8"),
-        "whisper-large-v3-turbo-ja-sft" => mf.contains("sft") || mf.contains("model-q8"),
+        "whisper-large-v3-q8" => {
+            mf.contains("large-v3-q5") || mf.contains("large-v3-q8") || mf == "ggml-large-v3.bin"
+        }
+        "whisper-large-v3-turbo-ja-sft" => {
+            mf.contains("kotoba") || mf.contains("sft") || mf.contains("model-q8")
+        }
         "qwen3-asr-0.6b-int8" => {
             eng == "sherpa-qwen3"
                 || (cfg.stt.accuracy.ultimate_ensemble
@@ -941,6 +999,7 @@ pub fn is_entry_in_use(entry: &CatalogManifestEntry, cfg: &AppConfig) -> bool {
         }
         "qwen3-asr-1.7b-gguf" => eng == "local-http",
         "parakeet-ja-int8" => eng == "sherpa-onnx" || mf.contains("parakeet"),
+        "llama-server-vulkan" => cfg.stt.accuracy.llm.enabled,
         "qwen3-1.7b-llm" => cfg.stt.accuracy.llm.enabled && llm_mf.contains("1.7b"),
         "qwen3-4b-llm" => cfg.stt.accuracy.llm.enabled && llm_mf.contains("4b"),
         "dpdfnet-16k" => {
@@ -967,6 +1026,222 @@ pub fn build_catalog_inventory(
     hw: &HardwareProfile,
 ) -> Vec<ModelCatalogItemDto> {
     build_catalog_inventory_ex(models_dir, Path::new("."), cfg, hw, &BTreeMap::new())
+}
+
+pub fn find_matched_path_in_dirs(
+    dirs: &[PathBuf],
+    entry: &CatalogManifestEntry,
+) -> Option<PathBuf> {
+    for d in dirs {
+        if let Some(p) = find_matched_path(d, entry) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+pub fn build_recommended_bundles_in_dirs(
+    hw: &HardwareProfile,
+    model_dirs: &[PathBuf],
+    merged: &[ResolvedCatalogModel],
+) -> Vec<RecommendedBundleDto> {
+    if model_dirs.is_empty() {
+        return build_recommended_bundles(hw, Path::new("."), merged);
+    }
+    let mut bundles = build_recommended_bundles(hw, &model_dirs[0], merged);
+    for b in &mut bundles {
+        let mut pending_mb = 0u32;
+        let mut all_installed = true;
+        for mid in &b.model_ids {
+            if let Some(rm) = merged.iter().find(|r| r.entry.id == *mid) {
+                let inst = rm.entry.bundled_default
+                    || find_matched_path_in_dirs(model_dirs, &rm.entry).is_some();
+                if !inst {
+                    all_installed = false;
+                    pending_mb = pending_mb.saturating_add(rm.entry.download_size_mb);
+                }
+            }
+        }
+        b.pending_download_mb = pending_mb;
+        b.all_installed = all_installed;
+    }
+    bundles
+}
+
+pub fn build_catalog_inventory_in_dirs(
+    model_dirs: &[PathBuf],
+    data_dir: &Path,
+    cfg: &AppConfig,
+    hw: &HardwareProfile,
+    health_map: &BTreeMap<String, ModelUrlHealthDto>,
+) -> Vec<ModelCatalogItemDto> {
+    let mut out = Vec::new();
+    let mut covered_paths: Vec<PathBuf> = Vec::new();
+    let merged = load_merged_catalog(data_dir);
+
+    for resolved in merged {
+        let entry = &resolved.entry;
+        let matched = find_matched_path_in_dirs(model_dirs, entry);
+        let installed = entry.bundled_default || matched.is_some();
+        let disk_size_bytes = matched.as_ref().map(|p| dir_size_bytes(p)).unwrap_or(0);
+        if let Some(p) = matched {
+            covered_paths.push(p);
+        }
+        let in_use = is_entry_in_use(entry, cfg);
+        let health = health_map.get(&entry.id);
+        out.push(ModelCatalogItemDto {
+            id: entry.id.clone(),
+            category: entry.category,
+            display_name: entry.display_name.clone(),
+            runtime: entry.runtime.clone(),
+            version_tag: entry.version_tag.clone(),
+            benefits: entry.benefits.clone(),
+            best_for: entry.best_for.clone(),
+            caution: entry.caution.clone(),
+            min_vram_gb: entry.min_vram_gb,
+            download_size_mb: entry.download_size_mb,
+            scores: entry.scores,
+            bundled_default: entry.bundled_default,
+            downloadable: !entry.primary_url.trim().is_empty(),
+            installed,
+            in_use,
+            can_delete: installed && !entry.bundled_default,
+            disk_size_bytes,
+            disk_size_label: if disk_size_bytes > 0 {
+                format_bytes(disk_size_bytes)
+            } else if entry.bundled_default {
+                "本体内蔵".into()
+            } else {
+                format!("約 {} MB", entry.download_size_mb)
+            },
+            pc_fit_badge: compute_pc_fit(entry, hw),
+            primary_url: entry.primary_url.clone(),
+            default_url: resolved.default_url,
+            mirror_urls: entry.mirror_urls.clone(),
+            has_override: resolved.has_override,
+            skip_sha256: resolved.skip_sha256,
+            sha256: entry.sha256.clone(),
+            preset_summary: entry.recommended_preset.summary_text(),
+            health_status: health
+                .map(|h| h.status.clone())
+                .unwrap_or_else(|| "unknown".into()),
+            health_message: health.map(|h| h.message.clone()).unwrap_or_default(),
+        });
+    }
+
+    let mut seen_custom = std::collections::HashSet::new();
+    for models_dir in model_dirs {
+        if let Ok(entries) = fs::read_dir(models_dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if covered_paths.iter().any(|cp| cp == &p) {
+                    continue;
+                }
+                let Some(name) = p.file_name().and_then(|s| s.to_str()).map(|s| s.to_string()) else {
+                    continue;
+                };
+                if name.eq_ignore_ascii_case("silero_vad.onnx") {
+                    continue;
+                }
+                let lower = name.to_ascii_lowercase();
+                let is_extra_model = (p.is_file()
+                    && (lower.ends_with(".bin") || lower.ends_with(".gguf") || lower.ends_with(".onnx")))
+                    || (p.is_dir() && lower.starts_with("sherpa-onnx-"));
+                if !is_extra_model || !seen_custom.insert(lower.clone()) {
+                    continue;
+                }
+                let sz = dir_size_bytes(&p);
+                let in_use = cfg.stt.model_file.eq_ignore_ascii_case(&name)
+                    || cfg.stt.accuracy.llm.model_file.eq_ignore_ascii_case(&name);
+                let cat = if lower.ends_with(".gguf") && !lower.contains("asr") {
+                    ModelCategory::LlmCorrection
+                } else if lower.contains("gtcrn") || lower.contains("dpdf") || lower.contains("deepfilter") {
+                    ModelCategory::NoiseSuppression
+                } else {
+                    ModelCategory::Stt
+                };
+                out.push(ModelCatalogItemDto {
+                    id: format!("custom:{}", name),
+                    category: cat,
+                    display_name: format!("カスタム追加: {}", name),
+                    runtime: if lower.ends_with(".onnx") || p.is_dir() {
+                        "sherpa-onnx (DirectML / CPU)".into()
+                    } else {
+                        "Vulkan / CPU".into()
+                    },
+                    version_tag: "custom".into(),
+                    benefits: vec![
+                        "ユーザーが追加・カスタムURL取得したローカルモデルファイル".into(),
+                        "外部モデル管理UIから不要時にワンクリック個別削除が可能".into(),
+                    ],
+                    best_for: "特定話者・専門用語向けカスタムモデル".into(),
+                    caution: "動作要件は配置した量子化形式に依存します".into(),
+                    min_vram_gb: 2.0,
+                    download_size_mb: (sz / (1024 * 1024)) as u32,
+                    scores: ModelScores::default(),
+                    bundled_default: false,
+                    downloadable: false,
+                    installed: true,
+                    in_use,
+                    can_delete: true,
+                    disk_size_bytes: sz,
+                    disk_size_label: format_bytes(sz),
+                    pc_fit_badge: "カスタム".into(),
+                    primary_url: String::new(),
+                    default_url: String::new(),
+                    mirror_urls: Vec::new(),
+                    has_override: false,
+                    skip_sha256: false,
+                    sha256: None,
+                    preset_summary: String::new(),
+                    health_status: "unknown".into(),
+                    health_message: String::new(),
+                });
+            }
+        }
+    }
+    out
+}
+
+pub fn delete_model_from_disk_in_dirs(
+    model_dirs: &[PathBuf],
+    data_dir: &Path,
+    model_id: &str,
+) -> Result<u64, String> {
+    if let Some(custom_name) = model_id.strip_prefix("custom:") {
+        let clean = crate::stt::downloader::sanitize_filename(custom_name)?;
+        for models_dir in model_dirs {
+            let p = models_dir.join(&clean);
+            if p.exists() {
+                let freed = dir_size_bytes(&p);
+                remove_path_and_partials(&p)?;
+                return Ok(freed);
+            }
+        }
+        return Err("対象モデルが見つかりません".into());
+    }
+    let merged = load_merged_catalog(data_dir);
+    let resolved = merged
+        .iter()
+        .find(|r| r.entry.id == model_id)
+        .ok_or_else(|| format!("未知のモデルIDです: {}", model_id))?;
+
+    if resolved.entry.bundled_default {
+        return Err(format!(
+            "「{}」は同梱標準モデルのため削除できません（保護対象）",
+            resolved.entry.display_name
+        ));
+    }
+
+    let matched = find_matched_path_in_dirs(model_dirs, &resolved.entry).ok_or_else(|| {
+        format!(
+            "「{}」のローカルファイルは既に存在しません",
+            resolved.entry.display_name
+        )
+    })?;
+    let freed = dir_size_bytes(&matched);
+    remove_path_and_partials(&matched)?;
+    Ok(freed)
 }
 
 pub fn build_catalog_inventory_ex(

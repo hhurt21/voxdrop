@@ -28,6 +28,7 @@
           <button class="nav-btn" data-tab="dm-tts">DM読み上げ (VOICEVOX)</button>
           <div class="nav-section">カスタマイズ</div>
           <button class="nav-btn" data-tab="diagnostics">音声診断・モデル比較</button>
+          <button class="nav-btn" data-tab="local-llm">ローカルLLM補正</button>
           <button class="nav-btn" data-tab="commands">合言葉・音声コマンド</button>
           <button class="nav-btn" data-tab="dictionary">辞書・整形</button>
           <button class="nav-btn" data-tab="guard">安全ガード・自動化</button>
@@ -632,6 +633,109 @@
           </div>
         </section>
 
+        <!-- Dedicated Local LLM Post-Correction Tab -->
+        <section class="tab-panel" id="tab-local-llm">
+          <div class="card">
+            <div class="row space-between" style="flex-wrap: wrap; gap: 8px">
+              <h3>ローカルLLM かんたんセットアップ（誤字・空耳・口調補正 / Vulkan・CPU対応）</h3>
+              <div class="row gap-xs" style="flex-wrap: wrap">
+                <span class="pill" id="llmStatusBadge">LLM: 未確認</span>
+                <span class="pill" id="llmRuntimeBadge">llama-server: 未確認</span>
+                <span class="pill" id="llmModelCountBadge">GGUFモデル: 0件</span>
+              </div>
+            </div>
+            <p class="hint">
+              認識結果をそのまま出力する前に、直前会話・辞書・ゲーム名・読み（モーラ）を踏まえてローカル LLM が自然な日本語へ補正します（クラウド送信ゼロ・CUDA不要・Radeon/GeForce/Intel/CPU対応）。
+            </p>
+            <div class="row gap-sm" style="margin-top: 10px; flex-wrap: wrap">
+              <button type="button" class="btn-primary btn-sm" id="btnDownloadLlamaServer">llama-server (Vulkan/CPU) を自動導入 (~38MB)</button>
+              <button type="button" class="btn-secondary btn-sm" id="btnDownloadLlm17b">Qwen3-1.7B 軽量版を取得 (~1.1GB)</button>
+              <button type="button" class="btn-secondary btn-sm" id="btnDownloadLlm4b">Qwen3-4B 高精度版を取得 (~2.4GB)</button>
+            </div>
+            <div id="llmSetupProgressWrap" style="display: none; margin-top: 10px">
+              <div class="small-label" id="llmSetupProgressText">準備中...</div>
+              <div style="height: 8px; background: rgba(255,255,255,0.08); border-radius: 6px; overflow: hidden; margin-top: 4px">
+                <div id="llmSetupProgressBar" style="height: 100%; width: 0%; background: var(--accent);"></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="row space-between" style="flex-wrap: wrap; gap: 8px">
+              <h3>モデル選択 &amp; 接続・自動起動設定</h3>
+              <div class="row gap-xs" style="flex-wrap: wrap">
+                <button type="button" class="btn-secondary btn-sm" id="btnLlmPresetLlamaServer">llama-server (:8081)</button>
+                <button type="button" class="btn-secondary btn-sm" id="btnLlmPresetOllama">Ollama (:11434)</button>
+                <button type="button" class="btn-secondary btn-sm" id="btnLlmPresetLmStudio">LM Studio (:1234)</button>
+              </div>
+            </div>
+            <div class="toggle-grid" style="margin-top: 8px">
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkLlmEnabled" />
+                <span>認識後の誤字・空耳をローカルLLMで文脈補正する</span>
+              </label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkLlmAutoLaunch" />
+                <span>有効時・起動時に llama-server を自動ヘッドレス起動する</span>
+              </label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkLlmStopExit" />
+                <span>VoxDrop 終了時に自動停止する</span>
+              </label>
+            </div>
+            <div class="form-grid" style="margin-top: 10px">
+              <label>導入済み GGUF モデル選択
+                <select id="llmModelFileSelect" class="input">
+                  <option value="">自動（最初に検出した .gguf）</option>
+                </select>
+              </label>
+              <label>文体スタイル
+                <select id="llmStyle" class="input">
+                  <option value="normal">標準（誤字のみ最小修正）</option>
+                  <option value="casual">フレンド向けタメ口</option>
+                  <option value="polite">丁寧語（です・ます）</option>
+                  <option value="game_short">ゲーム通話向け簡潔</option>
+                </select>
+              </label>
+              <label>LLM Base URL
+                <input type="text" id="llmBaseUrl" class="input" placeholder="http://127.0.0.1:8081" />
+              </label>
+              <label>Endpoint Path
+                <input type="text" id="llmEndpointPath" class="input" placeholder="/v1/chat/completions" />
+              </label>
+              <label>モデル識別子 (OpenAI / Ollama名)
+                <input type="text" id="llmModel" class="input" placeholder="qwen3-1.7b" />
+              </label>
+              <label>タイムアウト (ms)
+                <input type="number" id="llmTimeoutMs" class="input" min="250" max="10000" value="1800" />
+              </label>
+              <label>LLM実行ファイル (空欄で自動検出)
+                <input type="text" id="llmExePath" class="input" placeholder="自動検出（models\llama-server\llama-server.exe）" />
+              </label>
+              <label>起動引数 (空欄で選択モデルから自動生成)
+                <input type="text" id="llmArgs" class="input" placeholder="自動生成 (-m ... --port 8081 -ngl 99)" />
+              </label>
+              <label>API Key（任意）
+                <input type="password" id="llmApiKey" class="input" />
+              </label>
+            </div>
+            <div class="row gap-sm" style="margin-top: 10px; flex-wrap: wrap">
+              <button type="button" class="btn-secondary btn-sm" id="btnTestLlm">LLM接続テスト</button>
+              <button type="button" class="btn-primary btn-sm" id="btnLaunchLlm">LLMサーバーを起動</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3>ライブ誤字・空耳補正テスト</h3>
+            <p class="hint">入力した文字列を現在の辞書・宛先・文体設定でローカル LLM に補正させ、動作と応答速度を確認します。</p>
+            <div class="row gap-sm" style="margin-top: 8px">
+              <input type="text" id="llmTestInput" class="input grow" placeholder="例: ばんだるかってミッド見よう" />
+              <button type="button" class="btn-primary btn-sm" id="btnTestLlmSample">補正テスト実行</button>
+            </div>
+            <div id="llmTestOutput" class="ab-result" style="margin-top: 8px"></div>
+          </div>
+        </section>
+
         <!-- Commands & Passphrase Rules Tab -->
         <section class="tab-panel" id="tab-commands">
           <div class="card">
@@ -1136,57 +1240,11 @@
 
           <div class="card">
             <div class="row space-between">
-              <h3>ローカルLLM 誤認識・空耳ポストコレクタ（OpenAI互換 / Vulkan）</h3>
-              <span class="pill" id="llmStatusBadge">未確認</span>
-            </div>
-            <div class="toggle-grid" style="margin-top: 8px">
-              <label class="checkbox-row">
-                <input type="checkbox" id="chkLlmEnabled" />
-                <span>認識後の誤字・空耳をローカルLLMで文脈補正する</span>
-              </label>
-              <label class="checkbox-row">
-                <input type="checkbox" id="chkLlmAutoLaunch" />
-                <span>有効時に llama-server 等を自動起動</span>
-              </label>
-              <label class="checkbox-row">
-                <input type="checkbox" id="chkLlmStopExit" />
-                <span>終了時に自動停止</span>
-              </label>
-            </div>
-            <div class="form-grid" style="margin-top: 8px">
-              <label>LLM Base URL
-                <input type="text" id="llmBaseUrl" class="input" placeholder="http://127.0.0.1:8081" />
-              </label>
-              <label>Endpoint Path
-                <input type="text" id="llmEndpointPath" class="input" placeholder="/v1/chat/completions" />
-              </label>
-              <label>モデル識別子
-                <input type="text" id="llmModel" class="input" placeholder="qwen3-1.7b" />
-              </label>
-              <label>文体スタイル
-                <select id="llmStyle" class="input">
-                  <option value="normal">標準（誤字のみ最小修正）</option>
-                  <option value="casual">フレンド向けタメ口</option>
-                  <option value="polite">丁寧語（です・ます）</option>
-                  <option value="game_short">ゲーム通話向け簡潔</option>
-                </select>
-              </label>
-              <label>LLM実行ファイル (llama-server.exe 等)
-                <input type="text" id="llmExePath" class="input" />
-              </label>
-              <label>起動引数 (Vulkan GPU / -m models\...)
-                <input type="text" id="llmArgs" class="input" />
-              </label>
-              <label>タイムアウト (ms)
-                <input type="number" id="llmTimeoutMs" class="input" min="250" max="10000" value="1800" />
-              </label>
-              <label>API Key（任意）
-                <input type="password" id="llmApiKey" class="input" />
-              </label>
-            </div>
-            <div class="row gap-sm" style="margin-top: 8px">
-              <button type="button" class="btn-secondary btn-sm" id="btnTestLlm">LLM接続テスト</button>
-              <button type="button" class="btn-primary btn-sm" id="btnLaunchLlm">LLMサーバー起動</button>
+              <div>
+                <h3>ローカルLLM 誤認識・空耳ポストコレクタ（専用タブへ移動しました）</h3>
+                <p class="hint">llama-server 自動導入、Qwen3-1.7B/4B モデル選択、Ollama/LM Studio 接続切替、ライブ補正テストは左メニュー「ローカルLLM補正」から行えます。</p>
+              </div>
+              <button type="button" class="btn-secondary btn-sm" id="btnJumpLocalLlmTab">ローカルLLM補正タブを開く →</button>
             </div>
           </div>
 

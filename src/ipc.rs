@@ -61,6 +61,7 @@ pub enum ClientCommand {
     LaunchHttpAsr,
     TestLlmCorrector { base_url: Option<String> },
     LaunchLlmServer,
+    TestLlmSample { text: String },
     GetCatalogInventory,
     DeleteModel { model_id: String },
     ApplyWizardRecommendation,
@@ -276,6 +277,13 @@ pub enum BackendEvent {
         ok: bool,
         message: String,
     },
+    LlmSampleResult {
+        ok: bool,
+        input: String,
+        output: String,
+        elapsed_ms: u64,
+        error: Option<String>,
+    },
     PostSendError {
         code: String,
         detail: String,
@@ -288,6 +296,9 @@ pub enum BackendEvent {
         models: Vec<String>,
         selected: String,
         qwen3_installed: bool,
+        llm_models: Vec<String>,
+        selected_llm_model: String,
+        llama_server_path: Option<String>,
     },
     DiagnosticsUpdated {
         items: Vec<UtteranceDiagnosticDto>,

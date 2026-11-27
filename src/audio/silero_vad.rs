@@ -226,6 +226,7 @@ fn find_silero_model_path(explicit_path: &str, runtime_dir: Option<&Path>) -> Op
     if let Some(rt) = runtime_dir {
         candidates.push(rt.join("models").join("silero_vad.onnx"));
     }
+    candidates.push(crate::stt::local::user_models_dir().join("silero_vad.onnx"));
     candidates.push(
         crate::runtime::runtime_cache_dir()
             .join("models")
@@ -250,6 +251,17 @@ fn load_vad_dll_fns(dll_path: &Path) -> Result<VadDllFns, String> {
     let path_str = abs_path.to_string_lossy();
     let clean_path = path_str.strip_prefix(r"\\?\").unwrap_or(&path_str);
     let wide: Vec<u16> = clean_path.encode_utf16().chain(std::iter::once(0)).collect();
+
+    if let Some(bin_dir) = Path::new(clean_path).parent() {
+        let dir_wide: Vec<u16> = bin_dir
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            let _ = windows::Win32::System::LibraryLoader::SetDllDirectoryW(PCWSTR(dir_wide.as_ptr()));
+        }
+    }
 
     unsafe {
         let hmodule = LoadLibraryExW(

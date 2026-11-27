@@ -131,6 +131,13 @@ enum UserEvent {
     OnlineCatalogSyncDone(Result<(usize, usize, String), String>),
     HttpAsrHealthDone(Result<String, String>),
     LlmHealthDone(Result<String, String>),
+    LlmSampleDone {
+        ok: bool,
+        input: String,
+        output: String,
+        elapsed_ms: u64,
+        error: Option<String>,
+    },
     PhaseUpdate(String),
     StreamingPreviewReady(String),
     AppUpdateFound {
@@ -1447,17 +1454,55 @@ fn toggle_panic_safe_mode(
     );
 }
 
+fn emit_stt_models(state: &AppState, webview: &WebView) {
+    let models = stt::local::list_available_ggml_models(
+        &state.config.stt,
+        state.runtime_dir.as_deref(),
+    );
+    let qwen3_installed = stt::local::has_qwen3_asr_model(
+        &state.config.stt,
+        state.runtime_dir.as_deref(),
+    );
+    let llm_models = stt::local::list_available_llm_gguf_models(
+        &state.config.stt,
+        state.runtime_dir.as_deref(),
+    );
+    let llama_server_path = stt::local::discover_llama_server_exe(
+        &state.config.stt,
+        state.runtime_dir.as_deref(),
+    )
+    .map(|p| p.display().to_string());
+    emit(
+        webview,
+        &BackendEvent::SttModels {
+            models,
+            selected: state.config.stt.model_file.clone(),
+            qwen3_installed,
+            llm_models,
+            selected_llm_model: state.config.stt.accuracy.llm.model_file.clone(),
+            llama_server_path,
+        },
+    );
+}
+
 fn emit_catalog_inventory(state: &AppState, webview: &WebView) {
-    let m_dir = stt::local::resolve_download_model_dir(
+    let mut m_dirs = stt::local::resolve_model_search_dirs(
         &state.config.stt.model_dir,
         state.runtime_dir.as_deref(),
     );
+    let dl_dir = stt::local::resolve_download_model_dir(
+        &state.config.stt.model_dir,
+        state.runtime_dir.as_deref(),
+    );
+    if !m_dirs.iter().any(|d| d == &dl_dir) {
+        m_dirs.insert(0, dl_dir);
+    }
     let data_dir = state.data_dir();
     let hw = gpu_diag::detect_hardware_profile(state.runtime_dir.as_deref());
     let merged = stt::catalog::load_merged_catalog(&data_dir);
-    let bundles = stt::catalog::build_recommended_bundles(&hw, &m_dir, &merged);
-    let items = stt::catalog::build_catalog_inventory_ex(
-        &m_dir,
+    let bundles = stt::catalog::build_recommended_bundles_in_dirs(&hw, &m_dirs, &merged);
+    let items = stt::catalog::build_catalog_inventory_in_dirs(
+        &m_dirs,
         &data_dir,
         &state.config,
         &hw,
@@ -1485,16 +1530,23 @@ fn apply_model_auto_preset_for_state(
     proxy: &EventLoopProxy<UserEvent>,
 ) -> bool {
     let data_dir = state.data_dir();
-    let m_dir = stt::local::resolve_download_model_dir(
+    let mut m_dirs = stt::local::resolve_model_search_dirs(
         &state.config.stt.model_dir,
         state.runtime_dir.as_deref(),
     );
+    let dl_dir = stt::local::resolve_download_model_dir(
+        &state.config.stt.model_dir,
+        state.runtime_dir.as_deref(),
+    );
+    if !m_dirs.iter().any(|d| d == &dl_dir) {
+        m_dirs.insert(0, dl_dir);
+    }
     let merged = stt::catalog::load_merged_catalog(&data_dir);
     let Some(resolved) = merged.iter().find(|r| r.entry.id == model_id) else {
         return false;
     };
     let (snap, summary) =
-        stt::catalog::apply_preset_with_snapshot(&mut state.config, resolved, &m_dir);
+        stt::catalog::apply_preset_with_snapshot_in_dirs(&mut state.config, resolved, &m_dirs);
     state.last_preset_snapshot = Some(snap);
     let _ = state.config.save_to(&state.config_path);
 
@@ -2872,9 +2924,15 @@ fn main() -> wry::Result<()> {
     }
     if state.config.stt.accuracy.llm.enabled && state.config.stt.accuracy.llm.auto_launch {
         let lcfg = state.config.stt.accuracy.llm.clone();
+        let scfg = state.config.stt.clone();
+        let rt_dir = state.runtime_dir.clone();
         let lp = proxy.clone();
         thread::spawn(move || {
-            let res = stt::llm_corrector::ensure_llm_server_running(&lcfg);
+            let res = stt::llm_corrector::ensure_llm_server_running_with_dirs(
+                &lcfg,
+                &scfg,
+                rt_dir.as_deref(),
+            );
             let _ = lp.send_event(UserEvent::LlmHealthDone(res));
         });
     }
@@ -2998,18 +3056,7 @@ fn main() -> wry::Result<()> {
                 state.stt_engine_name = engine.name();
                 state.stt_device_name = engine.device_name();
                 let _ = stt_tx.send(SttWorkerMsg::ReloadEngine(engine));
-                let models =
-                    stt::local::list_available_ggml_models(&state.config.stt, state.runtime_dir.as_deref());
-                let qwen3_installed =
-                    stt::local::has_qwen3_asr_model(&state.config.stt, state.runtime_dir.as_deref());
-                emit(
-                    &webview,
-                    &BackendEvent::SttModels {
-                        models,
-                        selected: state.config.stt.model_file.clone(),
-                        qwen3_installed,
-                    },
-                );
+                emit_stt_models(&state, &webview);
                 emit_all(&webview, &overlay_webview, &state.status_event());
                 if let Some(err) = error {
                     emit(
@@ -3237,6 +3284,24 @@ fn main() -> wry::Result<()> {
                     emit(&webview, &BackendEvent::Toast { level: "error".into(), message: err });
                 }
             },
+            Event::UserEvent(UserEvent::LlmSampleDone {
+                ok,
+                input,
+                output,
+                elapsed_ms,
+                error,
+            }) => {
+                emit(
+                    &webview,
+                    &BackendEvent::LlmSampleResult {
+                        ok,
+                        input,
+                        output,
+                        elapsed_ms,
+                        error,
+                    },
+                );
+            }
             Event::UserEvent(UserEvent::AppUpdateFound { latest_tag, url }) => {
                 emit(
                     &webview,
@@ -3499,22 +3564,7 @@ fn main() -> wry::Result<()> {
                     },
                 );
                 if done {
-                    let models = stt::local::list_available_ggml_models(
-                        &state.config.stt,
-                        state.runtime_dir.as_deref(),
-                    );
-                    let qwen3_installed = stt::local::has_qwen3_asr_model(
-                        &state.config.stt,
-                        state.runtime_dir.as_deref(),
-                    );
-                    emit(
-                        &webview,
-                        &BackendEvent::SttModels {
-                            models,
-                            selected: state.config.stt.model_file.clone(),
-                            qwen3_installed,
-                        },
-                    );
+                    emit_stt_models(&state, &webview);
                     emit(
                         &webview,
                         &BackendEvent::Toast {
@@ -4322,9 +4372,15 @@ fn main() -> wry::Result<()> {
                             && state.config.stt.accuracy.llm.auto_launch
                         {
                             let lcfg = state.config.stt.accuracy.llm.clone();
+                            let scfg = state.config.stt.clone();
+                            let rt_dir = state.runtime_dir.clone();
                             let lp = proxy.clone();
                             thread::spawn(move || {
-                                let res = stt::llm_corrector::ensure_llm_server_running(&lcfg);
+                                let res = stt::llm_corrector::ensure_llm_server_running_with_dirs(
+                                    &lcfg,
+                                    &scfg,
+                                    rt_dir.as_deref(),
+                                );
                                 let _ = lp.send_event(UserEvent::LlmHealthDone(res));
                             });
                         }
@@ -4810,22 +4866,7 @@ fn main() -> wry::Result<()> {
                         );
                     }
                     ClientCommand::ListSttModels => {
-                        let models = stt::local::list_available_ggml_models(
-                            &state.config.stt,
-                            state.runtime_dir.as_deref(),
-                        );
-                        let qwen3_installed = stt::local::has_qwen3_asr_model(
-                            &state.config.stt,
-                            state.runtime_dir.as_deref(),
-                        );
-                        emit(
-                            &webview,
-                            &BackendEvent::SttModels {
-                                models,
-                                selected: state.config.stt.model_file.clone(),
-                                qwen3_installed,
-                            },
-                        );
+                        emit_stt_models(&state, &webview);
                     }
                     ClientCommand::ReplayUtterance { id } => {
                         if let Some(entry) = state.recent_utterances.iter().find(|u| u.id == id) {
@@ -5066,10 +5107,59 @@ fn main() -> wry::Result<()> {
                     }
                     ClientCommand::LaunchLlmServer => {
                         let cfg = state.config.stt.accuracy.llm.clone();
+                        let scfg = state.config.stt.clone();
+                        let rt_dir = state.runtime_dir.clone();
                         let p = proxy.clone();
                         thread::spawn(move || {
-                            let res = stt::llm_corrector::ensure_llm_server_running(&cfg);
+                            let res = stt::llm_corrector::ensure_llm_server_running_with_dirs(
+                                &cfg,
+                                &scfg,
+                                rt_dir.as_deref(),
+                            );
                             let _ = p.send_event(UserEvent::LlmHealthDone(res));
+                        });
+                    }
+                    ClientCommand::TestLlmSample { text } => {
+                        let mut cfg = state.config.stt.accuracy.llm.clone();
+                        cfg.enabled = true;
+                        let dict = state.effective_filter().dictionary;
+                        let tgt_label = discord::target_display_label(
+                            state.config.discord_targets.active_target(),
+                        );
+                        let game_name = state.active_profile().map(|p| p.name.clone());
+                        let recent = state.recent_sent_strings();
+                        let p = proxy.clone();
+                        thread::spawn(move || {
+                            let t0 = Instant::now();
+                            let req = stt::llm_corrector::LlmCorrectionRequest {
+                                primary_text: &text,
+                                secondary_text: None,
+                                recent_messages: &recent,
+                                target_label: &tgt_label,
+                                game_name: game_name.as_deref(),
+                                dictionary: &dict,
+                                style: cfg.style,
+                            };
+                            match stt::llm_corrector::correct_transcript_with_llm(&cfg, &req) {
+                                Ok(out) => {
+                                    let _ = p.send_event(UserEvent::LlmSampleDone {
+                                        ok: true,
+                                        input: text,
+                                        output: out,
+                                        elapsed_ms: t0.elapsed().as_millis() as u64,
+                                        error: None,
+                                    });
+                                }
+                                Err(err) => {
+                                    let _ = p.send_event(UserEvent::LlmSampleDone {
+                                        ok: false,
+                                        input: text,
+                                        output: String::new(),
+                                        elapsed_ms: t0.elapsed().as_millis() as u64,
+                                        error: Some(err),
+                                    });
+                                }
+                            }
                         });
                     }
                     ClientCommand::GetCatalogInventory => {
@@ -5173,10 +5263,17 @@ fn main() -> wry::Result<()> {
                             &state.config.stt.model_dir,
                             state.runtime_dir.as_deref(),
                         );
+                        let mut m_dirs = stt::local::resolve_model_search_dirs(
+                            &state.config.stt.model_dir,
+                            state.runtime_dir.as_deref(),
+                        );
+                        if !m_dirs.iter().any(|d| d == &m_dir) {
+                            m_dirs.insert(0, m_dir.clone());
+                        }
                         let data_dir = state.data_dir();
                         let hw = gpu_diag::detect_hardware_profile(state.runtime_dir.as_deref());
                         let merged = stt::catalog::load_merged_catalog(&data_dir);
-                        let bundles = stt::catalog::build_recommended_bundles(&hw, &m_dir, &merged);
+                        let bundles = stt::catalog::build_recommended_bundles_in_dirs(&hw, &m_dirs, &merged);
                         if let Some(bundle) = bundles.into_iter().find(|b| b.id == bundle_id) {
                             let p = proxy.clone();
                             let to_download: Vec<String> = bundle
@@ -5188,7 +5285,7 @@ fn main() -> wry::Result<()> {
                                         .find(|r| &r.entry.id == mid)
                                         .map(|r| {
                                             !r.entry.bundled_default
-                                                && stt::catalog::find_matched_path(&m_dir, &r.entry)
+                                                && stt::catalog::find_matched_path_in_dirs(&m_dirs, &r.entry)
                                                     .is_none()
                                         })
                                         .unwrap_or(false)
@@ -5310,14 +5407,14 @@ fn main() -> wry::Result<()> {
                         }
                     }
                     ClientCommand::CleanupUnusedModels => {
-                        let m_dir = stt::local::resolve_download_model_dir(
+                        let m_dirs = stt::local::resolve_model_search_dirs(
                             &state.config.stt.model_dir,
                             state.runtime_dir.as_deref(),
                         );
                         let data_dir = state.data_dir();
                         let hw = gpu_diag::detect_hardware_profile(state.runtime_dir.as_deref());
-                        let items = stt::catalog::build_catalog_inventory_ex(
-                            &m_dir,
+                        let items = stt::catalog::build_catalog_inventory_in_dirs(
+                            &m_dirs,
                             &data_dir,
                             &state.config,
                             &hw,
@@ -5327,7 +5424,7 @@ fn main() -> wry::Result<()> {
                         let mut del_count = 0usize;
                         for item in items {
                             if item.can_delete && !item.in_use {
-                                if let Ok(f) = stt::catalog::delete_model_from_disk_ex(&m_dir, &data_dir, &item.id) {
+                                if let Ok(f) = stt::catalog::delete_model_from_disk_in_dirs(&m_dirs, &data_dir, &item.id) {
                                     freed_total = freed_total.saturating_add(f);
                                     del_count += 1;
                                 }
@@ -5406,12 +5503,12 @@ fn main() -> wry::Result<()> {
                         }
 
                         thread::sleep(Duration::from_millis(80));
-                        let m_dir = stt::local::resolve_download_model_dir(
+                        let m_dirs = stt::local::resolve_model_search_dirs(
                             &state.config.stt.model_dir,
                             state.runtime_dir.as_deref(),
                         );
                         let data_dir = state.data_dir();
-                        match stt::catalog::delete_model_from_disk_ex(&m_dir, &data_dir, &model_id) {
+                        match stt::catalog::delete_model_from_disk_in_dirs(&m_dirs, &data_dir, &model_id) {
                             Ok(freed) => {
                                 let _ = state.config.save_to(&state.config_path);
                                 state.stt_ready = false;
@@ -5421,6 +5518,7 @@ fn main() -> wry::Result<()> {
                                     state.runtime_dir.clone(),
                                     proxy.clone(),
                                 );
+                                emit_stt_models(&state, &webview);
                                 emit_catalog_inventory(&state, &webview);
                                 emit(
                                     &webview,
