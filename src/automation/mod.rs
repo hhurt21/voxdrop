@@ -100,9 +100,24 @@ pub fn paste_text_guarded(
     let (restore_hwnd, proc_name) = prepare_foreground(guard)?;
 
     let res = if text.is_empty() {
-        input::send_key_action(KeyAction::Enter)
+        if press_enter {
+            input::send_key_action(KeyAction::Enter)
+        } else {
+            Ok(())
+        }
+    } else if press_enter {
+        let r = input::paste_with_clipboard_restore(
+            text,
+            false,
+            guard.clipboard_restore_delay_ms.max(100),
+        );
+        if r.is_ok() {
+            send_enter_with_verify_and_retry(&guard.allowed_processes)
+        } else {
+            r
+        }
     } else {
-        input::paste_with_clipboard_restore(text, press_enter, guard.clipboard_restore_delay_ms)
+        input::paste_with_clipboard_restore(text, false, guard.clipboard_restore_delay_ms)
     };
 
     maybe_restore(restore_hwnd);
@@ -376,7 +391,7 @@ pub fn send_to_discord_target(
                             );
                         }
                         input::post_chars_window_message(render_hwnd, chunk)?;
-                        thread::sleep(Duration::from_millis(80));
+                        thread::sleep(Duration::from_millis(120));
                         match uia::read_main_composer_text_no_mouse(&guard.allowed_processes) {
                             Some(val) if val.trim().is_empty() => {
                                 continue;
@@ -396,7 +411,7 @@ pub fn send_to_discord_target(
                     }
                     if press_enter {
                         input::post_enter_window_message(render_hwnd)?;
-                        thread::sleep(Duration::from_millis(90));
+                        thread::sleep(Duration::from_millis(140));
                         let mut cleared = match uia::read_main_composer_text_no_mouse(&guard.allowed_processes) {
                             Some(rem) => rem.trim().is_empty(),
                             None => true,
@@ -404,7 +419,7 @@ pub fn send_to_discord_target(
                         if !cleared {
                             let _ = uia::focus_main_composer_verified_no_mouse(&guard.allowed_processes, 300);
                             input::post_enter_window_message(render_hwnd)?;
-                            thread::sleep(Duration::from_millis(85));
+                            thread::sleep(Duration::from_millis(140));
                             cleared = match uia::read_main_composer_text_no_mouse(&guard.allowed_processes) {
                                 Some(rem) => rem.trim().is_empty(),
                                 None => true,
@@ -461,9 +476,9 @@ pub fn send_to_discord_target(
         }
     }
 
-    // Ensure Discord is foreground; only do an extra UIA focus check if we had no target navigation
+    // Ensure Discord is foreground and composer has focus when returning from another window or skipping nav
     let (_, proc_name) = prepare_foreground(guard)?;
-    if target.is_none() || !auto_navigate {
+    if !already_allowed || target.is_none() || !auto_navigate {
         let _ = uia::focus_discord_chat_input(&guard.allowed_processes, 250);
     }
 
@@ -476,11 +491,22 @@ pub fn send_to_discord_target(
     } else {
         let mut last_res = Ok(());
         for (idx, chunk) in chunks.iter().enumerate() {
-            last_res = input::paste_with_clipboard_restore(
-                chunk,
-                press_enter,
-                guard.clipboard_restore_delay_ms,
-            );
+            if press_enter {
+                last_res = input::paste_with_clipboard_restore(
+                    chunk,
+                    false,
+                    guard.clipboard_restore_delay_ms.max(100),
+                );
+                if last_res.is_ok() {
+                    last_res = send_enter_with_verify_and_retry(&guard.allowed_processes);
+                }
+            } else {
+                last_res = input::paste_with_clipboard_restore(
+                    chunk,
+                    false,
+                    guard.clipboard_restore_delay_ms,
+                );
+            }
             if last_res.is_err() {
                 break;
             }
@@ -511,6 +537,44 @@ pub fn send_to_discord_target(
     } else {
         Ok(base_msg)
     }
+}
+
+/// Waits for Slate.js/Chromium composer to reflect pasted text, sends Enter, and retries via UIA +
+/// fallback `PostMessageW(VK_RETURN)` if text remains unsubmitted in the composer.
+fn send_enter_with_verify_and_retry(allowed_processes: &[String]) -> Result<(), String> {
+    // Poll briefly so Chromium/Slate.js finishes DOM commit before Enter
+    for _ in 0..5 {
+        match uia::read_main_composer_text_no_mouse(allowed_processes) {
+            Some(t) if !t.trim().is_empty() => break,
+            None => break,
+            Some(_) => thread::sleep(Duration::from_millis(45)),
+        }
+    }
+
+    for attempt in 0..3usize {
+        if attempt > 0 {
+            let _ = window::ensure_allowed_foreground(allowed_processes, 400);
+            let _ = uia::focus_discord_chat_input(allowed_processes, 250);
+            thread::sleep(Duration::from_millis(40));
+        }
+
+        input::send_key_action(KeyAction::Enter)?;
+        if attempt == 2 {
+            if let Some((_, render_hwnd)) = window::find_discord_render_hwnd(allowed_processes) {
+                let _ = input::post_enter_window_message(render_hwnd);
+            }
+        }
+
+        let check_wait = if attempt == 0 { 130 } else { 170 };
+        thread::sleep(Duration::from_millis(check_wait));
+
+        match uia::read_main_composer_text_no_mouse(allowed_processes) {
+            Some(rem) if rem.trim().is_empty() => return Ok(()),
+            None => return Ok(()),
+            Some(_) => continue,
+        }
+    }
+    Ok(())
 }
 
 /// Sends a keyboard or mouse-wheel command action (auto-focusing Discord if configured).

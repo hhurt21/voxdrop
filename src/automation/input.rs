@@ -6,11 +6,11 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
-    KEYEVENTF_KEYUP, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT,
-    VIRTUAL_KEY, VK_A, VK_BACK, VK_CONTROL, VK_D, VK_DOWN, VK_ESCAPE, VK_F, VK_I, VK_K, VK_LEFT,
-    VK_M, VK_MENU, VK_NEXT, VK_P, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_U, VK_UP, VK_V,
-    VK_Z,
+    MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, MOUSEEVENTF_LEFTDOWN,
+    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT, VIRTUAL_KEY, VK_A, VK_BACK, VK_CONTROL,
+    VK_D, VK_DOWN, VK_ESCAPE, VK_F, VK_I, VK_K, VK_LEFT, VK_M, VK_MENU, VK_NEXT, VK_P, VK_PRIOR,
+    VK_RETURN, VK_RIGHT, VK_SHIFT, VK_U, VK_UP, VK_V, VK_Z,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, PostMessageW, SetCursorPos, WM_CHAR, WM_KEYDOWN, WM_KEYUP,
@@ -84,12 +84,13 @@ fn key_input(vk: VIRTUAL_KEY, key_up: bool) -> INPUT {
     if is_extended_key(vk) {
         flags |= KEYEVENTF_EXTENDEDKEY;
     }
+    let scan = unsafe { MapVirtualKeyW(vk.0 as u32, MAPVK_VK_TO_VSC) as u16 };
     INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
                 wVk: vk,
-                wScan: 0,
+                wScan: scan,
                 dwFlags: flags,
                 time: 0,
                 dwExtraInfo: 0,
@@ -130,13 +131,13 @@ fn send_inputs(inputs: &[INPUT]) -> Result<(), String> {
 }
 
 fn send_combo(modifier: VIRTUAL_KEY, key: VIRTUAL_KEY) -> Result<(), String> {
-    let seq = [
-        key_input(modifier, false),
-        key_input(key, false),
-        key_input(key, true),
-        key_input(modifier, true),
-    ];
-    send_inputs(&seq)
+    send_inputs(&[key_input(modifier, false)])?;
+    thread::sleep(Duration::from_millis(10));
+    send_inputs(&[key_input(key, false)])?;
+    thread::sleep(Duration::from_millis(12));
+    send_inputs(&[key_input(key, true)])?;
+    thread::sleep(Duration::from_millis(10));
+    send_inputs(&[key_input(modifier, true)])
 }
 
 fn send_combo3(m1: VIRTUAL_KEY, m2: VIRTUAL_KEY, key: VIRTUAL_KEY) -> Result<(), String> {
@@ -152,8 +153,17 @@ fn send_combo3(m1: VIRTUAL_KEY, m2: VIRTUAL_KEY, key: VIRTUAL_KEY) -> Result<(),
 }
 
 fn send_single_key(key: VIRTUAL_KEY) -> Result<(), String> {
-    let seq = [key_input(key, false), key_input(key, true)];
-    send_inputs(&seq)
+    send_inputs(&[key_input(key, false)])?;
+    thread::sleep(Duration::from_millis(16));
+    send_inputs(&[key_input(key, true)])
+}
+
+/// Computes post-paste settle wait (ms) before sending Enter or restoring clipboard so Slate.js/Chromium
+/// finishes processing multi-line clipboard pastes cleanly.
+pub fn compute_post_paste_delay_ms(text: &str) -> u64 {
+    let lines = text.lines().count().max(1) as u64;
+    let chars = text.chars().count() as u64;
+    (90 + lines * 20 + (chars / 80) * 15).clamp(90, 320)
 }
 
 /// Performs a real Win32 left mouse click at screen coordinates `(x, y)` and restores the user's cursor.
@@ -366,7 +376,9 @@ pub fn post_enter_window_message(target_hwnd: HWND) -> Result<(), String> {
             lparam_down,
         )
         .map_err(|e| format!("PostMessageW(VK_RETURN down) に失敗しました: {}", e))?;
-        thread::sleep(Duration::from_millis(24));
+        thread::sleep(Duration::from_millis(12));
+        let _ = PostMessageW(Some(target_hwnd), WM_CHAR, WPARAM(0x0D), lparam_down);
+        thread::sleep(Duration::from_millis(16));
         PostMessageW(
             Some(target_hwnd),
             WM_KEYUP,
@@ -425,17 +437,23 @@ pub fn paste_with_clipboard_restore(
         .map_err(|e| format!("クリップボードへの書き込みに失敗しました: {}", e))?;
     LAST_OWN_CLIPBOARD_MS.store(now_ms(), Ordering::Relaxed);
 
-    thread::sleep(Duration::from_millis(20));
+    thread::sleep(Duration::from_millis(25));
 
     let paste_res = send_key_action_unlocked(KeyAction::CtrlV);
 
-    if paste_res.is_ok() && press_enter {
-        thread::sleep(Duration::from_millis(30));
-        let _ = send_key_action_unlocked(KeyAction::Enter);
+    let paste_settle = compute_post_paste_delay_ms(text);
+    if paste_res.is_ok() {
+        thread::sleep(Duration::from_millis(paste_settle));
+        if press_enter {
+            let _ = send_key_action_unlocked(KeyAction::Enter);
+            thread::sleep(Duration::from_millis(60));
+        }
     }
 
-    let delay = restore_delay_ms.clamp(30, 1000);
-    thread::sleep(Duration::from_millis(delay));
+    let delay = restore_delay_ms.clamp(80, 1000);
+    if delay > paste_settle && !press_enter {
+        thread::sleep(Duration::from_millis(delay - paste_settle));
+    }
 
     if let Some(prev) = previous_text {
         let _ = clipboard.set_text(prev);
@@ -455,8 +473,14 @@ mod tests {
         let up = key_input(VK_RETURN, true);
         unsafe {
             assert_eq!(down.Anonymous.ki.wVk, VK_RETURN);
+            assert_eq!(down.Anonymous.ki.wScan, 0x1C);
             assert_eq!(down.Anonymous.ki.dwFlags.0, 0);
             assert_eq!(up.Anonymous.ki.dwFlags, KEYEVENTF_KEYUP);
         }
+        assert!(compute_post_paste_delay_ms("こんにちは") >= 90);
+        assert!(
+            compute_post_paste_delay_ms("1行目\n2行目\n3行目\n4行目\n5行目\n6行目\n7行目")
+                >= 200
+        );
     }
 }
