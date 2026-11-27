@@ -16,7 +16,7 @@ use windows::Win32::Networking::WinHttp::{
     WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_FLAG_SECURE,
 };
 
-pub const CURRENT_APP_TAG: &str = "v1.7.4";
+pub const CURRENT_APP_TAG: &str = "v1.7.5";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]

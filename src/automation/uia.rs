@@ -115,20 +115,120 @@ fn find_discord_window(allowed_processes: &[String]) -> Option<(HWND, String)> {
     ctx.found
 }
 
-/// Parses Discord's window title such as `"#雑談 | メイン鯖 - Discord"` or `"@alice - Discord"`.
-pub fn parse_discord_window_title(title: &str) -> (Option<String>, Option<String>, Option<String>) {
-    let clean = title
-        .trim()
-        .strip_suffix("- Discord")
-        .or_else(|| title.trim().strip_suffix("— Discord"))
-        .unwrap_or(title)
-        .trim();
-    // Remove leading unread dot like "• " or "(3) "
-    let clean = clean
-        .trim_start_matches(|c: char| c == '•' || c.is_whitespace())
-        .trim();
+fn strip_leading_unread_markers(mut s: &str) -> &str {
+    loop {
+        let trimmed = s.trim_start_matches(|c: char| c == '•' || c == '·' || c.is_whitespace());
+        let mut advanced = trimmed;
+        if let Some(rest) = advanced.strip_prefix('(') {
+            if let Some(end) = rest.find(')') {
+                let inner = rest[..end].trim();
+                let digits_like = !inner.is_empty()
+                    && inner
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || c == '+' || c == '件');
+                if digits_like {
+                    advanced = &rest[end + 1..];
+                }
+            }
+        } else if let Some(rest) = advanced.strip_prefix('[') {
+            if let Some(end) = rest.find(']') {
+                let inner = rest[..end].trim();
+                let digits_like = !inner.is_empty()
+                    && inner
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || c == '+' || c == '件');
+                if digits_like {
+                    advanced = &rest[end + 1..];
+                }
+            }
+        }
+        let next = advanced.trim_start_matches(|c: char| c == '•' || c == '·' || c.is_whitespace());
+        if next.len() == s.len() {
+            return next;
+        }
+        s = next;
+    }
+}
 
-    if let Some((left, right)) = clean.split_once('|') {
+fn strip_discord_affix(s: &str) -> &str {
+    let mut cur = s.trim();
+    let suffixes = [" - discord", " — discord", " – discord", " | discord"];
+    let prefixes = ["discord | ", "discord - ", "discord — ", "discord – "];
+    loop {
+        cur = strip_leading_unread_markers(cur).trim();
+        let lower = cur.to_ascii_lowercase();
+        let mut changed = false;
+        for suf in suffixes {
+            if lower.ends_with(suf) && cur.len() >= suf.len() {
+                let cut = cur.len() - suf.len();
+                if cur.is_char_boundary(cut) {
+                    cur = cur[..cut].trim();
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        let lower2 = cur.to_ascii_lowercase();
+        for pre in prefixes {
+            if lower2.starts_with(pre) && cur.len() >= pre.len() {
+                if cur.is_char_boundary(pre.len()) {
+                    cur = cur[pre.len()..].trim();
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    strip_leading_unread_markers(cur).trim()
+}
+
+/// Parses Discord's window title such as `"#雑談 | メイン鯖 - Discord"`,
+/// `"Discord | @alice"`, `"• (3) Discord | @alice"`, or `"@alice - Discord"`.
+pub fn parse_discord_window_title(title: &str) -> (Option<String>, Option<String>, Option<String>) {
+    let clean = strip_discord_affix(title);
+    if clean.is_empty()
+        || clean.eq_ignore_ascii_case("discord")
+        || clean == "ダイレクトメッセージ"
+        || clean.eq_ignore_ascii_case("direct messages")
+        || clean == "フレンド"
+        || clean.eq_ignore_ascii_case("friends")
+    {
+        return (None, None, None);
+    }
+
+    if let Some(dm) = clean.strip_prefix('@') {
+        let friend = dm.trim();
+        if !friend.is_empty() {
+            return (None, None, Some(friend.to_string()));
+        }
+    }
+
+    if let Some((left_raw, right_raw)) = clean.split_once('|') {
+        let left = strip_leading_unread_markers(left_raw).trim();
+        let right = right_raw.trim();
+
+        if left.is_empty() || left.eq_ignore_ascii_case("discord") {
+            if let Some(dm) = right.strip_prefix('@') {
+                let friend = dm.trim();
+                if !friend.is_empty() {
+                    return (None, None, Some(friend.to_string()));
+                }
+            }
+            return (None, None, None);
+        }
+        if right.is_empty() || right.eq_ignore_ascii_case("discord") {
+            if let Some(dm) = left.strip_prefix('@') {
+                let friend = dm.trim();
+                if !friend.is_empty() {
+                    return (None, None, Some(friend.to_string()));
+                }
+            }
+            return (None, None, None);
+        }
+
         let ch = left.trim().trim_start_matches('#').trim();
         let srv = right.trim();
         return (
@@ -137,12 +237,7 @@ pub fn parse_discord_window_title(title: &str) -> (Option<String>, Option<String
             None,
         );
     }
-    if let Some(dm) = clean.strip_prefix('@') {
-        let friend = dm.trim();
-        if !friend.is_empty() {
-            return (None, None, Some(friend.to_string()));
-        }
-    }
+
     (None, None, None)
 }
 
@@ -1028,8 +1123,44 @@ mod tests {
             (Some("メイン鯖".into()), Some("雑談".into()), None)
         );
         assert_eq!(
+            parse_discord_window_title("Discord | #雑談 | メイン鯖"),
+            (Some("メイン鯖".into()), Some("雑談".into()), None)
+        );
+        assert_eq!(
             parse_discord_window_title("• @alice - Discord"),
             (None, None, Some("alice".into()))
+        );
+        assert_eq!(
+            parse_discord_window_title("@かげろー - Discord"),
+            (None, None, Some("かげろー".into()))
+        );
+        assert_eq!(
+            parse_discord_window_title("Discord | @かげろー"),
+            (None, None, Some("かげろー".into()))
+        );
+        assert_eq!(
+            parse_discord_window_title("• Discord | @suicune"),
+            (None, None, Some("suicune".into()))
+        );
+        assert_eq!(
+            parse_discord_window_title("(3) Discord | @かげろー"),
+            (None, None, Some("かげろー".into()))
+        );
+        assert_eq!(
+            parse_discord_window_title("(12) @alice - Discord"),
+            (None, None, Some("alice".into()))
+        );
+        assert_eq!(
+            parse_discord_window_title("Discord - @bob"),
+            (None, None, Some("bob".into()))
+        );
+        assert_eq!(
+            parse_discord_window_title("Discord | ダイレクトメッセージ"),
+            (None, None, None)
+        );
+        assert_eq!(
+            parse_discord_window_title("ダイレクトメッセージ"),
+            (None, None, None)
         );
     }
 

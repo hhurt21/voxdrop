@@ -43,6 +43,7 @@ impl NotificationController {
         let toast_enabled = initial_cfg.enabled || initial_cfg.debug_log_toasts;
         let wpn_enabled = initial_cfg.enabled;
         let uia_enabled = initial_cfg.enabled && initial_cfg.read_without_windows_notifications;
+        let uia_debug = initial_cfg.debug_log_toasts;
         let config = Arc::new(Mutex::new(initial_cfg));
         let dedup = Arc::new(Mutex::new(NotificationDeduplicator::new(24)));
 
@@ -113,11 +114,20 @@ impl NotificationController {
         let cfg_uia = config.clone();
         let dedup_uia = dedup.clone();
         let cb_uia = cb;
-        let uia_watcher = DiscordUiaWatcher::spawn(uia_enabled, move |ev: UiaDmEvent| {
+        let uia_watcher = DiscordUiaWatcher::spawn(uia_enabled, uia_debug, move |ev: UiaDmEvent| {
             let cfg = match cfg_uia.lock() {
                 Ok(g) => g.clone(),
                 Err(_) => return,
             };
+
+            if let UiaDmEvent::Debug(line) = ev {
+                if cfg.debug_log_toasts {
+                    eprintln!("{}", line);
+                    cb_uia(NotificationEvent::DebugToast(line));
+                }
+                return;
+            }
+
             if !cfg.enabled || !cfg.read_without_windows_notifications {
                 return;
             }
@@ -142,6 +152,11 @@ impl NotificationController {
                         sanitize_message_for_tts(&body, &cfg.url_replacement, cfg.max_chars);
                     if sanitized.is_empty() {
                         return;
+                    }
+                    if cfg.debug_log_toasts {
+                        let line = format!("[UIA OpenDM] {}: {}", sender, sanitized);
+                        eprintln!("{}", line);
+                        cb_uia(NotificationEvent::DebugToast(line));
                     }
                     let speech_text = discord_filter::format_speech_text(&sender, &sanitized, &cfg);
                     cb_uia(NotificationEvent::SpeakText {
@@ -172,6 +187,11 @@ impl NotificationController {
                     } else {
                         format!("新しいDMが{}件届きました", count)
                     };
+                    if cfg.debug_log_toasts {
+                        let line = format!("[UIA UnreadBadge] {}: {}", sender, body);
+                        eprintln!("{}", line);
+                        cb_uia(NotificationEvent::DebugToast(line));
+                    }
                     let speech_text = if cfg.read_sender_name {
                         format!("{}さんから。{}", sender, body)
                     } else {
@@ -183,6 +203,7 @@ impl NotificationController {
                         speech_text,
                     });
                 }
+                UiaDmEvent::Debug(_) => {}
             }
         });
 
@@ -199,6 +220,7 @@ impl NotificationController {
         self.wpn_watcher.set_enabled(cfg.enabled);
         self.uia_watcher
             .set_enabled(cfg.enabled && cfg.read_without_windows_notifications);
+        self.uia_watcher.set_debug_enabled(cfg.debug_log_toasts);
         if let Ok(mut guard) = self.config.lock() {
             *guard = cfg;
         }

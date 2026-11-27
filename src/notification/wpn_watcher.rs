@@ -36,6 +36,7 @@ type FnSqlite3ColumnBlob = unsafe extern "C" fn(*mut c_void, c_int) -> *const c_
 type FnSqlite3ColumnBytes = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
 type FnSqlite3Finalize = unsafe extern "C" fn(*mut c_void) -> c_int;
 type FnSqlite3Close = unsafe extern "C" fn(*mut c_void) -> c_int;
+type FnSqlite3BusyTimeout = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
 
 struct WinSqliteFns {
     _hmod: HMODULE,
@@ -49,6 +50,7 @@ struct WinSqliteFns {
     column_bytes: FnSqlite3ColumnBytes,
     finalize: FnSqlite3Finalize,
     close: FnSqlite3Close,
+    busy_timeout: Option<FnSqlite3BusyTimeout>,
 }
 
 unsafe impl Send for WinSqliteFns {}
@@ -104,6 +106,7 @@ impl WinSqliteFns {
                             column_bytes,
                             finalize,
                             close,
+                            busy_timeout: load_sym(hmod, b"sqlite3_busy_timeout\0"),
                         });
                     }
                 }
@@ -125,6 +128,9 @@ impl WinSqliteFns {
                     (self.close)(db);
                 }
                 return None;
+            }
+            if let Some(bt) = self.busy_timeout {
+                bt(db, 200);
             }
             let mut stmt: *mut c_void = std::ptr::null_mut();
             let mut out = None;
@@ -168,6 +174,9 @@ impl WinSqliteFns {
                     (self.close)(db);
                 }
                 return None;
+            }
+            if let Some(bt) = self.busy_timeout {
+                bt(db, 200);
             }
 
             let mut max_id = since_id;
@@ -378,11 +387,13 @@ impl WpnWatcher {
             let mut last_db_stamp = file_stamp(&db_path);
             let mut last_wal_stamp = file_stamp(&wal_path);
             let mut was_active = initially_active;
+            let mut ticks_since_query: u32 = 0;
 
             while !shutdown_bg.load(Ordering::Relaxed) {
                 let is_active = active_bg.load(Ordering::Relaxed);
                 if !is_active {
                     was_active = false;
+                    ticks_since_query = 0;
                     thread::sleep(Duration::from_millis(500));
                     continue;
                 }
@@ -394,15 +405,18 @@ impl WpnWatcher {
                     }
                     last_db_stamp = file_stamp(&db_path);
                     last_wal_stamp = file_stamp(&wal_path);
+                    ticks_since_query = 0;
                     was_active = true;
                 }
 
+                ticks_since_query = ticks_since_query.saturating_add(1);
                 let cur_db = file_stamp(&db_path);
                 let cur_wal = file_stamp(&wal_path);
-                if cur_db != last_db_stamp || cur_wal != last_wal_stamp {
-                    last_db_stamp = cur_db;
-                    last_wal_stamp = cur_wal;
+                if cur_db != last_db_stamp || cur_wal != last_wal_stamp || ticks_since_query >= 4 {
                     if let Some((new_max, rows)) = sqlite.query_new_discord_rows(&db_path, last_id) {
+                        last_db_stamp = cur_db;
+                        last_wal_stamp = cur_wal;
+                        ticks_since_query = 0;
                         if new_max > last_id {
                             last_id = new_max;
                         }
@@ -446,5 +460,14 @@ mod tests {
         let srv = parse_wpn_toast_xml("com.squirrel.Discord.Discord", srv_xml).expect("srv");
         assert_eq!(srv.app_name_hint, "Discord [server]");
         assert_eq!(srv.texts, vec!["Hanako (#雑談, メイン鯖)", "よろしく！"]);
+
+        let canary_dm_xml = "<toast><visual><binding template=\"ToastGeneric\"><text>suicune</text><text>送信されると思います。\r\n送信されてます。</text><image placement=\"appLogoOverride\" src=\"C:\\Users\\test\\avatar.png\"/></binding></visual><audio silent=\"true\"/></toast>";
+        let canary = parse_wpn_toast_xml("com.squirrel.DiscordCanary.DiscordCanary", canary_dm_xml)
+            .expect("canary");
+        assert_eq!(canary.app_name_hint, "Discord");
+        assert_eq!(
+            canary.texts,
+            vec!["suicune", "送信されると思います。\r\n送信されてます。"]
+        );
     }
 }
