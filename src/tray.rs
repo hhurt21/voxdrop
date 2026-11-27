@@ -13,6 +13,7 @@ pub enum TrayState {
 pub enum TrayAction {
     ToggleListening,
     ToggleOverlay,
+    TogglePanicSafeMode,
     ShowMainWindow,
     Quit,
 }
@@ -21,6 +22,7 @@ pub struct TrayManager {
     tray_icon: TrayIcon,
     toggle_item: MenuItem,
     overlay_item: MenuItem,
+    panic_item: MenuItem,
     icon_muted: Icon,
     icon_listening: Icon,
     icon_speaking: Icon,
@@ -35,16 +37,19 @@ impl TrayManager {
         let menu = Menu::new();
         let toggle_item = MenuItem::new("録音開始 (OFF)", true, None);
         let overlay_item = MenuItem::new("ミニHUD表示切替", true, None);
+        let panic_item = MenuItem::new("配信セーフモード (パニックミュート): OFF", true, None);
         let show_item = MenuItem::new("設定画面を開く", true, None);
         let quit_item = MenuItem::new("VoxDrop を終了", true, None);
 
         let toggle_id = toggle_item.id().clone();
         let overlay_id = overlay_item.id().clone();
+        let panic_id = panic_item.id().clone();
         let show_id = show_item.id().clone();
         let quit_id = quit_item.id().clone();
 
         menu.append(&toggle_item).map_err(|e| e.to_string())?;
         menu.append(&overlay_item).map_err(|e| e.to_string())?;
+        menu.append(&panic_item).map_err(|e| e.to_string())?;
         menu.append(&show_item).map_err(|e| e.to_string())?;
         menu.append(&PredefinedMenuItem::separator())
             .map_err(|e| e.to_string())?;
@@ -70,6 +75,8 @@ impl TrayManager {
                 on_menu(TrayAction::ToggleListening);
             } else if *id == overlay_id {
                 on_menu(TrayAction::ToggleOverlay);
+            } else if *id == panic_id {
+                on_menu(TrayAction::TogglePanicSafeMode);
             } else if *id == show_id {
                 on_menu(TrayAction::ShowMainWindow);
             } else if *id == quit_id {
@@ -93,6 +100,7 @@ impl TrayManager {
             tray_icon,
             toggle_item,
             overlay_item,
+            panic_item,
             icon_muted,
             icon_listening,
             icon_speaking,
@@ -130,6 +138,14 @@ impl TrayManager {
             "ミニHUDを非表示"
         } else {
             "ミニHUDを表示"
+        });
+    }
+
+    pub fn set_panic_mode(&self, active: bool) {
+        self.panic_item.set_text(if active {
+            "配信セーフモード (パニックミュート): ON [解除]"
+        } else {
+            "配信セーフモード (パニックミュート): OFF"
         });
     }
 }

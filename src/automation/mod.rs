@@ -396,6 +396,27 @@ pub fn send_to_discord_target(
                     }
                     if press_enter {
                         input::post_enter_window_message(render_hwnd)?;
+                        thread::sleep(Duration::from_millis(90));
+                        let mut cleared = match uia::read_main_composer_text_no_mouse(&guard.allowed_processes) {
+                            Some(rem) => rem.trim().is_empty(),
+                            None => true,
+                        };
+                        if !cleared {
+                            let _ = uia::focus_main_composer_verified_no_mouse(&guard.allowed_processes, 300);
+                            input::post_enter_window_message(render_hwnd)?;
+                            thread::sleep(Duration::from_millis(85));
+                            cleared = match uia::read_main_composer_text_no_mouse(&guard.allowed_processes) {
+                                Some(rem) => rem.trim().is_empty(),
+                                None => true,
+                            };
+                        }
+                        if !cleared {
+                            let _ = input::copy_text_to_clipboard_only(&formatted);
+                            return Err(
+                                "PostMessage送信失敗 [enter_not_sent]: Enter送信後も入力欄にテキストが残っています（クリップボードへ退避済み）"
+                                    .into(),
+                            );
+                        }
                         if idx + 1 < chunks.len() {
                             thread::sleep(Duration::from_millis(120));
                         }

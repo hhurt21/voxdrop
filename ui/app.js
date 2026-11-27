@@ -725,7 +725,7 @@
     $("ncVadProbThreshold").value = nc.vad_prob_threshold;
     $("ncVadEngine").value = nc.vad_engine || "gtcrn-16k";
     $("ncSttEngine").value = nc.stt_engine || "dpdfnet-16k";
-    const dpdfLim = nc.dpdfnet_attenuation_limit_db != null ? nc.dpdfnet_attenuation_limit_db : -18;
+    const dpdfLim = Math.abs(nc.dpdfnet_attenuation_limit_db != null ? nc.dpdfnet_attenuation_limit_db : 12);
     $("ncDpdfLimit").value = dpdfLim;
     $("ncDpdfLimitVal").textContent = dpdfLim;
     const eqVal = nc.presence_eq_strength != null ? nc.presence_eq_strength : 0.55;
@@ -837,6 +837,7 @@
     $("hkPtt").value = cfg.hotkeys.push_to_talk || "";
     $("hkClear").value = cfg.hotkeys.clear_draft || "";
     $("hkOverlay").value = cfg.hotkeys.toggle_overlay || "";
+    $("hkPanicMute").value = cfg.hotkeys.panic_mute || "";
 
     $("chkOverlayEnabled").checked = !!cfg.overlay.enabled;
     $("chkOverlayClickThrough").checked = !!cfg.overlay.click_through;
@@ -1026,7 +1027,7 @@
         radio_clarity_mode: $("chkNcRadioClarity").checked,
         vad_engine: $("ncVadEngine").value || "gtcrn-16k",
         stt_engine: $("ncSttEngine").value || "dpdfnet-16k",
-        dpdfnet_attenuation_limit_db: parseFloat($("ncDpdfLimit").value) || -18,
+        dpdfnet_attenuation_limit_db: Math.abs(parseFloat($("ncDpdfLimit").value) || 12),
         presence_eq_strength: parseFloat($("ncPresenceEq").value) || 0.55,
       },
       audio_device_fallbacks: splitCsv($("audioFallbacksInput").value),
@@ -1116,6 +1117,7 @@
         push_to_talk: $("hkPtt").value.trim(),
         clear_draft: $("hkClear").value.trim(),
         toggle_overlay: $("hkOverlay").value.trim(),
+        panic_mute: $("hkPanicMute").value.trim(),
       },
       overlay: {
         ...currentConfig.overlay,
@@ -2767,7 +2769,8 @@
         const box = $("autoTunerProposalBox");
         if (box) {
           box.className = "ab-result show";
-          box.innerHTML = `提案 (${p.tested_cases || 0}件評価 / 一致 ${(Number(p.avg_similarity || 0) * 100).toFixed(1)}%): EQ=${Number(p.best_eq_strength || 0).toFixed(2)}, WSOLA=${Number(p.best_wsola_rate || 1).toFixed(2)}x, Beam=${p.best_beam_size || 3} <button type="button" class="btn-primary btn-sm" id="btnApplyTuner">この設定を適用</button>`;
+          const dpdfDb = Number(p.best_dpdfnet_db != null ? p.best_dpdfnet_db : 12);
+          box.innerHTML = `提案 (${p.tested_cases || 0}件評価 / 一致 ${(Number(p.avg_similarity || 0) * 100).toFixed(1)}%): EQ=${Number(p.best_eq_strength || 0).toFixed(2)}, WSOLA=${Number(p.best_wsola_rate || 1).toFixed(2)}x, Beam=${p.best_beam_size || 3}, DPDFNet=${dpdfDb}dB <button type="button" class="btn-primary btn-sm" id="btnApplyTuner">この設定を適用</button>`;
           const b = $("btnApplyTuner");
           if (b) {
             b.addEventListener("click", () => {
@@ -2776,6 +2779,7 @@
                 eq_strength: p.best_eq_strength,
                 wsola_rate: p.best_wsola_rate,
                 beam_size: p.best_beam_size,
+                dpdfnet_db: dpdfDb,
               });
             });
           }
@@ -2786,7 +2790,20 @@
         const box = $("calibrationResultBox");
         if (box) {
           box.className = "ab-result show";
-          box.textContent = `${ev.score_note} | 推奨VAD=${Number(ev.recommended_vad || 0.012).toFixed(3)}, EQ=${Number(ev.recommended_eq || 0.55).toFixed(2)}, WSOLA=${ev.recommended_wsola ? "ON" : "OFF"}`;
+          const ne = ev.recommended_noise_engine || "dpdfnet-16k";
+          box.innerHTML = `${ev.score_note} | 推奨VAD=${Number(ev.recommended_vad || 0.012).toFixed(3)}, EQ=${Number(ev.recommended_eq || 0.55).toFixed(2)}, WSOLA=${ev.recommended_wsola ? "ON" : "OFF"}, ノイズ抑制=${ne} <button type="button" class="btn-primary btn-sm" id="btnApplyCalibration">診断結果を1クリック適用</button>`;
+          const b = $("btnApplyCalibration");
+          if (b) {
+            b.addEventListener("click", () => {
+              send({
+                type: "ApplyCalibrationResult",
+                vad_threshold: Number(ev.recommended_vad || 0.012),
+                eq_strength: Number(ev.recommended_eq || 0.55),
+                wsola_enabled: !!ev.recommended_wsola,
+                noise_engine: ne,
+              });
+            });
+          }
         }
         showToast("15秒滑舌診断が完了しました", "ok");
         break;

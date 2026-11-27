@@ -15,6 +15,7 @@ pub enum HotkeyAction {
     PushToTalkUp,
     ClearDraft,
     ToggleOverlay,
+    TogglePanicSafeMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +24,7 @@ enum SlotKind {
     PushToTalk,
     ClearDraft,
     ToggleOverlay,
+    PanicMute,
 }
 
 pub struct HotkeyManager {
@@ -74,6 +76,9 @@ impl HotkeyManager {
                 }
                 (SlotKind::ToggleOverlay, HotKeyState::Pressed) => {
                     cb_hk(HotkeyAction::ToggleOverlay);
+                }
+                (SlotKind::PanicMute, HotKeyState::Pressed) => {
+                    cb_hk(HotkeyAction::TogglePanicSafeMode);
                 }
                 _ => {}
             }
@@ -137,6 +142,7 @@ impl HotkeyManager {
             (SlotKind::PushToTalk, "Push-to-Talk", cfg.push_to_talk.as_str()),
             (SlotKind::ClearDraft, "緊急ドラフトクリア", cfg.clear_draft.as_str()),
             (SlotKind::ToggleOverlay, "ミニHUD切替", cfg.toggle_overlay.as_str()),
+            (SlotKind::PanicMute, "配信セーフモード", cfg.panic_mute.as_str()),
         ];
 
         for (slot, label, spec) in specs {

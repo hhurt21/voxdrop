@@ -823,7 +823,7 @@ impl ResidentSherpaDenoiser {
                 sd_cfg.model.gtcrn.model = model_c.as_ptr();
             } else {
                 sd_cfg.model.dpdfnet.model = model_c.as_ptr();
-                sd_cfg.model.dpdfnet.attenuation_limit_db = attenuation_limit_db.clamp(0.0, 60.0);
+                sd_cfg.model.dpdfnet.attenuation_limit_db = normalize_dpdfnet_db(attenuation_limit_db);
             }
             let ptr_sd = unsafe { create_sd(&sd_cfg) };
             if !ptr_sd.is_null() {
@@ -896,6 +896,10 @@ impl ResidentSherpaDenoiser {
             }
         }
     }
+}
+
+pub(crate) fn normalize_dpdfnet_db(db: f32) -> f32 {
+    db.abs().clamp(0.0, 60.0)
 }
 
 #[cfg(test)]
@@ -987,6 +991,13 @@ mod tests {
             .collect();
         let out = sd.denoise(&noisy, 16_000).expect("denoise 16k");
         assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn normalizes_dpdfnet_attenuation_limit_db_safely() {
+        assert_eq!(normalize_dpdfnet_db(-18.0), 18.0);
+        assert_eq!(normalize_dpdfnet_db(12.0), 12.0);
+        assert_eq!(normalize_dpdfnet_db(99.0), 60.0);
     }
 }
 

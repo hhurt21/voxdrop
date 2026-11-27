@@ -548,6 +548,8 @@ pub struct HotkeyConfig {
     pub push_to_talk: String,
     pub clear_draft: String,
     pub toggle_overlay: String,
+    /// 配信・画面共有セーフモード（緊急パニックミュート）トグル (#28)
+    pub panic_mute: String,
 }
 
 impl Default for HotkeyConfig {
@@ -557,6 +559,7 @@ impl Default for HotkeyConfig {
             push_to_talk: String::new(),
             clear_draft: "Ctrl+Shift+X".into(),
             toggle_overlay: "Ctrl+Shift+O".into(),
+            panic_mute: String::new(),
         }
     }
 }
@@ -1067,8 +1070,14 @@ impl AppConfig {
     /// Migrates older config versions (< 2) to conversational VAD & clean STT defaults
     /// while preserving all user targets, commands, dictionary, and VOICEVOX settings.
     pub fn migrate(&mut self) -> bool {
+        let mut changed = false;
+        if self.noise_cancel.dpdfnet_attenuation_limit_db < 0.0 {
+            self.noise_cancel.dpdfnet_attenuation_limit_db =
+                self.noise_cancel.dpdfnet_attenuation_limit_db.abs().clamp(0.0, 60.0);
+            changed = true;
+        }
         if self.config_version >= 2 {
-            return false;
+            return changed;
         }
         if self.vad.silence_ms < 550 {
             self.vad.silence_ms = 620;
@@ -1341,7 +1350,12 @@ mod tests {
             speech_style: None,
         });
         let json = serde_json::to_string(&cfg).expect("serialize");
-        let back: AppConfig = serde_json::from_str(&json).expect("deserialize");
+        let mut back: AppConfig = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(cfg, back);
+
+        back.noise_cancel.dpdfnet_attenuation_limit_db = -18.0;
+        assert!(back.migrate());
+        assert_eq!(back.noise_cancel.dpdfnet_attenuation_limit_db, 18.0);
+        assert_eq!(back.hotkeys.panic_mute, "");
     }
 }

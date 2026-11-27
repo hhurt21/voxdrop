@@ -68,8 +68,20 @@ pub enum ClientCommand {
     DeleteBenchmarkCase { id: String },
     RunBenchmarkSuite,
     RunAutoTuner,
-    ApplyAutoTuner { eq_strength: f32, wsola_rate: f32, beam_size: i32 },
+    ApplyAutoTuner {
+        eq_strength: f32,
+        wsola_rate: f32,
+        beam_size: i32,
+        #[serde(default)]
+        dpdfnet_db: Option<f32>,
+    },
     StartCalibrationWizard,
+    ApplyCalibrationResult {
+        vad_threshold: f32,
+        eq_strength: f32,
+        wsola_enabled: bool,
+        noise_engine: String,
+    },
     TogglePanicSafeMode,
     ToggleTargetLock,
     ExportBackup,
@@ -216,6 +228,7 @@ pub enum BackendEvent {
         recommended_eq: f32,
         recommended_wsola: bool,
         recommended_model: String,
+        recommended_noise_engine: String,
     },
     BackupExported {
         json: String,

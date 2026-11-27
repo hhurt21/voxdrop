@@ -16,7 +16,7 @@ use windows::Win32::Networking::WinHttp::{
     WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_FLAG_SECURE,
 };
 
-pub const CURRENT_APP_TAG: &str = "v1.6.0";
+pub const CURRENT_APP_TAG: &str = "v1.6.1";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -219,15 +219,17 @@ pub struct AutoTunerProposal {
     pub best_eq_strength: f32,
     pub best_wsola_rate: f32,
     pub best_beam_size: i32,
+    pub best_dpdfnet_db: f32,
     pub avg_similarity: f32,
     pub tested_cases: usize,
 }
 
-/// Grid-searches optimal `(eq_strength, wsola_rate, beam_size)` against saved hard WAV cases (#38).
+/// Grid-searches optimal `(eq_strength, wsola_rate, beam_size, dpdfnet_db)` against saved hard WAV cases (#38).
 pub fn run_auto_parameter_tuner(
     cases: &[BenchmarkCase],
     engine: &dyn SttEngine,
     base_ctx: &TranscribeContext,
+    denoiser_16k: Option<&crate::stt::sherpa_ffi::ResidentSherpaDenoiser>,
 ) -> Result<AutoTunerProposal, String> {
     if cases.is_empty() {
         return Err("ベンチマーク用に保存された発話WAVがありません（音声診断タブから保存してください）".into());
@@ -244,24 +246,33 @@ pub fn run_auto_parameter_tuner(
         return Err("有効なベンチマークWAVファイルを読み込めませんでした".into());
     }
 
-    let candidates: &[(f32, f32, i32)] = &[
-        (0.35, 1.00, 3),
-        (0.55, 0.90, 5),
-        (0.75, 0.85, 5),
-        (0.20, 0.85, 5),
+    let candidates: &[(f32, f32, i32, f32)] = &[
+        (0.35, 1.00, 3, 12.0),
+        (0.55, 0.90, 5, 12.0),
+        (0.75, 0.85, 5, 16.0),
+        (0.20, 0.85, 5, 18.0),
     ];
 
     let mut best: Option<AutoTunerProposal> = None;
-    for &(eq, wsola_r, beam) in candidates {
+    for &(eq, wsola_r, beam, dpdf_db) in candidates {
         let mut sum_sim = 0.0f32;
         let mut ctx = base_ctx.clone();
         ctx.eq_strength = eq;
         ctx.beam_size = beam;
         for (c, samples) in &loaded {
-            let input = if (wsola_r - 1.0).abs() > 0.02 {
-                crate::audio::enhance::wsola_time_stretch(samples, wsola_r)
+            let base_in = if dpdf_db <= 14.0 {
+                if let Some(den) = denoiser_16k {
+                    den.denoise(samples, 16_000).unwrap_or_else(|_| samples.clone())
+                } else {
+                    samples.clone()
+                }
             } else {
                 samples.clone()
+            };
+            let input = if (wsola_r - 1.0).abs() > 0.02 {
+                crate::audio::enhance::wsola_time_stretch(&base_in, wsola_r)
+            } else {
+                base_in
             };
             let actual = engine.transcribe_with_context(&input, &ctx).unwrap_or_default();
             sum_sim += phonetic_similarity(&actual, &c.expected_text);
@@ -272,6 +283,7 @@ pub fn run_auto_parameter_tuner(
                 best_eq_strength: eq,
                 best_wsola_rate: wsola_r,
                 best_beam_size: beam,
+                best_dpdfnet_db: dpdf_db,
                 avg_similarity: avg,
                 tested_cases: loaded.len(),
             });

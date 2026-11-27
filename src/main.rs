@@ -179,6 +179,7 @@ enum SttWorkerMsg {
     },
     ReloadEngine(Arc<dyn SttEngine>),
     UpdatePromptHints(String),
+    ClearCaches,
     UnloadAll,
     Shutdown,
 }
@@ -1005,6 +1006,10 @@ fn spawn_stt_worker(
                 SttWorkerMsg::UpdatePromptHints(hints) => {
                     engine.set_prompt_hints(&hints);
                 }
+                SttWorkerMsg::ClearCaches => {
+                    denoiser_cache = None;
+                    secondary_cache = None;
+                }
                 SttWorkerMsg::UnloadAll => {
                     engine = Arc::new(BootLoadingEngine);
                     denoiser_cache = None;
@@ -1370,6 +1375,85 @@ fn set_listening_state(
         t.update_state(state.tray_state(), state.overlay_visible);
     }
     emit_all(main_wv, overlay_wv, &state.status_event());
+}
+
+fn toggle_panic_safe_mode(
+    state: &mut AppState,
+    audio_ctrl: &AudioController,
+    tts_ctrl: &TtsQueueController,
+    sound_player: &SoundPlayer,
+    webview: &WebView,
+    overlay_webview: &WebView,
+    overlay_window: &tao::window::Window,
+    tray: &Option<TrayManager>,
+) {
+    state.panic_mode = !state.panic_mode;
+    if state.panic_mode {
+        set_listening_state(
+            false,
+            false,
+            state,
+            audio_ctrl,
+            sound_player,
+            webview,
+            overlay_webview,
+            tray,
+        );
+        cancel_send_countdown(
+            state,
+            webview,
+            overlay_webview,
+            sound_player,
+            "パニックセーフモード発動",
+        );
+        state.draft_segments.clear();
+        tts_ctrl.stop_and_clear();
+        state.overlay_visible = false;
+        overlay_window.set_visible(false);
+    } else {
+        state.overlay_visible = state.config.overlay.enabled;
+        overlay_window.set_visible(state.overlay_visible);
+    }
+    if let Some(ref t) = tray {
+        t.set_panic_mode(state.panic_mode);
+        t.update_state(state.tray_state(), state.overlay_visible);
+    }
+    emit_all(webview, overlay_webview, &state.status_event());
+    emit(
+        webview,
+        &BackendEvent::Toast {
+            level: if state.panic_mode { "warn" } else { "ok" }.into(),
+            message: if state.panic_mode {
+                "配信・画面共有セーフモード ON（マイク停止・HUD非表示・読み上げ停止・履歴マスク）"
+            } else {
+                "配信セーフモードを解除しました"
+            }
+            .into(),
+        },
+    );
+}
+
+fn reload_stt_for_power_or_vram(
+    state: &AppState,
+    stt_tx: &mpsc::Sender<SttWorkerMsg>,
+    proxy: &EventLoopProxy<UserEvent>,
+) {
+    let mut cfg = state.config.stt.clone();
+    if state.vram_eco_offloaded {
+        let _ = stt_tx.send(SttWorkerMsg::ClearCaches);
+        let m_dir = stt::local::resolve_download_model_dir(&cfg.model_dir, state.runtime_dir.as_deref());
+        let has_parakeet = m_dir
+            .join("sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8")
+            .is_dir();
+        if has_parakeet {
+            cfg.engine = "sherpa-onnx".into();
+            cfg.model_file.clear();
+        }
+        cfg.threads = state.config.power_eco.eco_threads.clamp(1, 8);
+    } else if state.eco_mode_active {
+        cfg.threads = state.config.power_eco.eco_threads.clamp(1, 8);
+    }
+    spawn_stt_loader(cfg, state.runtime_dir.clone(), proxy.clone());
 }
 
 fn activate_registered_target(
@@ -2950,17 +3034,27 @@ fn main() -> wry::Result<()> {
                         &recent_msgs,
                         Some(&tgt_label),
                     );
-                    let eff_beam = if state.eco_mode_active {
+                    let eff_beam = if state.eco_mode_active || state.vram_eco_offloaded {
                         1
                     } else {
                         state.config.stt.accuracy.beam_size
                     };
+                    let eff_preset = if state.night_mode_active {
+                        config::ConversationPreset::Slow
+                    } else {
+                        state.config.stt.preset
+                    };
+                    let eff_eq = if state.night_mode_active {
+                        state.config.noise_cancel.presence_eq_strength.max(0.65)
+                    } else {
+                        state.config.noise_cancel.presence_eq_strength
+                    };
                     let ctx = TranscribeContext {
                         language: state.config.stt.language.clone(),
                         hotwords_prompt: if hints.is_empty() { None } else { Some(hints) },
-                        preset: state.config.stt.preset,
+                        preset: eff_preset,
                         radio_clarity: state.config.noise_cancel.radio_clarity_mode,
-                        eq_strength: state.config.noise_cancel.presence_eq_strength,
+                        eq_strength: eff_eq,
                         head_pad_ms: state.config.stt.accuracy.head_silence_pad_ms,
                         tail_pad_ms: state.config.stt.accuracy.tail_silence_pad_ms,
                         beam_size: eff_beam,
@@ -3099,6 +3193,14 @@ fn main() -> wry::Result<()> {
                             let rec_vad = if peak_dbfs < -24.0 { 0.007 } else if peak_dbfs < -14.0 { 0.010 } else { 0.012 };
                             let rec_eq = if peak_dbfs < -18.0 || tempo >= 4.0 { 0.70 } else { 0.55 };
                             let rec_wsola = tempo >= 3.8;
+                            let rec_noise = if peak_dbfs < -22.0 && !hw.is_on_battery {
+                                "dpdfnet-16k"
+                            } else if hw.is_on_battery {
+                                "gtcrn-16k"
+                            } else {
+                                hw.recommended_stt_noise.as_str()
+                            }
+                            .to_string();
                             let note = format!(
                                 "診断完了: ピーク {:.1} dBFS / 話速スコア {:.1} / 認識「{}」",
                                 peak_dbfs, tempo, trimmed
@@ -3111,6 +3213,7 @@ fn main() -> wry::Result<()> {
                                     recommended_eq: rec_eq,
                                     recommended_wsola: rec_wsola,
                                     recommended_model: hw.recommended_stt_model,
+                                    recommended_noise_engine: rec_noise,
                                 },
                             );
                             return;
@@ -3421,14 +3524,26 @@ fn main() -> wry::Result<()> {
                             vad.threshold = vad.threshold.min(0.008);
                             vad.silence_ms = vad.silence_ms.max(800);
                             audio_ctrl.update_vad(vad);
+                            let mut night_tts = state.config.discord_tts.clone();
+                            night_tts.voicevox.volume_scale = (night_tts.voicevox.volume_scale
+                                * state.config.night_mode.tts_volume_scale)
+                                .clamp(0.05, 2.0);
+                            tts_ctrl.update_config(night_tts);
                         } else {
                             audio_ctrl.update_vad(state.config.vad.clone());
+                            tts_ctrl.update_config(state.config.discord_tts.clone());
                         }
                     }
                 } else {
-                    state.night_mode_active = false;
+                    if state.night_mode_active {
+                        state.night_mode_active = false;
+                        audio_ctrl.update_vad(state.config.vad.clone());
+                        tts_ctrl.update_config(state.config.discord_tts.clone());
+                    }
                 }
                 if state.win_poll_ticks % 20 == 1 {
+                    let prev_eco = state.eco_mode_active;
+                    let prev_vram = state.vram_eco_offloaded;
                     if state.config.power_eco.auto_battery_eco {
                         let (on_bat, _) = gpu_diag::query_power_status();
                         state.eco_mode_active = on_bat;
@@ -3438,11 +3553,38 @@ fn main() -> wry::Result<()> {
                     if state.config.power_eco.vram_watchdog_enabled {
                         if let Some(adp) = gpu_diag::query_best_dxgi_adapter() {
                             if let Some(pct) = adp.vram_usage_pct {
-                                state.vram_eco_offloaded = pct >= state.config.power_eco.vram_threshold_pct;
+                                let th = state.config.power_eco.vram_threshold_pct;
+                                state.vram_eco_offloaded = if prev_vram {
+                                    pct >= th.saturating_sub(10)
+                                } else {
+                                    pct >= th
+                                };
                             }
                         }
                     } else {
                         state.vram_eco_offloaded = false;
+                    }
+                    if prev_eco != state.eco_mode_active || prev_vram != state.vram_eco_offloaded {
+                        reload_stt_for_power_or_vram(&state, &stt_tx, &proxy);
+                        let msg = if state.vram_eco_offloaded {
+                            "VRAM高負荷を検知：STTを軽量/省メモリ構成へ退避しました"
+                        } else if state.eco_mode_active {
+                            "バッテリー駆動を検知：省電力Ecoスレッド設定へ切り替えました"
+                        } else {
+                            "電源/VRAM回復：通常STT構成へ復帰しました"
+                        };
+                        emit(
+                            &webview,
+                            &BackendEvent::Toast {
+                                level: if state.vram_eco_offloaded || state.eco_mode_active {
+                                    "warn"
+                                } else {
+                                    "ok"
+                                }
+                                .into(),
+                                message: msg.into(),
+                            },
+                        );
                     }
                 }
                 emit_all(&webview, &overlay_webview, &state.status_event());
@@ -3613,6 +3755,7 @@ fn main() -> wry::Result<()> {
                         "composer_not_found",
                         "focus_failed",
                         "text_not_inserted",
+                        "enter_not_sent",
                     ] {
                         if message.contains(code) {
                             emit_all(
@@ -3814,6 +3957,18 @@ fn main() -> wry::Result<()> {
                     }
                     emit_all(&webview, &overlay_webview, &state.status_event());
                 }
+                HotkeyAction::TogglePanicSafeMode => {
+                    toggle_panic_safe_mode(
+                        &mut state,
+                        &audio_ctrl,
+                        &tts_ctrl,
+                        &sound_player,
+                        &webview,
+                        &overlay_webview,
+                        &overlay_window,
+                        &tray,
+                    );
+                }
             },
             Event::UserEvent(UserEvent::Tray(action)) => match action {
                 TrayAction::ToggleListening => {
@@ -3838,6 +3993,18 @@ fn main() -> wry::Result<()> {
                         t.update_state(state.tray_state(), state.overlay_visible);
                     }
                     emit_all(&webview, &overlay_webview, &state.status_event());
+                }
+                TrayAction::TogglePanicSafeMode => {
+                    toggle_panic_safe_mode(
+                        &mut state,
+                        &audio_ctrl,
+                        &tts_ctrl,
+                        &sound_player,
+                        &webview,
+                        &overlay_webview,
+                        &overlay_window,
+                        &tray,
+                    );
                 }
                 TrayAction::ShowMainWindow => {
                     window.set_visible(true);
@@ -5038,7 +5205,18 @@ fn main() -> wry::Result<()> {
                             beam_size: state.config.stt.accuracy.beam_size,
                             temperature_fallback: state.config.stt.accuracy.temperature_fallback,
                         };
-                        match stats::run_auto_parameter_tuner(&state.bench_cases, eng.as_ref(), &ctx) {
+                        let den_opt = stt::local::discover_stt_denoiser(
+                            state.config.noise_cancel.stt_engine,
+                            &state.config.stt,
+                            state.runtime_dir.as_deref(),
+                            state.config.noise_cancel.dpdfnet_attenuation_limit_db,
+                        );
+                        match stats::run_auto_parameter_tuner(
+                            &state.bench_cases,
+                            eng.as_ref(),
+                            &ctx,
+                            den_opt.as_deref(),
+                        ) {
                             Ok(proposal) => {
                                 emit(&webview, &BackendEvent::AutoTunerResult { proposal });
                             }
@@ -5057,10 +5235,15 @@ fn main() -> wry::Result<()> {
                         eq_strength,
                         wsola_rate,
                         beam_size,
+                        dpdfnet_db,
                     } => {
                         state.config.noise_cancel.presence_eq_strength = eq_strength.clamp(0.0, 1.0);
                         state.config.stt.accuracy.wsola_rate = wsola_rate.clamp(0.75, 1.0);
                         state.config.stt.accuracy.beam_size = beam_size.clamp(1, 5);
+                        if let Some(db) = dpdfnet_db {
+                            state.config.noise_cancel.dpdfnet_attenuation_limit_db =
+                                db.abs().clamp(0.0, 60.0);
+                        }
                         let _ = state.config.save_to(&state.config_path);
                         emit(
                             &webview,
@@ -5074,6 +5257,42 @@ fn main() -> wry::Result<()> {
                             &BackendEvent::Toast {
                                 level: "ok".into(),
                                 message: "自動探索パラメータを適用しました".into(),
+                            },
+                        );
+                    }
+                    ClientCommand::ApplyCalibrationResult {
+                        vad_threshold,
+                        eq_strength,
+                        wsola_enabled,
+                        noise_engine,
+                    } => {
+                        state.config.vad.threshold = vad_threshold.clamp(0.002, 0.20);
+                        state.config.noise_cancel.presence_eq_strength = eq_strength.clamp(0.0, 1.0);
+                        state.config.stt.accuracy.wsola_enabled = wsola_enabled;
+                        state.config.noise_cancel.stt_engine = match noise_engine.as_str() {
+                            "dpdfnet-48k" => NoiseEngineKind::DpdfNet48k,
+                            "gtcrn-16k" => NoiseEngineKind::Gtcrn16k,
+                            "deepfilternet3" => NoiseEngineKind::DeepFilterNet3,
+                            "rnnoise" => NoiseEngineKind::Rnnoise,
+                            "off-hpf" => NoiseEngineKind::OffHpf,
+                            _ => NoiseEngineKind::DpdfNet16k,
+                        };
+                        audio_ctrl.update_vad(state.config.vad.clone());
+                        audio_ctrl.update_noise_cancel(state.config.noise_cancel.clone());
+                        let _ = state.config.save_to(&state.config_path);
+                        emit(
+                            &webview,
+                            &BackendEvent::ConfigLoaded {
+                                config: state.config.clone(),
+                                config_path: state.config_path.display().to_string(),
+                            },
+                        );
+                        emit_all(&webview, &overlay_webview, &state.status_event());
+                        emit(
+                            &webview,
+                            &BackendEvent::Toast {
+                                level: "ok".into(),
+                                message: "15秒滑舌診断の推奨パラメータを適用しました".into(),
                             },
                         );
                     }
@@ -5100,45 +5319,15 @@ fn main() -> wry::Result<()> {
                         );
                     }
                     ClientCommand::TogglePanicSafeMode => {
-                        state.panic_mode = !state.panic_mode;
-                        if state.panic_mode {
-                            set_listening_state(
-                                false,
-                                false,
-                                &mut state,
-                                &audio_ctrl,
-                                &sound_player,
-                                &webview,
-                                &overlay_webview,
-                                &tray,
-                            );
-                            cancel_send_countdown(
-                                &mut state,
-                                &webview,
-                                &overlay_webview,
-                                &sound_player,
-                                "パニックセーフモード発動",
-                            );
-                            state.draft_segments.clear();
-                            tts_ctrl.stop_and_clear();
-                            state.overlay_visible = false;
-                            overlay_window.set_visible(false);
-                        } else {
-                            state.overlay_visible = state.config.overlay.enabled;
-                            overlay_window.set_visible(state.overlay_visible);
-                        }
-                        emit_all(&webview, &overlay_webview, &state.status_event());
-                        emit(
+                        toggle_panic_safe_mode(
+                            &mut state,
+                            &audio_ctrl,
+                            &tts_ctrl,
+                            &sound_player,
                             &webview,
-                            &BackendEvent::Toast {
-                                level: if state.panic_mode { "warn" } else { "ok" }.into(),
-                                message: if state.panic_mode {
-                                    "配信・画面共有セーフモード ON（マイク停止・HUD非表示・読み上げ停止・履歴マスク）"
-                                } else {
-                                    "配信セーフモードを解除しました"
-                                }
-                                .into(),
-                            },
+                            &overlay_webview,
+                            &overlay_window,
+                            &tray,
                         );
                     }
                     ClientCommand::ToggleTargetLock => {

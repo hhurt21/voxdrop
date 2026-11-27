@@ -269,31 +269,66 @@ where
 
     let dest_path = target_dir.join(&spec.filename);
     let tmp_path = target_dir.join(format!("{}.part", spec.filename));
-    let _ = fs::remove_file(&tmp_path);
 
-    on_progress(&spec.id, 10, &format!("ダウンロード開始: {}", spec.filename));
-
-    let mut dl_cmd = Command::new("curl.exe");
-    dl_cmd.creation_flags(CREATE_NO_WINDOW);
-    dl_cmd.args(["-L", "--fail", "--retry", "2", "--retry-delay", "2", "-o"])
-        .arg(&tmp_path)
-        .arg(&spec.url);
-
-    let out = dl_cmd
-        .output()
-        .map_err(|e| format!("curl.exe の起動に失敗しました: {}", e))?;
-    if !out.status.success() {
+    let mut actual_sha = String::new();
+    for attempt in 0..2 {
         let _ = fs::remove_file(&tmp_path);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(format!(
-            "モデルのダウンロードに失敗しました ({}): {}",
-            out.status,
-            stderr.trim()
-        ));
+        let start_msg = if attempt == 0 {
+            format!("ダウンロード開始: {}", spec.filename)
+        } else {
+            format!("整合性再検証のため再ダウンロード中: {}", spec.filename)
+        };
+        on_progress(&spec.id, 10, &start_msg);
+
+        let mut dl_cmd = Command::new("curl.exe");
+        dl_cmd.creation_flags(CREATE_NO_WINDOW);
+        dl_cmd
+            .args(["-L", "--fail", "--retry", "2", "--retry-delay", "2", "-o"])
+            .arg(&tmp_path)
+            .arg(&spec.url);
+
+        let out = dl_cmd
+            .output()
+            .map_err(|e| format!("curl.exe の起動に失敗しました: {}", e))?;
+        if !out.status.success() {
+            let _ = fs::remove_file(&tmp_path);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(format!(
+                "モデルのダウンロードに失敗しました ({}): {}",
+                out.status,
+                stderr.trim()
+            ));
+        }
+
+        let file_len = fs::metadata(&tmp_path).map(|m| m.len()).unwrap_or(0);
+        if file_len < 1024 {
+            let _ = fs::remove_file(&tmp_path);
+            if attempt == 0 {
+                continue;
+            }
+            return Err("ダウンロードファイルが空または破損しています（HTMLエラー等）".into());
+        }
+
+        actual_sha = compute_file_sha256(&tmp_path)?;
+        if let Some(ref expected) = spec.expected_sha256 {
+            if !actual_sha.eq_ignore_ascii_case(expected.trim()) {
+                let _ = fs::remove_file(&tmp_path);
+                if attempt == 0 {
+                    continue;
+                }
+                return Err(format!(
+                    "SHA-256 整合性検証に失敗しました（破損データのため削除: {} != {}）",
+                    &actual_sha[..actual_sha.len().min(12)],
+                    &expected[..expected.len().min(12)]
+                ));
+            }
+        }
+        break;
     }
 
+    let short_sha = &actual_sha[..actual_sha.len().min(10)];
     if spec.is_tar_bz2 {
-        on_progress(&spec.id, 75, "アーカイブを展開中...");
+        on_progress(&spec.id, 75, &format!("SHA-256 ({}) 確認済・展開中...", short_sha));
         let mut tar_cmd = Command::new("tar.exe");
         tar_cmd.creation_flags(CREATE_NO_WINDOW);
         tar_cmd.arg("-xjf").arg(&tmp_path).arg("-C").arg(target_dir);
@@ -313,7 +348,11 @@ where
         }
         fs::rename(&tmp_path, &dest_path)
             .map_err(|e| format!("モデルファイルの配置に失敗しました: {}", e))?;
-        on_progress(&spec.id, 100, &format!("ダウンロード完了: {}", spec.filename));
+        on_progress(
+            &spec.id,
+            100,
+            &format!("ダウンロード完了 (SHA-256: {}): {}", short_sha, spec.filename),
+        );
         Ok(dest_path)
     }
 }

@@ -215,7 +215,7 @@
                       <option value="dpdfnet-16k">DPDFNet2 16kHz (推奨・DirectML/CPU)</option>
                       <option value="dpdfnet-48k">DPDFNet 48kHz (最高音質・外部)</option>
                       <option value="gtcrn-16k">GTCRN 16kHz (軽量AI)</option>
-                      <option value="deepfilternet3">DeepFilterNet3 外部CLI</option>
+                      <option value="deepfilternet3">DeepFilterNet3 (外部ONNX)</option>
                       <option value="rnnoise">RNNoise 48kHz (同梱標準)</option>
                       <option value="off-hpf">バイパス (85Hzハイパスのみ)</option>
                     </select>
@@ -230,8 +230,8 @@
                 </div>
                 <input type="range" id="ncStrength" min="0" max="1" step="0.05" value="1" />
                 <div class="form-grid" style="margin-top: 6px">
-                  <label class="small-label">DPDFNet残響ガード (dB): <strong id="ncDpdfLimitVal">-18</strong> dB
-                    <input type="range" id="ncDpdfLimit" min="-40" max="0" step="1" value="-18" />
+                  <label class="small-label">DPDFNet残響ガード (dB): <strong id="ncDpdfLimitVal">12</strong> dB
+                    <input type="range" id="ncDpdfLimit" min="0" max="40" step="1" value="12" />
                   </label>
                   <label class="small-label">子音Presence EQ (3.6kHz): <strong id="ncPresenceEqVal">55%</strong>
                     <input type="range" id="ncPresenceEq" min="0" max="1" step="0.05" value="0.55" />
@@ -942,6 +942,9 @@
                 </label>
                 <label>ミニHUD表示切替
                   <input type="text" id="hkOverlay" class="input" placeholder="Ctrl+Shift+O" />
+                </label>
+                <label>配信セーフモード（パニックミュート）
+                  <input type="text" id="hkPanicMute" class="input" placeholder="例: Ctrl+Shift+P（空欄で無効）" />
                 </label>
               </div>
             </div>
