@@ -319,13 +319,13 @@ fn is_loopback(host: &str) -> bool {
 }
 
 unsafe fn query_winhttp_string_header(req: *mut c_void, level: u32, name: Option<&[u16]>) -> Option<String> {
-    let mut buf = vec![0u16; 512];
+    let mut buf = vec![0u16; 2048];
     let mut byte_len = (buf.len() * 2) as u32;
     let name_ptr = match name {
         Some(n) => PCWSTR(n.as_ptr()),
         None => PCWSTR::null(),
     };
-    if WinHttpQueryHeaders(
+    let mut ok = WinHttpQueryHeaders(
         req,
         level,
         name_ptr,
@@ -333,10 +333,27 @@ unsafe fn query_winhttp_string_header(req: *mut c_void, level: u32, name: Option
         &mut byte_len,
         std::ptr::null_mut(),
     )
-    .is_ok()
-    {
+    .is_ok();
+    if !ok && byte_len > (buf.len() * 2) as u32 && byte_len <= 65_536 {
+        let needed_u16 = (byte_len as usize / 2) + 4;
+        buf.resize(needed_u16, 0);
+        byte_len = (buf.len() * 2) as u32;
+        ok = WinHttpQueryHeaders(
+            req,
+            level,
+            name_ptr,
+            Some(buf.as_mut_ptr() as *mut c_void),
+            &mut byte_len,
+            std::ptr::null_mut(),
+        )
+        .is_ok();
+    }
+    if ok {
         let u16_len = (byte_len as usize / 2).min(buf.len());
-        let s = String::from_utf16_lossy(&buf[..u16_len]).trim().to_string();
+        let s = String::from_utf16_lossy(&buf[..u16_len])
+            .trim_end_matches('\0')
+            .trim()
+            .to_string();
         if !s.is_empty() {
             return Some(s);
         }
@@ -448,6 +465,171 @@ fn disable_auto_redirects(req: *mut c_void) {
     unsafe {
         let _ = WinHttpSetOption(Some(req), WINHTTP_OPTION_DISABLE_FEATURE, Some(&bytes));
     }
+}
+
+/// Fetches UTF-8 text (e.g. JSON API / manifest) over HTTPS-only WinHTTP, following redirects
+/// including long CDN Location headers cleanly.
+pub fn fetch_https_text_winhttp(url: &str, accept_json: bool) -> Result<String, String> {
+    let trimmed = url.trim();
+    if !trimmed.starts_with("https://") {
+        return Err("セキュリティ保護のため https:// URL のみ許可されています".into());
+    }
+    fetch_text_winhttp_inner(trimmed, accept_json)
+}
+
+fn fetch_text_winhttp_inner(url: &str, accept_json: bool) -> Result<String, String> {
+    const MAX_TEXT_BYTES: usize = 4 * 1024 * 1024;
+    let mut current_url = url.trim().to_string();
+    for _hop in 0..8usize {
+        let parsed = split_download_url(&current_url)?;
+        let ua_w: Vec<u16> = "VoxDrop-Discovery/1.7\0".encode_utf16().collect();
+        let host_w: Vec<u16> = parsed.host.encode_utf16().chain(std::iter::once(0)).collect();
+        let path_w: Vec<u16> = parsed
+            .path_and_query
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let access = if is_loopback(&parsed.host) {
+            WINHTTP_ACCESS_TYPE_NO_PROXY
+        } else {
+            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY
+        };
+        let flags = if parsed.is_https {
+            WINHTTP_FLAG_SECURE
+        } else {
+            Default::default()
+        };
+
+        enum TextHop {
+            Redirect(String),
+            Body(u32, Vec<u8>),
+        }
+
+        let hop_out = unsafe {
+            let session = WinHttpOpen(PCWSTR(ua_w.as_ptr()), access, PCWSTR::null(), PCWSTR::null(), 0);
+            if session.is_null() {
+                return Err("WinHTTP セッション初期化失敗".into());
+            }
+            let out = (|| -> Result<TextHop, String> {
+                let _ = WinHttpSetTimeouts(session, 5000, 8000, 12_000, 15_000);
+                let connect = WinHttpConnect(session, PCWSTR(host_w.as_ptr()), parsed.port, 0);
+                if connect.is_null() {
+                    return Err(format!("サーバーへ接続できません: {}", parsed.host));
+                }
+                let req = WinHttpOpenRequest(
+                    connect,
+                    w!("GET"),
+                    PCWSTR(path_w.as_ptr()),
+                    PCWSTR::null(),
+                    PCWSTR::null(),
+                    std::ptr::null(),
+                    flags,
+                );
+                if req.is_null() {
+                    let _ = WinHttpCloseHandle(connect);
+                    return Err("GET リクエスト作成失敗".into());
+                }
+                disable_auto_redirects(req);
+                if accept_json {
+                    let hdr_w: Vec<u16> = "Accept: application/vnd.github+json, application/json\r\n\0"
+                        .encode_utf16()
+                        .collect();
+                    let _ = WinHttpAddRequestHeaders(
+                        req,
+                        &hdr_w[..hdr_w.len().saturating_sub(1)],
+                        WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE,
+                    );
+                }
+                if let Err(e) = WinHttpSendRequest(req, None, None, 0, 0, 0) {
+                    let _ = WinHttpCloseHandle(req);
+                    let _ = WinHttpCloseHandle(connect);
+                    return Err(format!("リクエスト送信失敗: {}", e));
+                }
+                if let Err(e) = WinHttpReceiveResponse(req, std::ptr::null_mut()) {
+                    let _ = WinHttpCloseHandle(req);
+                    let _ = WinHttpCloseHandle(connect);
+                    return Err(format!("応答待機失敗: {}", e));
+                }
+                let mut status: u32 = 0;
+                let mut slen = std::mem::size_of::<u32>() as u32;
+                let _ = WinHttpQueryHeaders(
+                    req,
+                    WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                    PCWSTR::null(),
+                    Some(&mut status as *mut u32 as *mut c_void),
+                    &mut slen,
+                    std::ptr::null_mut(),
+                );
+                if matches!(status, 301 | 302 | 303 | 307 | 308) {
+                    let location = query_winhttp_string_header(req, WINHTTP_QUERY_LOCATION, None);
+                    let _ = WinHttpCloseHandle(req);
+                    let _ = WinHttpCloseHandle(connect);
+                    if let Some(loc) = location {
+                        return Ok(TextHop::Redirect(loc));
+                    }
+                    return Err(format!(
+                        "リダイレクト先に Location ヘッダがありません (HTTP {})",
+                        status
+                    ));
+                }
+                let mut bytes = Vec::new();
+                loop {
+                    let mut avail: u32 = 0;
+                    if let Err(e) = WinHttpQueryDataAvailable(req, &mut avail) {
+                        let _ = WinHttpCloseHandle(req);
+                        let _ = WinHttpCloseHandle(connect);
+                        return Err(format!("データ受信エラー: {}", e));
+                    }
+                    if avail == 0 {
+                        break;
+                    }
+                    let mut chunk = vec![0u8; (avail as usize).min(65_536)];
+                    let mut read: u32 = 0;
+                    if WinHttpReadData(
+                        req,
+                        chunk.as_mut_ptr() as *mut c_void,
+                        chunk.len() as u32,
+                        &mut read,
+                    )
+                    .is_err()
+                    {
+                        let _ = WinHttpCloseHandle(req);
+                        let _ = WinHttpCloseHandle(connect);
+                        return Err("レスポンス読み取りエラー".into());
+                    }
+                    if read == 0 {
+                        break;
+                    }
+                    if bytes.len() + (read as usize) > MAX_TEXT_BYTES {
+                        let _ = WinHttpCloseHandle(req);
+                        let _ = WinHttpCloseHandle(connect);
+                        return Err("レスポンスサイズが上限 (4MB) を超えました".into());
+                    }
+                    bytes.extend_from_slice(&chunk[..read as usize]);
+                }
+                let _ = WinHttpCloseHandle(req);
+                let _ = WinHttpCloseHandle(connect);
+                Ok(TextHop::Body(status, bytes))
+            })();
+            let _ = WinHttpCloseHandle(session);
+            out
+        }?;
+
+        match hop_out {
+            TextHop::Redirect(loc) => {
+                current_url = resolve_redirect_url(&current_url, &loc)?;
+                continue;
+            }
+            TextHop::Body(status, bytes) => {
+                if status != 200 {
+                    return Err(format!("API / マニフェスト取得エラー (HTTP {})", status));
+                }
+                return String::from_utf8(bytes)
+                    .map_err(|_| "レスポンスは UTF-8 テキストではありません".into());
+            }
+        }
+    }
+    Err("リダイレクト回数が上限を超えました".into())
 }
 
 fn probe_once_winhttp(url: &str, method: &str, range_zero: bool) -> Result<(u32, Option<u64>, String), String> {
@@ -1158,7 +1340,7 @@ mod tests {
         let payload_clone = payload.clone();
 
         thread::spawn(move || {
-            for stream in listener.incoming().take(12).flatten() {
+            for stream in listener.incoming().take(18).flatten() {
                 let mut reader = std::io::BufReader::new(stream);
                 let mut req_line = String::new();
                 let _ = reader.read_line(&mut req_line);
@@ -1177,11 +1359,19 @@ mod tests {
                 let mut s = reader.into_inner();
                 let parts: Vec<&str> = req_line.split_whitespace().collect();
                 let method = *parts.first().unwrap_or(&"GET");
-                let path = *parts.get(1).unwrap_or(&"/");
+                let path_full = *parts.get(1).unwrap_or(&"/");
+                let path = path_full.split('?').next().unwrap_or(path_full);
                 if path == "/dead.bin" {
                     let _ = s.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
                 } else if path == "/redirect308.bin" {
                     let _ = s.write_all(b"HTTP/1.1 308 Permanent Redirect\r\nLocation: /mirror.bin\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                } else if path == "/longredirect.bin" {
+                    let sig = "a".repeat(1580);
+                    let resp = format!(
+                        "HTTP/1.1 302 Found\r\nLocation: /mirror.bin?sig={}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        sig
+                    );
+                    let _ = s.write_all(resp.as_bytes());
                 } else if path == "/truncated.bin" {
                     let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 4096\r\nConnection: close\r\n\r\nshort");
                 } else if path == "/html.bin" {
@@ -1264,9 +1454,20 @@ mod tests {
         assert_eq!(got.len(), payload.len());
         assert_eq!(got, payload);
 
-        // 308 redirect probe + download + truncated body rejection
+        // 308 redirect + 1600-char 302 Location header redirect + truncated body rejection
         let redir_probe = probe_url_health_winhttp(&format!("http://{}/redirect308.bin", addr));
         assert!(redir_probe.ok, "308 redirect probe should succeed: {:?}", redir_probe);
+
+        let long_url = format!("http://{}/longredirect.bin", addr);
+        let long_probe = probe_url_health_winhttp(&long_url);
+        assert!(long_probe.ok, "1600-char Location redirect probe should succeed: {:?}", long_probe);
+        let tmp_long = std::env::temp_dir().join(format!("voxdrop_longredir_test_{}.part", std::process::id()));
+        let _ = fs::remove_file(&tmp_long);
+        download_url_resumable_winhttp(&long_url, &tmp_long, "longredir", &|_, _, _| {})
+            .expect("1600-char Location redirect download should succeed");
+        let got_long = fs::read(&tmp_long).unwrap();
+        let _ = fs::remove_file(&tmp_long);
+        assert_eq!(got_long, payload);
 
         let tmp_trunc = std::env::temp_dir().join(format!("voxdrop_trunc_test_{}.part", std::process::id()));
         let trunc_res = download_url_resumable_winhttp(
@@ -1277,5 +1478,27 @@ mod tests {
         );
         let _ = fs::remove_file(&tmp_trunc);
         assert!(trunc_res.is_err(), "truncated response must error, got Ok");
+    }
+
+    #[test]
+    #[ignore]
+    fn live_winhttp_long_redirect_smoke() {
+        for url in [
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-q5_0.bin",
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/speech-enhancement-models/dpdfnet2.onnx",
+            "https://github.com/ggml-org/llama.cpp/releases/download/b12811/llama-b12811-bin-win-vulkan-x64.zip",
+            "https://huggingface.co/unsloth/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q4_K_M.gguf",
+        ] {
+            let res = probe_url_health_winhttp(url);
+            assert!(res.ok, "WinHTTP live probe failed for {}: {:?}", url, res);
+            println!("LIVE WINHTTP OK: {} -> {}", url, res.message);
+        }
+        let disc_dir = std::env::temp_dir().join(format!("voxdrop_live_disc_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&disc_dir);
+        fs::create_dir_all(&disc_dir).unwrap();
+        let report = crate::stt::catalog::discover_latest_and_alternative_models_winhttp(&disc_dir, None)
+            .expect("live discovery must succeed");
+        println!("LIVE DISCOVERY OK: {} | added={:?} updated={:?}", report.summary, report.added_models, report.updated_models);
+        let _ = fs::remove_dir_all(&disc_dir);
     }
 }

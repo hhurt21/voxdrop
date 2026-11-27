@@ -129,6 +129,7 @@ enum UserEvent {
     },
     UrlHealthCheckDone(Vec<stt::catalog::ModelUrlHealthDto>),
     OnlineCatalogSyncDone(Result<(usize, usize, String), String>),
+    ModelsDiscoveredDone(Result<stt::catalog::ModelDiscoveryReport, String>),
     HttpAsrHealthDone(Result<String, String>),
     LlmHealthDone(Result<String, String>),
     LlmSampleDone {
@@ -3565,6 +3566,7 @@ fn main() -> wry::Result<()> {
                 );
                 if done {
                     emit_stt_models(&state, &webview);
+                    let err_msg = message.clone();
                     emit(
                         &webview,
                         &BackendEvent::Toast {
@@ -3572,6 +3574,33 @@ fn main() -> wry::Result<()> {
                             message,
                         },
                     );
+                    if !ok
+                        && (err_msg.contains("404")
+                            || err_msg.contains("HTMLエラーページ")
+                            || err_msg.contains("未知のモデルID")
+                            || err_msg.contains("見つかりません"))
+                    {
+                        let data_dir = state.data_dir();
+                        let broken_id = model_id.clone();
+                        let p = proxy.clone();
+                        emit(
+                            &webview,
+                            &BackendEvent::Toast {
+                                level: "info".into(),
+                                message: format!(
+                                    "「{}」が見つからないため、最新・代替モデルを自動探索しています...",
+                                    broken_id
+                                ),
+                            },
+                        );
+                        thread::spawn(move || {
+                            let res = stt::catalog::discover_latest_and_alternative_models_winhttp(
+                                &data_dir,
+                                Some(&broken_id),
+                            );
+                            let _ = p.send_event(UserEvent::ModelsDiscoveredDone(res));
+                        });
+                    }
                     if ok && state.config.auto_apply_preset_on_download {
                         let applied = apply_model_auto_preset_for_state(
                             &mut state,
@@ -3635,6 +3664,46 @@ fn main() -> wry::Result<()> {
                     );
                 }
                 Err(err) => {
+                    emit(
+                        &webview,
+                        &BackendEvent::Toast {
+                            level: "error".into(),
+                            message: err,
+                        },
+                    );
+                }
+            },
+            Event::UserEvent(UserEvent::ModelsDiscoveredDone(res)) => match res {
+                Ok(report) => {
+                    emit(
+                        &webview,
+                        &BackendEvent::ModelsDiscovered {
+                            ok: true,
+                            added: report.added_models.clone(),
+                            updated: report.updated_models.clone(),
+                            summary: report.summary.clone(),
+                        },
+                    );
+                    emit_catalog_inventory(&state, &webview);
+                    emit_stt_models(&state, &webview);
+                    emit(
+                        &webview,
+                        &BackendEvent::Toast {
+                            level: "ok".into(),
+                            message: report.summary,
+                        },
+                    );
+                }
+                Err(err) => {
+                    emit(
+                        &webview,
+                        &BackendEvent::ModelsDiscovered {
+                            ok: false,
+                            added: Vec::new(),
+                            updated: Vec::new(),
+                            summary: err.clone(),
+                        },
+                    );
                     emit(
                         &webview,
                         &BackendEvent::Toast {
@@ -5256,6 +5325,17 @@ fn main() -> wry::Result<()> {
                         thread::spawn(move || {
                             let res = stt::catalog::sync_online_catalog_winhttp(&url, &data_dir);
                             let _ = p.send_event(UserEvent::OnlineCatalogSyncDone(res));
+                        });
+                    }
+                    ClientCommand::DiscoverLatestModels { broken_model_id } => {
+                        let data_dir = state.data_dir();
+                        let p = proxy.clone();
+                        thread::spawn(move || {
+                            let res = stt::catalog::discover_latest_and_alternative_models_winhttp(
+                                &data_dir,
+                                broken_model_id.as_deref(),
+                            );
+                            let _ = p.send_event(UserEvent::ModelsDiscoveredDone(res));
                         });
                     }
                     ClientCommand::DownloadBundle { bundle_id } => {

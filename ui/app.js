@@ -2043,6 +2043,18 @@
     showToast("公式カタログ (models_catalog.json) を確認中...", "info");
     send({ type: "SyncOnlineCatalog" });
   });
+  if ($("btnDiscoverLatestModels")) {
+    $("btnDiscoverLatestModels").addEventListener("click", () => {
+      showToast("GitHub / HuggingFace から最新・代替モデルを探索して概要を生成しています...", "info");
+      send({ type: "DiscoverLatestModels", broken_model_id: null });
+    });
+  }
+  if ($("btnDiscoverLlmModels")) {
+    $("btnDiscoverLlmModels").addEventListener("click", () => {
+      showToast("最新の llama-server と Qwen3 LLM モデルを自動探索中...", "info");
+      send({ type: "DiscoverLatestModels", broken_model_id: null });
+    });
+  }
   $("btnCleanupModels").addEventListener("click", () => {
     if (window.confirm("現在使用していない外部モデルをまとめて削除し、ディスク容量を解放しますか？（同梱標準モデルは保護されます）")) {
       send({ type: "CleanupUnusedModels" });
@@ -3081,6 +3093,18 @@
       case "OnlineCatalogSynced":
         showToast(ev.summary || "カタログを更新しました", "ok");
         break;
+      case "ModelsDiscovered": {
+        const ban = $("discoveryResultBanner");
+        if (ban) {
+          ban.style.display = "block";
+          ban.className = "ab-result show" + (ev.ok ? "" : " err");
+          const parts = [ev.summary || ""];
+          if (ev.added && ev.added.length) parts.push("追加: " + ev.added.join(" / "));
+          if (ev.updated && ev.updated.length) parts.push("更新: " + ev.updated.join(" / "));
+          ban.textContent = parts.filter(Boolean).join("\n");
+        }
+        break;
+      }
       case "PresetAutoApplied": {
         const ban = $("autoPresetUndoBanner");
         if (ban) {

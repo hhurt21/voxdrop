@@ -307,6 +307,8 @@ pub fn discover_stt_denoiser(
     use crate::config::NoiseEngineKind;
     let names: &[&str] = match kind {
         NoiseEngineKind::DpdfNet16k => &[
+            "dpdfnet8.onnx",
+            "dpdfnet4.onnx",
             "dpdfnet2.onnx",
             "dpdfnet_baseline.onnx",
             "dpdfnet_baseline_16k.onnx",

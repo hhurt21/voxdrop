@@ -8,16 +8,8 @@ use crate::config::{
 use crate::gpu_diag::HardwareProfile;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::ffi::c_void;
 use std::fs;
 use std::path::{Path, PathBuf};
-use windows::core::{w, PCWSTR};
-use windows::Win32::Networking::WinHttp::{
-    WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryDataAvailable,
-    WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest,
-    WinHttpSetTimeouts, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_FLAG_SECURE,
-    WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
-};
 
 pub const CATALOG_SCHEMA_VERSION: u32 = 1;
 
@@ -513,92 +505,7 @@ pub fn sync_online_catalog_winhttp(
     if !trimmed.starts_with("https://") {
         return Err("セキュリティ保護のため、カタログ同期URLは https:// のみ許可されています".into());
     }
-    let parsed = crate::stt::http_asr::parse_url(trimmed)?;
-    let full_path = if parsed.base_path.is_empty() {
-        "/".to_string()
-    } else {
-        parsed.base_path.clone()
-    };
-
-    let ua_w: Vec<u16> = "VoxDrop-CatalogSync/1.7\0".encode_utf16().collect();
-    let host_w: Vec<u16> = parsed.host.encode_utf16().chain(std::iter::once(0)).collect();
-    let path_w: Vec<u16> = full_path.encode_utf16().chain(std::iter::once(0)).collect();
-
-    let (status, bytes) = unsafe {
-        let session = WinHttpOpen(
-            PCWSTR(ua_w.as_ptr()),
-            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-            PCWSTR::null(),
-            PCWSTR::null(),
-            0,
-        );
-        if session.is_null() {
-            return Err("WinHTTP セッション初期化失敗".into());
-        }
-        let res = (|| -> Result<(u32, Vec<u8>), String> {
-            let _ = WinHttpSetTimeouts(session, 4000, 5000, 8000, 8000);
-            let connect = WinHttpConnect(session, PCWSTR(host_w.as_ptr()), parsed.port, 0);
-            if connect.is_null() {
-                return Err(format!("カタログサーバーへ接続できません: {}", parsed.host));
-            }
-            let req = WinHttpOpenRequest(
-                connect,
-                w!("GET"),
-                PCWSTR(path_w.as_ptr()),
-                PCWSTR::null(),
-                PCWSTR::null(),
-                std::ptr::null(),
-                WINHTTP_FLAG_SECURE,
-            );
-            if req.is_null() {
-                let _ = WinHttpCloseHandle(connect);
-                return Err("HTTPS リクエスト作成に失敗しました".into());
-            }
-            WinHttpSendRequest(req, None, None, 0, 0, 0)
-                .map_err(|e| format!("リクエスト送信失敗: {}", e))?;
-            WinHttpReceiveResponse(req, std::ptr::null_mut())
-                .map_err(|e| format!("応答受信失敗: {}", e))?;
-
-            let mut status: u32 = 0;
-            let mut slen = std::mem::size_of::<u32>() as u32;
-            let _ = WinHttpQueryHeaders(
-                req,
-                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                PCWSTR::null(),
-                Some(&mut status as *mut u32 as *mut c_void),
-                &mut slen,
-                std::ptr::null_mut(),
-            );
-            let mut out = Vec::new();
-            loop {
-                let mut avail: u32 = 0;
-                if WinHttpQueryDataAvailable(req, &mut avail).is_err() || avail == 0 {
-                    break;
-                }
-                let mut chunk = vec![0u8; avail as usize];
-                let mut read: u32 = 0;
-                if WinHttpReadData(req, chunk.as_mut_ptr() as *mut c_void, avail, &mut read).is_err()
-                    || read == 0
-                {
-                    break;
-                }
-                out.extend_from_slice(&chunk[..read as usize]);
-                if out.len() > 2 * 1024 * 1024 {
-                    break;
-                }
-            }
-            let _ = WinHttpCloseHandle(req);
-            let _ = WinHttpCloseHandle(connect);
-            Ok((status, out))
-        })();
-        let _ = WinHttpCloseHandle(session);
-        res?
-    };
-
-    if status != 200 {
-        return Err(format!("カタログ取得エラー (HTTP {})", status));
-    }
-    let raw = String::from_utf8(bytes).map_err(|_| "カタログはUTF-8ではありません".to_string())?;
+    let raw = crate::stt::downloader::fetch_https_text_winhttp(trimmed, true)?;
     let manifest = parse_and_validate_manifest(&raw)?;
 
     let before = load_merged_catalog(data_dir);
@@ -621,6 +528,553 @@ pub fn sync_online_catalog_winhttp(
         manifest.models.len()
     );
     Ok((updated_urls, added_models, summary))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelDiscoveryReport {
+    pub updated_models: Vec<String>,
+    pub added_models: Vec<String>,
+    pub summary: String,
+}
+
+fn mb_rounded(bytes: u64) -> u32 {
+    if bytes == 0 {
+        0
+    } else {
+        ((bytes as f64) / (1024.0 * 1024.0)).round().max(1.0) as u32
+    }
+}
+
+pub fn parse_llama_cpp_latest_vulkan(json: &str) -> Option<(String, String, u64)> {
+    let rels: serde_json::Value = serde_json::from_str(json).ok()?;
+    let arr = rels.as_array()?;
+    for r in arr {
+        let tag = r.get("tag_name").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let assets = r.get("assets").and_then(|v| v.as_array())?;
+        for a in assets {
+            let name = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if name.to_ascii_lowercase().contains("win-vulkan-x64.zip") {
+                let url = a
+                    .get("browser_download_url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                let sz = a.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+                if !tag.is_empty() && !url.is_empty() {
+                    return Some((tag.to_string(), url.to_string(), sz));
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn parse_sherpa_enhancement_assets(json: &str) -> Vec<CatalogManifestEntry> {
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let Some(assets) = val.get("assets").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for a in assets {
+        let name = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let url = a
+            .get("browser_download_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let sz = a.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+        if url.is_empty() || !name.ends_with(".onnx") {
+            continue;
+        }
+        match name {
+            "dpdfnet4.onnx" => out.push(CatalogManifestEntry {
+                id: "dpdfnet4-16k".into(),
+                category: ModelCategory::NoiseSuppression,
+                display_name: "DPDFNet4 (16kHz 高精度強化版)".into(),
+                runtime: "sherpa-onnx (DirectML / CPU)".into(),
+                version_tag: "dpdfnet4-auto".into(),
+                primary_url: url.into(),
+                mirror_urls: Vec::new(),
+                local_rel_path: "dpdfnet4.onnx".into(),
+                local_match: vec!["dpdfnet4.onnx".into()],
+                archive_type: ArchiveType::RawFile,
+                expected_size_bytes: Some(sz).filter(|&s| s > 0),
+                sha256: None,
+                min_vram_gb: 0.0,
+                download_size_mb: mb_rounded(sz).max(11),
+                scores: ModelScores { accuracy: 5, noise_resilience: 5, speed: 4, lightness: 3 },
+                bundled_default: false,
+                benefits: vec![
+                    "GitHub公式リリースから自動検出した DPDFNet4（Dual-Path 強化版・約11MB）".into(),
+                    "DPDFNet2 より強い非定常ノイズ（扇風機・キーボード・環境音）抑制力を実現".into(),
+                    "過抑制リミット (12 dB) で語頭の子音削れを防ぎつつ CUDA 不要で動作".into(),
+                ],
+                best_for: "強い周囲ノイズ環境での滑舌保護＆クリア集音".into(),
+                caution: "DPDFNet2 より CPU 負荷がわずかに増加します".into(),
+                recommended_preset: ModelAutoPreset {
+                    backend: BackendPreference::DirectMlWithCpuFallback,
+                    attenuation_limit_db: Some(12.0),
+                    ..Default::default()
+                },
+            }),
+            "dpdfnet8.onnx" => out.push(CatalogManifestEntry {
+                id: "dpdfnet8-16k".into(),
+                category: ModelCategory::NoiseSuppression,
+                display_name: "DPDFNet8 (16kHz 最強8ブロック版)".into(),
+                runtime: "sherpa-onnx (DirectML / CPU)".into(),
+                version_tag: "dpdfnet8-auto".into(),
+                primary_url: url.into(),
+                mirror_urls: Vec::new(),
+                local_rel_path: "dpdfnet8.onnx".into(),
+                local_match: vec!["dpdfnet8.onnx".into()],
+                archive_type: ArchiveType::RawFile,
+                expected_size_bytes: Some(sz).filter(|&s| s > 0),
+                sha256: None,
+                min_vram_gb: 0.0,
+                download_size_mb: mb_rounded(sz).max(14),
+                scores: ModelScores { accuracy: 5, noise_resilience: 5, speed: 3, lightness: 2 },
+                bundled_default: false,
+                benefits: vec![
+                    "GitHub公式リリースから自動検出した最上位 DPDFNet8（約14MB）".into(),
+                    "スピーカー返り音・機械打鍵・生活雑音が激しい部屋でも極めて高い音声分離性能".into(),
+                    "過抑制リミット (12 dB) プリセット自動適用で自然な声質を維持".into(),
+                ],
+                best_for: "極端な騒音下・開放型マイクでの最高水準ノイズ除去".into(),
+                caution: "シリーズ最重モデルのため低スペックCPUでは DPDFNet2/GTCRN を推奨".into(),
+                recommended_preset: ModelAutoPreset {
+                    backend: BackendPreference::DirectMlWithCpuFallback,
+                    attenuation_limit_db: Some(12.0),
+                    ..Default::default()
+                },
+            }),
+            _ => {}
+        }
+    }
+    out
+}
+
+pub fn parse_sherpa_asr_assets(json: &str) -> Vec<CatalogManifestEntry> {
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let Some(assets) = val.get("assets").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut best_qwen3: Option<(String, String, u64)> = None;
+    for a in assets {
+        let name = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let url = a
+            .get("browser_download_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let sz = a.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+        let lower = name.to_ascii_lowercase();
+        if lower.contains("qwen3-asr") && lower.contains("int8") && lower.ends_with(".tar.bz2") && !url.is_empty() {
+            let folder = name.trim_end_matches(".tar.bz2").to_string();
+            let replace = best_qwen3
+                .as_ref()
+                .map(|(prev_n, _, _)| name > prev_n.as_str())
+                .unwrap_or(true);
+            if replace {
+                best_qwen3 = Some((folder, url.to_string(), sz));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if let Some((folder, url, sz)) = best_qwen3 {
+        if let Some(mut base) = embedded_catalog_entries()
+            .into_iter()
+            .find(|e| e.id == "qwen3-asr-0.6b-int8")
+        {
+            base.primary_url = url;
+            base.local_rel_path = folder.clone();
+            if !base.local_match.contains(&folder) {
+                base.local_match.insert(0, folder);
+            }
+            if sz > 0 {
+                base.expected_size_bytes = Some(sz);
+                base.download_size_mb = mb_rounded(sz);
+            }
+            out.push(base);
+        }
+    }
+    out
+}
+
+pub fn parse_hf_whisper_tree(json: &str) -> Vec<CatalogManifestEntry> {
+    let Ok(items) = serde_json::from_str::<Vec<serde_json::Value>>(json) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let find_file = |fname: &str| -> Option<u64> {
+        items
+            .iter()
+            .find(|x| x.get("path").and_then(|p| p.as_str()) == Some(fname))
+            .map(|x| x.get("size").and_then(|s| s.as_u64()).unwrap_or(0))
+    };
+
+    if let Some(sz) = find_file("ggml-large-v3-q5_0.bin") {
+        if let Some(mut base) = embedded_catalog_entries()
+            .into_iter()
+            .find(|e| e.id == "whisper-large-v3-q8")
+        {
+            base.primary_url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-q5_0.bin".into();
+            if sz > 0 {
+                base.expected_size_bytes = Some(sz);
+                base.download_size_mb = mb_rounded(sz);
+            }
+            out.push(base);
+        }
+    }
+
+    if let Some(sz) = find_file("ggml-large-v3-turbo-q5_0.bin") {
+        let mb = mb_rounded(sz).max(547);
+        out.push(CatalogManifestEntry {
+            id: "whisper-large-v3-turbo-q5".into(),
+            category: ModelCategory::Stt,
+            display_name: "Whisper Large-v3-Turbo (Q5_0・省メモリ軽量版)".into(),
+            runtime: "whisper.cpp (Vulkan GPU / CPU)".into(),
+            version_tag: "v3-turbo-q5_0".into(),
+            primary_url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin".into(),
+            mirror_urls: vec!["https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin".into()],
+            local_rel_path: "ggml-large-v3-turbo-q5_0.bin".into(),
+            local_match: vec!["ggml-large-v3-turbo-q5_0.bin".into()],
+            archive_type: ArchiveType::RawFile,
+            expected_size_bytes: Some(sz).filter(|&s| s > 0),
+            sha256: None,
+            min_vram_gb: 1.5,
+            download_size_mb: mb,
+            scores: ModelScores { accuracy: 4, noise_resilience: 4, speed: 5, lightness: 5 },
+            bundled_default: false,
+            benefits: vec![
+                format!("自動探索で取得した Q5_0 軽量版（約{} MB・同梱Q8よりVRAM約300MB節約）", mb),
+                "Large-v3-Turbo 同等の超高速レスポンスのまま VRAM 4GB 未満GPUでも余裕で動作".into(),
+                "CUDA不要で AMD / NVIDIA / Intel の Vulkan GPU と CPU 両対応".into(),
+            ],
+            best_for: "VRAM 少なめ環境・重量級ゲームと同時起動したい日常会話".into(),
+            caution: "標準同梱 Q8_0 に比べ量子化ビット数が下がるため難語精度はわずかに控えめです".into(),
+            recommended_preset: ModelAutoPreset {
+                backend: BackendPreference::VulkanWithCpuFallback,
+                language: Some("ja".into()),
+                beam_size: Some(3),
+                temperature_fallback: Some(true),
+                no_speech_thold: Some(0.6),
+                conversation_preset: Some("normal".into()),
+                recommended_vad_padding_ms: Some((200, 300)),
+                ..Default::default()
+            },
+        });
+    }
+
+    if let Some(sz) = find_file("ggml-medium-q5_0.bin") {
+        let mb = mb_rounded(sz).max(514);
+        out.push(CatalogManifestEntry {
+            id: "whisper-medium-q5".into(),
+            category: ModelCategory::Stt,
+            display_name: "Whisper Medium (Q5_0・省VRAM・ノートPC向け)".into(),
+            runtime: "whisper.cpp (Vulkan GPU / CPU)".into(),
+            version_tag: "medium-q5_0".into(),
+            primary_url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium-q5_0.bin".into(),
+            mirror_urls: vec!["https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-medium-q5_0.bin".into()],
+            local_rel_path: "ggml-medium-q5_0.bin".into(),
+            local_match: vec!["ggml-medium-q5_0.bin".into()],
+            archive_type: ArchiveType::RawFile,
+            expected_size_bytes: Some(sz).filter(|&s| s > 0),
+            sha256: None,
+            min_vram_gb: 1.5,
+            download_size_mb: mb,
+            scores: ModelScores { accuracy: 4, noise_resilience: 3, speed: 5, lightness: 5 },
+            bundled_default: false,
+            benefits: vec![
+                format!("自動探索で取得した省メモリモデル（約{} MB・iGPU/CPU両対応）", mb),
+                "Large 系が重いノートPCや省電力環境でも安定した遅延で日本語文字起こし".into(),
+                "ダウンロード完了後は省リソース推奨プリセットへ自動切替可能".into(),
+            ],
+            best_for: "ノートPC・iGPU環境・VRAM 2GB以下の軽量運用".into(),
+            caution: "難解な固有名詞・早口の精度は Large-v3 系に一歩譲ります".into(),
+            recommended_preset: ModelAutoPreset {
+                backend: BackendPreference::VulkanWithCpuFallback,
+                language: Some("ja".into()),
+                beam_size: Some(2),
+                temperature_fallback: Some(true),
+                no_speech_thold: Some(0.6),
+                conversation_preset: Some("normal".into()),
+                recommended_vad_padding_ms: Some((200, 300)),
+                ..Default::default()
+            },
+        });
+    }
+
+    if let Some(sz) = find_file("ggml-large-v3.bin") {
+        let mb = mb_rounded(sz).max(2952);
+        out.push(CatalogManifestEntry {
+            id: "whisper-large-v3-fp16".into(),
+            category: ModelCategory::Stt,
+            display_name: "Whisper Large-v3 Full 非量子化 (FP16・極限精度)".into(),
+            runtime: "whisper.cpp (Vulkan GPU / VRAM 8GB+)".into(),
+            version_tag: "v3-fp16".into(),
+            primary_url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin".into(),
+            mirror_urls: vec!["https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin".into()],
+            local_rel_path: "ggml-large-v3.bin".into(),
+            local_match: vec!["ggml-large-v3.bin".into()],
+            archive_type: ArchiveType::RawFile,
+            expected_size_bytes: Some(sz).filter(|&s| s > 0),
+            sha256: None,
+            min_vram_gb: 6.0,
+            download_size_mb: mb,
+            scores: ModelScores { accuracy: 5, noise_resilience: 5, speed: 2, lightness: 1 },
+            bundled_default: false,
+            benefits: vec![
+                format!("自動探索で取得した非量子化 FP16 フル版（約{} MB・量子化劣化ゼロ）", mb),
+                "早口・小声・雑音混在でも Large-v3 本来の表現力を 100% 発揮".into(),
+                "VRAM 8GB 以上の Radeon / GeForce / Arc で beam_size=5 Vulkan 推論に対応".into(),
+            ],
+            best_for: "最高精度追求・VRAM 8GB 以上のデスクトップ環境".into(),
+            caution: "サイズが大きく (約3GB) 推論時間も長めです。迷ったら Q5_0 / Turbo を推奨".into(),
+            recommended_preset: ModelAutoPreset {
+                backend: BackendPreference::VulkanWithCpuFallback,
+                language: Some("ja".into()),
+                beam_size: Some(5),
+                temperature_fallback: Some(true),
+                no_speech_thold: Some(0.6),
+                conversation_preset: Some("normal".into()),
+                recommended_vad_padding_ms: Some((200, 300)),
+                ..Default::default()
+            },
+        });
+    }
+
+    out
+}
+
+pub fn parse_hf_qwen3_llm_tree(
+    repo: &str,
+    id: &str,
+    size_class: &str,
+    json: &str,
+) -> Option<CatalogManifestEntry> {
+    let items: Vec<serde_json::Value> = serde_json::from_str(json).ok()?;
+    let target = items.iter().find(|x| {
+        x.get("path")
+            .and_then(|p| p.as_str())
+            .map(|s| s.ends_with("Q4_K_M.gguf"))
+            .unwrap_or(false)
+    })?;
+    let fname = target.get("path")?.as_str()?.trim().to_string();
+    let sz = target.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+    let mb = mb_rounded(sz);
+    let primary_url = format!("https://huggingface.co/{}/resolve/main/{}", repo, fname);
+    let mirror_url = format!("https://hf-mirror.com/{}/resolve/main/{}", repo, fname);
+
+    let (display_name, min_vram_gb, scores, benefits, best_for, caution) = match size_class {
+        "0.6b" => (
+            "ローカルLLM 超軽量クラス (Qwen3-0.6B Q4_K_M)",
+            1.0,
+            ModelScores { accuracy: 3, noise_resilience: 3, speed: 5, lightness: 5 },
+            vec![
+                format!("自動探索で取得した超軽量クラス（約{} MB・CPU/iGPUでも超高速）", mb.max(378)),
+                "100ms 未満のレスポンスで明らかな助詞ミスや同音誤字を即座に修正".into(),
+                "メモリ消費が非常に小さくノートPCや VRAM 少なめ環境でも常用可能".into(),
+            ],
+            "低スペックPC・遅延を極限まで減らしたい軽量誤字補正".into(),
+            "複雑な文脈推論や大幅な口調変換には 1.7B / 4B クラスが有利です".into(),
+        ),
+        _ => (
+            "ローカルLLM ハイエンドクラス (Qwen3-8B Q4_K_M)",
+            8.0,
+            ModelScores { accuracy: 5, noise_resilience: 5, speed: 3, lightness: 1 },
+            vec![
+                format!("自動探索で取得した高精度8Bモデル（約{} MB・高度な日本語理解）", mb.max(4795)),
+                "2エンジン合議候補の統合・長い文脈・ゲーム専門用語を極めて自然に復元".into(),
+                "タメ口・丁寧語・ゲーム短縮報告などの口調スタイル変換も非常に自然".into(),
+            ],
+            "VRAM 10〜12GB 以上の環境での究極の日本語文脈補正".into(),
+            "ファイルサイズ約4.8GB・VRAM消費が大きいため重量級ゲーム同時起動時は 1.7B/4B 推奨".into(),
+        ),
+    };
+
+    Some(CatalogManifestEntry {
+        id: id.into(),
+        category: ModelCategory::LlmCorrection,
+        display_name: display_name.into(),
+        runtime: "llama-server (Vulkan GPU / CPU)".into(),
+        version_tag: "Q4_K_M-auto".into(),
+        primary_url,
+        mirror_urls: vec![mirror_url],
+        local_rel_path: fname.clone(),
+        local_match: vec![fname.clone(), fname.to_ascii_lowercase()],
+        archive_type: ArchiveType::RawFile,
+        expected_size_bytes: Some(sz).filter(|&s| s > 0),
+        sha256: None,
+        min_vram_gb,
+        download_size_mb: mb,
+        scores,
+        bundled_default: false,
+        benefits,
+        best_for,
+        caution,
+        recommended_preset: ModelAutoPreset {
+            backend: BackendPreference::VulkanWithCpuFallback,
+            ..Default::default()
+        },
+    })
+}
+
+pub fn merge_discovered_entries_into_cache(
+    data_dir: &Path,
+    discovered: Vec<CatalogManifestEntry>,
+    broken_model_id: Option<&str>,
+) -> Result<ModelDiscoveryReport, String> {
+    if discovered.is_empty() {
+        return Err("公開リポジトリからモデル定義を取得できませんでした".into());
+    }
+    let embedded_manifest = parse_and_validate_manifest(include_str!("../../models_catalog.json"))?;
+    let mut base = embedded_manifest.models;
+    if let Ok(raw) = fs::read_to_string(cache_path(data_dir)) {
+        if let Ok(cached) = parse_and_validate_manifest(&raw) {
+            if cached.updated_at.as_str() >= embedded_manifest.updated_at.as_str() {
+                for m in cached.models {
+                    if let Some(slot) = base.iter_mut().find(|e| e.id == m.id) {
+                        *slot = m;
+                    } else {
+                        base.push(m);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut updated_models = Vec::new();
+    let mut added_models = Vec::new();
+    for entry in discovered {
+        if let Some(slot) = base.iter_mut().find(|e| e.id == entry.id) {
+            let changed = slot.primary_url != entry.primary_url
+                || slot.version_tag != entry.version_tag
+                || slot.local_rel_path != entry.local_rel_path
+                || broken_model_id == Some(entry.id.as_str());
+            if changed {
+                *slot = entry.clone();
+                updated_models.push(entry.display_name);
+            }
+        } else {
+            added_models.push(entry.display_name.clone());
+            base.push(entry);
+        }
+    }
+
+    let manifest = CatalogManifest {
+        schema_version: CATALOG_SCHEMA_VERSION,
+        updated_at: embedded_manifest.updated_at,
+        models: base,
+    };
+    let raw_out = serde_json::to_string_pretty(&manifest)
+        .map_err(|e| format!("カタログJSONシリアライズ失敗: {}", e))?;
+    parse_and_validate_manifest(&raw_out)?;
+    fs::create_dir_all(data_dir).map_err(|e| format!("フォルダ作成失敗: {}", e))?;
+    atomic_write(&cache_path(data_dir), raw_out.as_bytes())?;
+
+    let summary = if added_models.is_empty() && updated_models.is_empty() {
+        "自動探索完了: 登録済みの全モデルURL・概要は最新状態です".into()
+    } else {
+        format!(
+            "自動探索完了: 新規モデル {}件追加・既存 {}件更新（概要・推奨プリセットを自動追記済み）",
+            added_models.len(),
+            updated_models.len()
+        )
+    };
+    Ok(ModelDiscoveryReport {
+        updated_models,
+        added_models,
+        summary,
+    })
+}
+
+/// Automatically queries official GitHub Releases and HuggingFace trees over HTTPS WinHTTP
+/// to repair broken URLs and discover latest/alternative models with auto-generated Japanese overviews.
+pub fn discover_latest_and_alternative_models_winhttp(
+    data_dir: &Path,
+    broken_model_id: Option<&str>,
+) -> Result<ModelDiscoveryReport, String> {
+    let mut discovered: Vec<CatalogManifestEntry> = Vec::new();
+    let mut any_ok = false;
+
+    if let Ok(json) = crate::stt::downloader::fetch_https_text_winhttp(
+        "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=3",
+        true,
+    ) {
+        any_ok = true;
+        if let Some((tag, url, sz)) = parse_llama_cpp_latest_vulkan(&json) {
+            if let Some(mut base) = embedded_catalog_entries()
+                .into_iter()
+                .find(|e| e.id == "llama-server-vulkan")
+            {
+                base.primary_url = url;
+                base.version_tag = format!("{}-vulkan", tag);
+                base.runtime = format!("llama.cpp {} (Vulkan / CPU)", tag);
+                if sz > 0 {
+                    base.expected_size_bytes = Some(sz);
+                    base.download_size_mb = mb_rounded(sz);
+                }
+                discovered.push(base);
+            }
+        }
+    }
+
+    if let Ok(json) = crate::stt::downloader::fetch_https_text_winhttp(
+        "https://api.github.com/repos/k2-fsa/sherpa-onnx/releases/tags/speech-enhancement-models",
+        true,
+    ) {
+        any_ok = true;
+        discovered.extend(parse_sherpa_enhancement_assets(&json));
+    }
+
+    if let Ok(json) = crate::stt::downloader::fetch_https_text_winhttp(
+        "https://api.github.com/repos/k2-fsa/sherpa-onnx/releases/tags/asr-models",
+        true,
+    ) {
+        any_ok = true;
+        discovered.extend(parse_sherpa_asr_assets(&json));
+    }
+
+    if let Ok(json) = crate::stt::downloader::fetch_https_text_winhttp(
+        "https://huggingface.co/api/models/ggerganov/whisper.cpp/tree/main",
+        true,
+    ) {
+        any_ok = true;
+        discovered.extend(parse_hf_whisper_tree(&json));
+    }
+
+    if let Ok(json) = crate::stt::downloader::fetch_https_text_winhttp(
+        "https://huggingface.co/api/models/unsloth/Qwen3-0.6B-GGUF/tree/main",
+        true,
+    ) {
+        any_ok = true;
+        if let Some(m) =
+            parse_hf_qwen3_llm_tree("unsloth/Qwen3-0.6B-GGUF", "qwen3-0.6b-llm", "0.6b", &json)
+        {
+            discovered.push(m);
+        }
+    }
+
+    if let Ok(json) = crate::stt::downloader::fetch_https_text_winhttp(
+        "https://huggingface.co/api/models/unsloth/Qwen3-8B-GGUF/tree/main",
+        true,
+    ) {
+        any_ok = true;
+        if let Some(m) =
+            parse_hf_qwen3_llm_tree("unsloth/Qwen3-8B-GGUF", "qwen3-8b-llm", "8b", &json)
+        {
+            discovered.push(m);
+        }
+    }
+
+    if !any_ok {
+        return Err("GitHub / HuggingFace API への接続に失敗しました（ネットワーク状態を確認してください）".into());
+    }
+    merge_discovered_entries_into_cache(data_dir, discovered, broken_model_id)
 }
 
 pub fn build_recommended_bundles(
@@ -758,7 +1212,7 @@ pub fn apply_preset_with_snapshot(
         ModelCategory::NoiseSuppression => {
             cfg.noise_cancel.enabled = true;
             cfg.noise_cancel.stt_engine = match e.id.as_str() {
-                "dpdfnet-16k" => NoiseEngineKind::DpdfNet16k,
+                "dpdfnet-16k" | "dpdfnet4-16k" | "dpdfnet8-16k" => NoiseEngineKind::DpdfNet16k,
                 "dpdfnet-48k" => NoiseEngineKind::DpdfNet48k,
                 "gtcrn-16k" => NoiseEngineKind::Gtcrn16k,
                 "deepfilternet3" => NoiseEngineKind::DeepFilterNet3,
@@ -987,8 +1441,11 @@ pub fn is_entry_in_use(entry: &CatalogManifestEntry, cfg: &AppConfig) -> bool {
                 && (mf.is_empty() || mf.contains("large-v3-turbo"))
         }
         "whisper-large-v3-q8" => {
-            mf.contains("large-v3-q5") || mf.contains("large-v3-q8") || mf == "ggml-large-v3.bin"
+            mf.contains("large-v3-q5") || mf.contains("large-v3-q8")
         }
+        "whisper-large-v3-turbo-q5" => mf.contains("turbo-q5"),
+        "whisper-medium-q5" => mf.contains("medium-q5"),
+        "whisper-large-v3-fp16" => mf == "ggml-large-v3.bin",
         "whisper-large-v3-turbo-ja-sft" => {
             mf.contains("kotoba") || mf.contains("sft") || mf.contains("model-q8")
         }
@@ -1000,9 +1457,11 @@ pub fn is_entry_in_use(entry: &CatalogManifestEntry, cfg: &AppConfig) -> bool {
         "qwen3-asr-1.7b-gguf" => eng == "local-http",
         "parakeet-ja-int8" => eng == "sherpa-onnx" || mf.contains("parakeet"),
         "llama-server-vulkan" => cfg.stt.accuracy.llm.enabled,
+        "qwen3-0.6b-llm" => cfg.stt.accuracy.llm.enabled && llm_mf.contains("0.6b"),
         "qwen3-1.7b-llm" => cfg.stt.accuracy.llm.enabled && llm_mf.contains("1.7b"),
         "qwen3-4b-llm" => cfg.stt.accuracy.llm.enabled && llm_mf.contains("4b"),
-        "dpdfnet-16k" => {
+        "qwen3-8b-llm" => cfg.stt.accuracy.llm.enabled && llm_mf.contains("8b"),
+        "dpdfnet-16k" | "dpdfnet4-16k" | "dpdfnet8-16k" => {
             cfg.noise_cancel.vad_engine_name() == "dpdfnet-16k"
                 || cfg.noise_cancel.stt_engine_name() == "dpdfnet-16k"
         }
@@ -1582,6 +2041,50 @@ mod tests {
         let qfreed = delete_model_from_disk(&dir, "qwen3-asr-0.6b-int8").expect("delete dir");
         assert_eq!(qfreed, 2048);
         assert!(!qdir.exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auto_discovery_parsers_and_cache_merge_generate_non_empty_overviews() {
+        let dir = std::env::temp_dir().join(format!("voxdrop_disc_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let llama_json = r#"[{"tag_name":"b12814","assets":[{"name":"llama-b12814-bin-win-vulkan-x64.zip","size":39329266,"browser_download_url":"https://github.com/ggml-org/llama.cpp/releases/download/b12814/llama-b12814-bin-win-vulkan-x64.zip"}]}]"#;
+        let (tag, lurl, lsz) = parse_llama_cpp_latest_vulkan(llama_json).unwrap();
+        assert_eq!(tag, "b12814");
+        assert!(lurl.contains("b12814"));
+        assert_eq!(lsz, 39329266);
+
+        let enh_json = r#"{"assets":[{"name":"dpdfnet4.onnx","size":11707436,"browser_download_url":"https://github.com/k2-fsa/sherpa-onnx/releases/download/speech-enhancement-models/dpdfnet4.onnx"},{"name":"dpdfnet8.onnx","size":14623619,"browser_download_url":"https://github.com/k2-fsa/sherpa-onnx/releases/download/speech-enhancement-models/dpdfnet8.onnx"}]}"#;
+        let enh = parse_sherpa_enhancement_assets(enh_json);
+        assert_eq!(enh.len(), 2);
+
+        let whisper_tree = r#"[{"path":"ggml-large-v3-turbo-q5_0.bin","size":574041195},{"path":"ggml-medium-q5_0.bin","size":539212467},{"path":"ggml-large-v3.bin","size":3095033483}]"#;
+        let wf = parse_hf_whisper_tree(whisper_tree);
+        assert_eq!(wf.len(), 3);
+
+        let llm_tree = r#"[{"path":"Qwen3-0.6B-Q4_K_M.gguf","size":396705472}]"#;
+        let llm = parse_hf_qwen3_llm_tree("unsloth/Qwen3-0.6B-GGUF", "qwen3-0.6b-llm", "0.6b", llm_tree).unwrap();
+        assert_eq!(llm.id, "qwen3-0.6b-llm");
+
+        let mut all_disc = Vec::new();
+        all_disc.extend(enh);
+        all_disc.extend(wf);
+        all_disc.push(llm);
+        let report = merge_discovered_entries_into_cache(&dir, all_disc, None).unwrap();
+        assert_eq!(report.added_models.len(), 6);
+
+        let merged = load_merged_catalog(&dir);
+        assert!(merged.iter().any(|m| m.entry.id == "dpdfnet4-16k"));
+        assert!(merged.iter().any(|m| m.entry.id == "whisper-large-v3-turbo-q5"));
+        assert!(merged.iter().any(|m| m.entry.id == "qwen3-0.6b-llm"));
+        for m in &merged {
+            assert!(!m.entry.benefits.is_empty(), "empty benefits for {}", m.entry.id);
+            assert!(!m.entry.best_for.trim().is_empty());
+            assert!(!m.entry.caution.trim().is_empty());
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }

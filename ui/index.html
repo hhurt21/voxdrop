@@ -651,6 +651,7 @@
               <button type="button" class="btn-primary btn-sm" id="btnDownloadLlamaServer">llama-server (Vulkan/CPU) を自動導入 (~38MB)</button>
               <button type="button" class="btn-secondary btn-sm" id="btnDownloadLlm17b">Qwen3-1.7B 軽量版を取得 (~1.1GB)</button>
               <button type="button" class="btn-secondary btn-sm" id="btnDownloadLlm4b">Qwen3-4B 高精度版を取得 (~2.4GB)</button>
+              <button type="button" class="btn-secondary btn-sm" id="btnDiscoverLlmModels">最新LLM・llama-serverを自動探索</button>
             </div>
             <div id="llmSetupProgressWrap" style="display: none; margin-top: 10px">
               <div class="small-label" id="llmSetupProgressText">準備中...</div>
@@ -1286,6 +1287,7 @@
                 <div class="row gap-sm" style="flex-wrap: wrap">
                   <button type="button" class="btn-secondary btn-sm" id="btnCheckAllUrls">全モデルURL疎通診断</button>
                   <button type="button" class="btn-secondary btn-sm" id="btnSyncCatalog">カタログを最新に更新</button>
+                  <button type="button" class="btn-primary btn-sm" id="btnDiscoverLatestModels">最新・代替モデルを自動探索して追加</button>
                   <button type="button" class="btn-danger btn-sm" id="btnCleanupModels">未使用モデルを整理</button>
                   <button type="button" class="btn-secondary btn-sm" id="btnUndoAutoPresetToolbar" style="display: none">元の設定に戻す</button>
                 </div>
@@ -1303,6 +1305,8 @@
                 </label>
               </div>
             </div>
+
+            <div id="discoveryResultBanner" class="ab-result" style="display: none; margin-bottom: 10px"></div>
 
             <div id="modelCatalogContainer"></div>
 

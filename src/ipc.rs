@@ -78,6 +78,10 @@ pub enum ClientCommand {
     },
     ResetModelUrlOverride { model_id: String },
     SyncOnlineCatalog,
+    DiscoverLatestModels {
+        #[serde(default)]
+        broken_model_id: Option<String>,
+    },
     DownloadBundle { bundle_id: String },
     ApplyModelAutoPreset { model_id: String },
     UndoAutoPreset,
@@ -237,6 +241,12 @@ pub enum BackendEvent {
     OnlineCatalogSynced {
         updated_urls: usize,
         added_models: usize,
+        summary: String,
+    },
+    ModelsDiscovered {
+        ok: bool,
+        added: Vec<String>,
+        updated: Vec<String>,
         summary: String,
     },
     PresetAutoApplied {
