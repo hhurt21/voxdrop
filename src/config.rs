@@ -1030,6 +1030,15 @@ pub struct AppConfig {
     pub night_mode: NightModeConfig,
     pub power_eco: PowerEcoConfig,
     pub wizard_completed: bool,
+    /// モデルダウンロード完了時に推奨プリセットを自動適用して切り替える（デフォルト: true）
+    #[serde(default = "default_true_flag")]
+    pub auto_apply_preset_on_download: bool,
+    /// 公式モデルカタログのオンライン同期 URL（https:// のみ許可）
+    pub catalog_manifest_url: String,
+}
+
+fn default_true_flag() -> bool {
+    true
 }
 
 impl Default for AppConfig {
@@ -1062,6 +1071,8 @@ impl Default for AppConfig {
             night_mode: NightModeConfig::default(),
             power_eco: PowerEcoConfig::default(),
             wizard_completed: false,
+            auto_apply_preset_on_download: true,
+            catalog_manifest_url: "https://raw.githubusercontent.com/hhurt21/voxdrop/main/models_catalog.json".into(),
         }
     }
 }

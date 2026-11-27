@@ -127,6 +127,8 @@ enum UserEvent {
         done: bool,
         ok: bool,
     },
+    UrlHealthCheckDone(Vec<stt::catalog::ModelUrlHealthDto>),
+    OnlineCatalogSyncDone(Result<(usize, usize, String), String>),
     HttpAsrHealthDone(Result<String, String>),
     LlmHealthDone(Result<String, String>),
     PhaseUpdate(String),
@@ -497,6 +499,8 @@ struct AppState {
     stats_path: PathBuf,
     bench_cases: Vec<stats::BenchmarkCase>,
     win_poll_ticks: u32,
+    model_health_map: std::collections::BTreeMap<String, stt::catalog::ModelUrlHealthDto>,
+    last_preset_snapshot: Option<stt::catalog::PresetRollbackSnapshot>,
 }
 
 impl AppState {
@@ -555,7 +559,17 @@ impl AppState {
             stats_path,
             bench_cases,
             win_poll_ticks: 0,
+            model_health_map: std::collections::BTreeMap::new(),
+            last_preset_snapshot: None,
         }
+    }
+
+    fn data_dir(&self) -> PathBuf {
+        self.config_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(AppConfig::app_data_dir)
     }
 
     fn recent_sent_strings(&self) -> Vec<String> {
@@ -1431,6 +1445,92 @@ fn toggle_panic_safe_mode(
             .into(),
         },
     );
+}
+
+fn emit_catalog_inventory(state: &AppState, webview: &WebView) {
+    let m_dir = stt::local::resolve_download_model_dir(
+        &state.config.stt.model_dir,
+        state.runtime_dir.as_deref(),
+    );
+    let data_dir = state.data_dir();
+    let hw = gpu_diag::detect_hardware_profile(state.runtime_dir.as_deref());
+    let merged = stt::catalog::load_merged_catalog(&data_dir);
+    let bundles = stt::catalog::build_recommended_bundles(&hw, &m_dir, &merged);
+    let items = stt::catalog::build_catalog_inventory_ex(
+        &m_dir,
+        &data_dir,
+        &state.config,
+        &hw,
+        &state.model_health_map,
+    );
+    emit(
+        webview,
+        &BackendEvent::CatalogInventory {
+            hardware: hw,
+            items,
+            bundles,
+            auto_apply_preset_on_download: state.config.auto_apply_preset_on_download,
+            can_undo_preset: state.last_preset_snapshot.is_some(),
+            manifest_url: state.config.catalog_manifest_url.clone(),
+        },
+    );
+}
+
+fn apply_model_auto_preset_for_state(
+    state: &mut AppState,
+    model_id: &str,
+    audio_ctrl: &AudioController,
+    webview: &WebView,
+    overlay_webview: &WebView,
+    proxy: &EventLoopProxy<UserEvent>,
+) -> bool {
+    let data_dir = state.data_dir();
+    let m_dir = stt::local::resolve_download_model_dir(
+        &state.config.stt.model_dir,
+        state.runtime_dir.as_deref(),
+    );
+    let merged = stt::catalog::load_merged_catalog(&data_dir);
+    let Some(resolved) = merged.iter().find(|r| r.entry.id == model_id) else {
+        return false;
+    };
+    let (snap, summary) =
+        stt::catalog::apply_preset_with_snapshot(&mut state.config, resolved, &m_dir);
+    state.last_preset_snapshot = Some(snap);
+    let _ = state.config.save_to(&state.config_path);
+
+    audio_ctrl.update_vad(state.config.vad.clone());
+    audio_ctrl.update_noise_cancel(state.config.noise_cancel.clone());
+    spawn_stt_loader(
+        state.config.stt.clone(),
+        state.runtime_dir.clone(),
+        proxy.clone(),
+    );
+
+    emit(
+        webview,
+        &BackendEvent::PresetAutoApplied {
+            model_id: model_id.to_string(),
+            summary: summary.clone(),
+            can_undo: true,
+        },
+    );
+    emit(
+        webview,
+        &BackendEvent::ConfigLoaded {
+            config: state.config.clone(),
+            config_path: state.config_path.display().to_string(),
+        },
+    );
+    emit_all(webview, overlay_webview, &state.status_event());
+    emit_catalog_inventory(state, webview);
+    emit(
+        webview,
+        &BackendEvent::Toast {
+            level: "ok".into(),
+            message: summary,
+        },
+    );
+    true
 }
 
 fn reload_stt_for_power_or_vram(
@@ -3391,7 +3491,7 @@ fn main() -> wry::Result<()> {
                 emit(
                     &webview,
                     &BackendEvent::ModelDownloadProgress {
-                        model_id,
+                        model_id: model_id.clone(),
                         progress,
                         message: message.clone(),
                         done,
@@ -3422,8 +3522,78 @@ fn main() -> wry::Result<()> {
                             message,
                         },
                     );
+                    if ok && state.config.auto_apply_preset_on_download {
+                        let applied = apply_model_auto_preset_for_state(
+                            &mut state,
+                            &model_id,
+                            &audio_ctrl,
+                            &webview,
+                            &overlay_webview,
+                            &proxy,
+                        );
+                        if !applied {
+                            emit_catalog_inventory(&state, &webview);
+                        }
+                    } else {
+                        emit_catalog_inventory(&state, &webview);
+                    }
                 }
             }
+            Event::UserEvent(UserEvent::UrlHealthCheckDone(results)) => {
+                let mut ok_cnt = 0usize;
+                let mut mir_cnt = 0usize;
+                let mut ng_cnt = 0usize;
+                for r in &results {
+                    match r.status.as_str() {
+                        "reachable" => ok_cnt += 1,
+                        "mirror_reachable" => mir_cnt += 1,
+                        "unreachable" => ng_cnt += 1,
+                        _ => {}
+                    }
+                    state.model_health_map.insert(r.model_id.clone(), r.clone());
+                }
+                emit(&webview, &BackendEvent::ModelUrlHealthUpdated { results });
+                emit_catalog_inventory(&state, &webview);
+                emit(
+                    &webview,
+                    &BackendEvent::Toast {
+                        level: if ng_cnt > 0 { "warn" } else { "ok" }.into(),
+                        message: format!(
+                            "URL疎通診断完了: 取得可 {}件 / ミラー {}件 / 不可 {}件",
+                            ok_cnt, mir_cnt, ng_cnt
+                        ),
+                    },
+                );
+            }
+            Event::UserEvent(UserEvent::OnlineCatalogSyncDone(res)) => match res {
+                Ok((updated_urls, added_models, summary)) => {
+                    emit(
+                        &webview,
+                        &BackendEvent::OnlineCatalogSynced {
+                            updated_urls,
+                            added_models,
+                            summary: summary.clone(),
+                        },
+                    );
+                    emit_catalog_inventory(&state, &webview);
+                    emit(
+                        &webview,
+                        &BackendEvent::Toast {
+                            level: "ok".into(),
+                            message: summary,
+                        },
+                    );
+                }
+                Err(err) => {
+                    emit(
+                        &webview,
+                        &BackendEvent::Toast {
+                            level: "error".into(),
+                            message: err,
+                        },
+                    );
+                }
+            },
             Event::UserEvent(UserEvent::HttpAsrHealthDone(res)) => match res {
                 Ok(msg) => {
                     emit(
@@ -4057,20 +4227,7 @@ fn main() -> wry::Result<()> {
                                 cases: state.bench_cases.clone(),
                             },
                         );
-                        let m_dir = stt::local::resolve_download_model_dir(
-                            &state.config.stt.model_dir,
-                            state.runtime_dir.as_deref(),
-                        );
-                        let hw = gpu_diag::detect_hardware_profile(state.runtime_dir.as_deref());
-                        let cat_items =
-                            stt::catalog::build_catalog_inventory(&m_dir, &state.config, &hw);
-                        emit(
-                            &webview,
-                            &BackendEvent::CatalogInventory {
-                                hardware: hw,
-                                items: cat_items,
-                            },
-                        );
+                        emit_catalog_inventory(&state, &webview);
                         emit(
                             &overlay_webview,
                             &BackendEvent::OverlayStyle {
@@ -4829,13 +4986,15 @@ fn main() -> wry::Result<()> {
                             &state.config.stt.model_dir,
                             state.runtime_dir.as_deref(),
                         );
+                        let data_dir = state.data_dir();
                         let p = proxy.clone();
                         thread::spawn(move || {
-                            let res = stt::downloader::download_model_into(
+                            let res = stt::downloader::download_model_into_with_data(
                                 &model_id,
                                 custom_url.as_deref(),
                                 custom_filename.as_deref(),
                                 &target_dir,
+                                &data_dir,
                                 |mid, pct, msg| {
                                     let _ = p.send_event(UserEvent::ModelDownloadProgress {
                                         model_id: mid.to_string(),
@@ -4914,18 +5073,280 @@ fn main() -> wry::Result<()> {
                         });
                     }
                     ClientCommand::GetCatalogInventory => {
+                        emit_catalog_inventory(&state, &webview);
+                    }
+                    ClientCommand::CheckModelUrl { model_id, test_url } => {
+                        let data_dir = state.data_dir();
+                        let p = proxy.clone();
+                        thread::spawn(move || {
+                            let merged = stt::catalog::load_merged_catalog(&data_dir);
+                            let res = if let Some(u) = test_url.filter(|s| !s.trim().is_empty()) {
+                                let probe = stt::downloader::probe_url_health_winhttp(&u);
+                                vec![stt::catalog::ModelUrlHealthDto {
+                                    model_id,
+                                    status: if probe.ok { "reachable" } else { "unreachable" }.into(),
+                                    http_code: probe.status_code,
+                                    content_length: probe.content_length,
+                                    active_url: u,
+                                    message: probe.message,
+                                }]
+                            } else if let Some(resolved) = merged.iter().find(|r| r.entry.id == model_id) {
+                                vec![stt::downloader::check_model_url_health(resolved)]
+                            } else {
+                                Vec::new()
+                            };
+                            let _ = p.send_event(UserEvent::UrlHealthCheckDone(res));
+                        });
+                    }
+                    ClientCommand::CheckAllModelUrls => {
+                        let data_dir = state.data_dir();
+                        let p = proxy.clone();
+                        thread::spawn(move || {
+                            let merged = stt::catalog::load_merged_catalog(&data_dir);
+                            let mut results = Vec::new();
+                            for item in merged {
+                                if !item.entry.primary_url.trim().is_empty() {
+                                    results.push(stt::downloader::check_model_url_health(&item));
+                                }
+                            }
+                            let _ = p.send_event(UserEvent::UrlHealthCheckDone(results));
+                        });
+                    }
+                    ClientCommand::SaveModelUrlOverride {
+                        model_id,
+                        primary_url,
+                        skip_sha256,
+                    } => {
+                        let data_dir = state.data_dir();
+                        match stt::catalog::save_catalog_override(
+                            &data_dir,
+                            &model_id,
+                            &primary_url,
+                            skip_sha256,
+                        ) {
+                            Ok(()) => {
+                                state.model_health_map.remove(&model_id);
+                                emit_catalog_inventory(&state, &webview);
+                                emit(
+                                    &webview,
+                                    &BackendEvent::Toast {
+                                        level: "ok".into(),
+                                        message: format!("{} のURL修正を保存しました", model_id),
+                                    },
+                                );
+                            }
+                            Err(err) => {
+                                emit(
+                                    &webview,
+                                    &BackendEvent::Toast {
+                                        level: "error".into(),
+                                        message: err,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    ClientCommand::ResetModelUrlOverride { model_id } => {
+                        let data_dir = state.data_dir();
+                        let _ = stt::catalog::reset_catalog_override(&data_dir, &model_id);
+                        state.model_health_map.remove(&model_id);
+                        emit_catalog_inventory(&state, &webview);
+                        emit(
+                            &webview,
+                            &BackendEvent::Toast {
+                                level: "ok".into(),
+                                message: format!("{} のURLをデフォルトへ戻しました", model_id),
+                            },
+                        );
+                    }
+                    ClientCommand::SyncOnlineCatalog => {
+                        let data_dir = state.data_dir();
+                        let url = state.config.catalog_manifest_url.clone();
+                        let p = proxy.clone();
+                        thread::spawn(move || {
+                            let res = stt::catalog::sync_online_catalog_winhttp(&url, &data_dir);
+                            let _ = p.send_event(UserEvent::OnlineCatalogSyncDone(res));
+                        });
+                    }
+                    ClientCommand::DownloadBundle { bundle_id } => {
                         let m_dir = stt::local::resolve_download_model_dir(
                             &state.config.stt.model_dir,
                             state.runtime_dir.as_deref(),
                         );
+                        let data_dir = state.data_dir();
                         let hw = gpu_diag::detect_hardware_profile(state.runtime_dir.as_deref());
-                        let items =
-                            stt::catalog::build_catalog_inventory(&m_dir, &state.config, &hw);
+                        let merged = stt::catalog::load_merged_catalog(&data_dir);
+                        let bundles = stt::catalog::build_recommended_bundles(&hw, &m_dir, &merged);
+                        if let Some(bundle) = bundles.into_iter().find(|b| b.id == bundle_id) {
+                            let p = proxy.clone();
+                            let to_download: Vec<String> = bundle
+                                .model_ids
+                                .into_iter()
+                                .filter(|mid| {
+                                    merged
+                                        .iter()
+                                        .find(|r| &r.entry.id == mid)
+                                        .map(|r| {
+                                            !r.entry.bundled_default
+                                                && stt::catalog::find_matched_path(&m_dir, &r.entry)
+                                                    .is_none()
+                                        })
+                                        .unwrap_or(false)
+                                })
+                                .collect();
+                            if to_download.is_empty() {
+                                for mid in ["dpdfnet-16k", "gtcrn-16k", "whisper-large-v3-q8", "qwen3-asr-0.6b-int8", "parakeet-ja-int8"] {
+                                    if bundle_id == "best_accuracy" && (mid == "whisper-large-v3-q8" || mid == "dpdfnet-16k") {
+                                        let _ = apply_model_auto_preset_for_state(&mut state, mid, &audio_ctrl, &webview, &overlay_webview, &proxy);
+                                    } else if bundle_id == "balanced_standard" && (mid == "qwen3-asr-0.6b-int8" || mid == "dpdfnet-16k") {
+                                        let _ = apply_model_auto_preset_for_state(&mut state, mid, &audio_ctrl, &webview, &overlay_webview, &proxy);
+                                    } else if bundle_id == "lightweight_game" && (mid == "parakeet-ja-int8" || mid == "gtcrn-16k") {
+                                        let _ = apply_model_auto_preset_for_state(&mut state, mid, &audio_ctrl, &webview, &overlay_webview, &proxy);
+                                    } else if bundle_id == "cpu_laptop" && (mid == "qwen3-asr-0.6b-int8" || mid == "gtcrn-16k") {
+                                        let _ = apply_model_auto_preset_for_state(&mut state, mid, &audio_ctrl, &webview, &overlay_webview, &proxy);
+                                    }
+                                }
+                            } else {
+                                emit(
+                                    &webview,
+                                    &BackendEvent::Toast {
+                                        level: "info".into(),
+                                        message: format!(
+                                            "「{}」のモデル {}件を順次ダウンロード開始します...",
+                                            bundle.title,
+                                            to_download.len()
+                                        ),
+                                    },
+                                );
+                                thread::spawn(move || {
+                                    for mid in to_download {
+                                        let res = stt::downloader::download_model_into_with_data(
+                                            &mid,
+                                            None,
+                                            None,
+                                            &m_dir,
+                                            &data_dir,
+                                            |id, pct, msg| {
+                                                let _ = p.send_event(UserEvent::ModelDownloadProgress {
+                                                    model_id: id.to_string(),
+                                                    progress: pct,
+                                                    message: msg.to_string(),
+                                                    done: false,
+                                                    ok: true,
+                                                });
+                                            },
+                                        );
+                                        match res {
+                                            Ok(path) => {
+                                                let _ = p.send_event(UserEvent::ModelDownloadProgress {
+                                                    model_id: mid,
+                                                    progress: 100,
+                                                    message: format!("セット構成モデル完了: {}", path.display()),
+                                                    done: true,
+                                                    ok: true,
+                                                });
+                                            }
+                                            Err(err) => {
+                                                let _ = p.send_event(UserEvent::ModelDownloadProgress {
+                                                    model_id: mid,
+                                                    progress: 0,
+                                                    message: err,
+                                                    done: true,
+                                                    ok: false,
+                                                });
+                                                break;
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    }
+                    ClientCommand::ApplyModelAutoPreset { model_id } => {
+                        if !apply_model_auto_preset_for_state(
+                            &mut state,
+                            &model_id,
+                            &audio_ctrl,
+                            &webview,
+                            &overlay_webview,
+                            &proxy,
+                        ) {
+                            emit(
+                                &webview,
+                                &BackendEvent::Toast {
+                                    level: "error".into(),
+                                    message: format!("推奨プリセットが見つかりません: {}", model_id),
+                                },
+                            );
+                        }
+                    }
+                    ClientCommand::UndoAutoPreset => {
+                        if let Some(snap) = state.last_preset_snapshot.take() {
+                            stt::catalog::restore_preset_snapshot(&mut state.config, snap);
+                            let _ = state.config.save_to(&state.config_path);
+                            audio_ctrl.update_vad(state.config.vad.clone());
+                            audio_ctrl.update_noise_cancel(state.config.noise_cancel.clone());
+                            spawn_stt_loader(
+                                state.config.stt.clone(),
+                                state.runtime_dir.clone(),
+                                proxy.clone(),
+                            );
+                            emit(
+                                &webview,
+                                &BackendEvent::ConfigLoaded {
+                                    config: state.config.clone(),
+                                    config_path: state.config_path.display().to_string(),
+                                },
+                            );
+                            emit_all(&webview, &overlay_webview, &state.status_event());
+                            emit_catalog_inventory(&state, &webview);
+                            emit(
+                                &webview,
+                                &BackendEvent::Toast {
+                                    level: "ok".into(),
+                                    message: "プリセット自動適用前の設定へ戻しました".into(),
+                                },
+                            );
+                        }
+                    }
+                    ClientCommand::CleanupUnusedModels => {
+                        let m_dir = stt::local::resolve_download_model_dir(
+                            &state.config.stt.model_dir,
+                            state.runtime_dir.as_deref(),
+                        );
+                        let data_dir = state.data_dir();
+                        let hw = gpu_diag::detect_hardware_profile(state.runtime_dir.as_deref());
+                        let items = stt::catalog::build_catalog_inventory_ex(
+                            &m_dir,
+                            &data_dir,
+                            &state.config,
+                            &hw,
+                            &state.model_health_map,
+                        );
+                        let mut freed_total = 0u64;
+                        let mut del_count = 0usize;
+                        for item in items {
+                            if item.can_delete && !item.in_use {
+                                if let Ok(f) = stt::catalog::delete_model_from_disk_ex(&m_dir, &data_dir, &item.id) {
+                                    freed_total = freed_total.saturating_add(f);
+                                    del_count += 1;
+                                }
+                            }
+                        }
+                        emit_catalog_inventory(&state, &webview);
                         emit(
                             &webview,
-                            &BackendEvent::CatalogInventory {
-                                hardware: hw,
-                                items,
+                            &BackendEvent::Toast {
+                                level: "ok".into(),
+                                message: if del_count > 0 {
+                                    format!(
+                                        "未使用モデル {}件を削除し、{} を解放しました",
+                                        del_count,
+                                        stt::catalog::format_bytes(freed_total)
+                                    )
+                                } else {
+                                    "削除対象の未使用モデルはありません".into()
+                                },
                             },
                         );
                     }
@@ -4989,7 +5410,8 @@ fn main() -> wry::Result<()> {
                             &state.config.stt.model_dir,
                             state.runtime_dir.as_deref(),
                         );
-                        match stt::catalog::delete_model_from_disk(&m_dir, &model_id) {
+                        let data_dir = state.data_dir();
+                        match stt::catalog::delete_model_from_disk_ex(&m_dir, &data_dir, &model_id) {
                             Ok(freed) => {
                                 let _ = state.config.save_to(&state.config_path);
                                 state.stt_ready = false;
@@ -4999,15 +5421,7 @@ fn main() -> wry::Result<()> {
                                     state.runtime_dir.clone(),
                                     proxy.clone(),
                                 );
-                                let hw = gpu_diag::detect_hardware_profile(state.runtime_dir.as_deref());
-                                let items = stt::catalog::build_catalog_inventory(&m_dir, &state.config, &hw);
-                                emit(
-                                    &webview,
-                                    &BackendEvent::CatalogInventory {
-                                        hardware: hw,
-                                        items,
-                                    },
-                                );
+                                emit_catalog_inventory(&state, &webview);
                                 emit(
                                     &webview,
                                     &BackendEvent::ConfigLoaded {
@@ -5061,12 +5475,7 @@ fn main() -> wry::Result<()> {
                             state.runtime_dir.clone(),
                             proxy.clone(),
                         );
-                        let m_dir = stt::local::resolve_download_model_dir(
-                            &state.config.stt.model_dir,
-                            state.runtime_dir.as_deref(),
-                        );
-                        let items = stt::catalog::build_catalog_inventory(&m_dir, &state.config, &hw);
-                        emit(&webview, &BackendEvent::CatalogInventory { hardware: hw.clone(), items });
+                        emit_catalog_inventory(&state, &webview);
                         emit(
                             &webview,
                             &BackendEvent::ConfigLoaded {

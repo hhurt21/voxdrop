@@ -13,6 +13,8 @@
   let isPanicMode = false;
   let lastCatalogInventory = null;
   let benchmarkCases = [];
+  let activeCatalogCategory = "all";
+  const expandedRepairIds = new Set();
   const phraseEditors = {};
 
   function ensurePhraseEditor(id) {
@@ -838,6 +840,12 @@
     $("hkClear").value = cfg.hotkeys.clear_draft || "";
     $("hkOverlay").value = cfg.hotkeys.toggle_overlay || "";
     $("hkPanicMute").value = cfg.hotkeys.panic_mute || "";
+    if ($("chkAutoApplyPreset")) {
+      $("chkAutoApplyPreset").checked = cfg.auto_apply_preset_on_download !== false;
+    }
+    if ($("catalogManifestUrl")) {
+      $("catalogManifestUrl").value = cfg.catalog_manifest_url || "https://raw.githubusercontent.com/hhurt21/voxdrop/main/models_catalog.json";
+    }
 
     $("chkOverlayEnabled").checked = !!cfg.overlay.enabled;
     $("chkOverlayClickThrough").checked = !!cfg.overlay.click_through;
@@ -1119,6 +1127,8 @@
         toggle_overlay: $("hkOverlay").value.trim(),
         panic_mute: $("hkPanicMute").value.trim(),
       },
+      auto_apply_preset_on_download: $("chkAutoApplyPreset") ? $("chkAutoApplyPreset").checked : true,
+      catalog_manifest_url: ($("catalogManifestUrl") && $("catalogManifestUrl").value.trim()) || "https://raw.githubusercontent.com/hhurt21/voxdrop/main/models_catalog.json",
       overlay: {
         ...currentConfig.overlay,
         enabled: $("chkOverlayEnabled").checked,
@@ -1947,6 +1957,33 @@
   });
 
   $("btnRefreshCatalog").addEventListener("click", () => send({ type: "GetCatalogInventory" }));
+  $("chkAutoApplyPreset").addEventListener("change", saveNow);
+  $("catalogManifestUrl").addEventListener("change", saveNow);
+  $("btnCheckAllUrls").addEventListener("click", () => {
+    showToast("全モデルのURL疎通を順番に診断しています...", "info");
+    send({ type: "CheckAllModelUrls" });
+  });
+  $("btnSyncCatalog").addEventListener("click", () => {
+    saveNow();
+    showToast("公式カタログ (models_catalog.json) を確認中...", "info");
+    send({ type: "SyncOnlineCatalog" });
+  });
+  $("btnCleanupModels").addEventListener("click", () => {
+    if (window.confirm("現在使用していない外部モデルをまとめて削除し、ディスク容量を解放しますか？（同梱標準モデルは保護されます）")) {
+      send({ type: "CleanupUnusedModels" });
+    }
+  });
+  $("btnUndoAutoPresetBanner").addEventListener("click", () => send({ type: "UndoAutoPreset" }));
+  $("btnUndoAutoPresetToolbar").addEventListener("click", () => send({ type: "UndoAutoPreset" }));
+  document.querySelectorAll("#catalogCategoryTabs .cat-tab-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      activeCatalogCategory = btn.dataset.cat || "all";
+      document.querySelectorAll("#catalogCategoryTabs .cat-tab-btn").forEach((b) => {
+        b.classList.toggle("active", b === btn);
+      });
+      if (lastCatalogInventory) renderCatalogInventory(lastCatalogInventory);
+    });
+  });
   $("btnApplyWizard").addEventListener("click", () => send({ type: "ApplyWizardRecommendation" }));
   $("btnStartCalibrationWizard").addEventListener("click", () => {
     const box = $("calibrationResultBox");
@@ -2174,12 +2211,79 @@
     send({ type: "TestKeyAction", action: "undo", delay_ms: delaySec * 1000 });
   });
 
+  function renderRecommendedBundles(bundles) {
+    const grid = $("recommendedBundlesGrid");
+    if (!grid) return;
+    grid.innerHTML = "";
+    (bundles || []).forEach((b) => {
+      const card = document.createElement("div");
+      card.className = "bundle-card" + (b.is_recommended_for_pc ? " recommended" : "");
+
+      const top = document.createElement("div");
+      top.className = "row space-between";
+      const title = document.createElement("strong");
+      title.textContent = b.title;
+      const badge = document.createElement("span");
+      badge.className = "pill " + (b.is_recommended_for_pc ? "ok" : "");
+      badge.textContent = b.pc_badge || "";
+      top.appendChild(title);
+      top.appendChild(badge);
+
+      const sub = document.createElement("div");
+      sub.className = "small-label";
+      sub.textContent = `${b.subtitle} | 構成: ${(b.model_labels || []).join(" + ")}`;
+
+      const ul = document.createElement("ul");
+      ul.className = "model-benefits";
+      (b.benefits || []).forEach((line) => {
+        const li = document.createElement("li");
+        li.textContent = line;
+        ul.appendChild(li);
+      });
+
+      const preset = document.createElement("div");
+      preset.className = "small-label";
+      preset.textContent = `自動設定: ${b.preset_summary || ""}`;
+
+      const act = document.createElement("div");
+      act.className = "row gap-sm";
+      act.style.marginTop = "4px";
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = b.is_recommended_for_pc ? "btn-success btn-sm" : "btn-primary btn-sm";
+      btn.textContent = b.all_installed
+        ? "導入済み・この推奨設定を適用"
+        : `この推奨セットを一括ダウンロード＆自動設定 (~${b.pending_download_mb}MB)`;
+      btn.addEventListener("click", () => send({ type: "DownloadBundle", bundle_id: b.id }));
+      act.appendChild(btn);
+
+      card.appendChild(top);
+      card.appendChild(sub);
+      card.appendChild(ul);
+      card.appendChild(preset);
+      card.appendChild(act);
+      grid.appendChild(card);
+    });
+  }
+
   function renderCatalogInventory(payload) {
     if (!payload) return;
     lastCatalogInventory = payload;
     const hw = payload.hardware || {};
     $("hwGpuName").textContent = `${hw.gpu_name || "CPU"} (${hw.gpu_vendor || "CPU"} | VRAM ${Number(hw.vram_gb || 0).toFixed(1)} GB${hw.vram_usage_pct != null ? " / 使用率 " + hw.vram_usage_pct + "%" : ""} | CPU ${hw.cpu_cores || "-"}コア)`;
     $("hwSummaryNote").textContent = `${hw.summary_note || ""} | 推奨: ${hw.recommended_stt_engine} / ${hw.recommended_stt_model || "標準"} | VAD=${hw.recommended_vad_noise} / STT=${hw.recommended_stt_noise}`;
+
+    if ($("btnUndoAutoPresetToolbar")) {
+      $("btnUndoAutoPresetToolbar").style.display = payload.can_undo_preset ? "inline-block" : "none";
+    }
+    if (!payload.can_undo_preset && $("autoPresetUndoBanner")) {
+      $("autoPresetUndoBanner").style.display = "none";
+    }
+    if ($("chkAutoApplyPreset") && typeof payload.auto_apply_preset_on_download === "boolean") {
+      $("chkAutoApplyPreset").checked = payload.auto_apply_preset_on_download;
+    }
+
+    renderRecommendedBundles(payload.bundles || []);
 
     const container = $("modelCatalogContainer");
     if (!container) return;
@@ -2190,7 +2294,9 @@
       ["llm_correction", "文脈誤字補正 (ローカルLLM)"],
       ["vad", "発話区間検出 (VAD)"],
     ];
-    const items = payload.items || [];
+    const items = (payload.items || []).filter(
+      (m) => activeCatalogCategory === "all" || m.category === activeCatalogCategory
+    );
     categories.forEach(([catKey, catTitle]) => {
       const group = items.filter((m) => m.category === catKey);
       if (!group.length) return;
@@ -2208,7 +2314,7 @@
         const top = document.createElement("div");
         top.className = "row space-between";
         const title = document.createElement("strong");
-        title.textContent = m.display_name || m.id;
+        title.textContent = m.display_name + (m.version_tag ? ` [${m.version_tag}]` : "");
         const badgeWrap = document.createElement("div");
         badgeWrap.className = "model-meta-row";
         if (m.in_use) {
@@ -2216,6 +2322,30 @@
           b.className = "pill ok";
           b.textContent = "使用中";
           badgeWrap.appendChild(b);
+        }
+        if (m.has_override) {
+          const ovb = document.createElement("span");
+          ovb.className = "pill warn";
+          ovb.textContent = "URL修正済";
+          badgeWrap.appendChild(ovb);
+        }
+        if (m.health_status && m.health_status !== "unknown") {
+          const hb = document.createElement("span");
+          hb.className =
+            "pill " +
+            (m.health_status === "reachable"
+              ? "ok"
+              : m.health_status === "mirror_reachable"
+              ? "warn"
+              : "danger");
+          hb.textContent =
+            m.health_status === "reachable"
+              ? "🟢 取得可"
+              : m.health_status === "mirror_reachable"
+              ? "🟡 ミラー可"
+              : "🔴 不可";
+          hb.title = m.health_message || "";
+          badgeWrap.appendChild(hb);
         }
         const fit = document.createElement("span");
         fit.className = "pill " + ((m.pc_fit_badge || "").includes("推奨") || (m.pc_fit_badge || "").includes("最適") ? "ok" : "");
@@ -2240,6 +2370,10 @@
         best.className = "small-label";
         best.textContent = `得意: ${m.best_for || "-"} / 注意: ${m.caution || "-"}`;
 
+        const presetLine = document.createElement("div");
+        presetLine.className = "small-label";
+        presetLine.textContent = m.preset_summary ? `推奨プリセット: ${m.preset_summary}` : "";
+
         const sc = m.scores || {};
         const bars = document.createElement("div");
         bars.className = "score-bars";
@@ -2254,7 +2388,7 @@
           const dlBtn = document.createElement("button");
           dlBtn.type = "button";
           dlBtn.className = "btn-primary btn-sm";
-          dlBtn.textContent = `取得 (~${m.download_size_mb}MB)`;
+          dlBtn.textContent = `ダウンロード (~${m.download_size_mb}MB)`;
           dlBtn.addEventListener("click", () => {
             send({ type: "DownloadModel", model_id: m.id, custom_url: null, custom_filename: null });
           });
@@ -2267,28 +2401,18 @@
           useBtn.className = "btn-secondary btn-sm";
           useBtn.textContent = "使用する";
           useBtn.addEventListener("click", () => {
-            if (m.category === "noise_suppression") {
-              $("ncSttEngine").value = m.id;
-              saveNow();
-            } else if (m.id.startsWith("ggml-") || m.id.startsWith("whisper-")) {
-              $("sttEngine").value = "whisper-cpp";
-              if (m.id.endsWith(".bin")) $("sttModelFile").value = m.id;
-              saveNow();
-            } else if (m.id === "qwen3-asr-0.6b-int8") {
-              $("sttEngine").value = "sherpa-qwen3";
-              saveNow();
-            } else if (m.id === "qwen3-asr-1.7b-gguf") {
-              $("sttEngine").value = "local-http";
-              saveNow();
-            } else if (m.id === "parakeet-ja-int8") {
-              $("sttEngine").value = "sherpa-onnx";
-              saveNow();
-            } else if (m.category === "llm_correction") {
-              $("chkLlmEnabled").checked = true;
-              saveNow();
-            }
+            send({ type: "ApplyModelAutoPreset", model_id: m.id });
           });
           actions.appendChild(useBtn);
+        } else if (m.installed && m.preset_summary) {
+          const reapBtn = document.createElement("button");
+          reapBtn.type = "button";
+          reapBtn.className = "btn-secondary btn-sm";
+          reapBtn.textContent = "推奨プリセット再適用";
+          reapBtn.addEventListener("click", () => {
+            send({ type: "ApplyModelAutoPreset", model_id: m.id });
+          });
+          actions.appendChild(reapBtn);
         }
 
         if (m.can_delete) {
@@ -2314,12 +2438,103 @@
           actions.appendChild(lockBadge);
         }
 
+        let repairPanel = null;
+        if (!m.bundled_default && (m.downloadable || m.default_url)) {
+          const togBtn = document.createElement("button");
+          togBtn.type = "button";
+          togBtn.className = "btn-secondary btn-sm";
+          togBtn.textContent = "URLを確認・修正 ▾";
+
+          repairPanel = document.createElement("div");
+          repairPanel.className = "url-repair-box";
+          repairPanel.style.display = expandedRepairIds.has(m.id) ? "flex" : "none";
+
+          const urlInp = document.createElement("input");
+          urlInp.type = "text";
+          urlInp.className = "input";
+          urlInp.value = m.primary_url || "";
+          urlInp.placeholder = "https://...";
+
+          const mirNote = document.createElement("div");
+          mirNote.className = "small-label";
+          mirNote.textContent = (m.mirror_urls && m.mirror_urls.length)
+            ? `自動ミラー (${m.mirror_urls.length}件): ${m.mirror_urls[0]}`
+            : "自動ミラー: なし";
+
+          const skipLbl = document.createElement("label");
+          skipLbl.className = "checkbox-row small-check";
+          const skipChk = document.createElement("input");
+          skipChk.type = "checkbox";
+          skipChk.checked = !!m.skip_sha256;
+          const skipSp = document.createElement("span");
+          skipSp.textContent = "URL差し替え時はSHA-256検証をスキップ";
+          skipLbl.appendChild(skipChk);
+          skipLbl.appendChild(skipSp);
+
+          const statusTxt = document.createElement("div");
+          statusTxt.className = "small-label";
+          statusTxt.id = "url-health-" + m.id;
+          statusTxt.textContent = m.health_message || "";
+
+          const rBtns = document.createElement("div");
+          rBtns.className = "row gap-sm";
+          rBtns.style.flexWrap = "wrap";
+
+          const testBtn = document.createElement("button");
+          testBtn.type = "button";
+          testBtn.className = "btn-secondary btn-sm";
+          testBtn.textContent = "URL疎通テスト";
+          testBtn.addEventListener("click", () => {
+            statusTxt.textContent = "診断中...";
+            send({ type: "CheckModelUrl", model_id: m.id, test_url: urlInp.value.trim() || null });
+          });
+
+          const saveDlBtn = document.createElement("button");
+          saveDlBtn.type = "button";
+          saveDlBtn.className = "btn-primary btn-sm";
+          saveDlBtn.textContent = "修正を保存してダウンロード";
+          saveDlBtn.addEventListener("click", () => {
+            const u = urlInp.value.trim();
+            if (!u) return;
+            send({ type: "SaveModelUrlOverride", model_id: m.id, primary_url: u, skip_sha256: skipChk.checked });
+            send({ type: "DownloadModel", model_id: m.id, custom_url: null, custom_filename: null });
+          });
+
+          const resetBtn = document.createElement("button");
+          resetBtn.type = "button";
+          resetBtn.className = "btn-secondary btn-sm";
+          resetBtn.textContent = "デフォルトURLに戻す";
+          resetBtn.addEventListener("click", () => {
+            send({ type: "ResetModelUrlOverride", model_id: m.id });
+          });
+
+          rBtns.appendChild(testBtn);
+          rBtns.appendChild(saveDlBtn);
+          rBtns.appendChild(resetBtn);
+
+          repairPanel.appendChild(urlInp);
+          repairPanel.appendChild(mirNote);
+          repairPanel.appendChild(skipLbl);
+          repairPanel.appendChild(rBtns);
+          repairPanel.appendChild(statusTxt);
+
+          togBtn.addEventListener("click", () => {
+            const open = repairPanel.style.display === "none";
+            repairPanel.style.display = open ? "flex" : "none";
+            if (open) expandedRepairIds.add(m.id);
+            else expandedRepairIds.delete(m.id);
+          });
+          actions.appendChild(togBtn);
+        }
+
         card.appendChild(top);
         card.appendChild(meta);
         card.appendChild(ul);
         card.appendChild(best);
+        if (presetLine.textContent) card.appendChild(presetLine);
         card.appendChild(bars);
         card.appendChild(actions);
+        if (repairPanel) card.appendChild(repairPanel);
         grid.appendChild(card);
       });
       container.appendChild(grid);
@@ -2749,6 +2964,26 @@
       case "CatalogInventory":
         renderCatalogInventory(ev);
         break;
+      case "ModelUrlHealthUpdated":
+        (ev.results || []).forEach((r) => {
+          const el = $("url-health-" + r.model_id);
+          if (el) el.textContent = r.message || "";
+        });
+        break;
+      case "OnlineCatalogSynced":
+        showToast(ev.summary || "カタログを更新しました", "ok");
+        break;
+      case "PresetAutoApplied": {
+        const ban = $("autoPresetUndoBanner");
+        if (ban) {
+          $("autoPresetUndoText").textContent = ev.summary || "推奨プリセットを適用しました";
+          ban.style.display = "flex";
+        }
+        if ($("btnUndoAutoPresetToolbar")) {
+          $("btnUndoAutoPresetToolbar").style.display = ev.can_undo ? "inline-block" : "none";
+        }
+        break;
+      }
       case "StatsUpdated":
         renderStatsSummary(ev.summary);
         break;

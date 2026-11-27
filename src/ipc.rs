@@ -3,7 +3,7 @@ use crate::gpu_diag::HardwareProfile;
 use crate::stats::{
     AutoTunerProposal, BenchmarkCase, BenchmarkCaseResult, StatsSummaryDto,
 };
-use crate::stt::catalog::ModelCatalogItemDto;
+use crate::stt::catalog::{ModelCatalogItemDto, ModelUrlHealthDto, RecommendedBundleDto};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +64,23 @@ pub enum ClientCommand {
     GetCatalogInventory,
     DeleteModel { model_id: String },
     ApplyWizardRecommendation,
+    CheckModelUrl {
+        model_id: String,
+        test_url: Option<String>,
+    },
+    CheckAllModelUrls,
+    SaveModelUrlOverride {
+        model_id: String,
+        primary_url: String,
+        #[serde(default)]
+        skip_sha256: bool,
+    },
+    ResetModelUrlOverride { model_id: String },
+    SyncOnlineCatalog,
+    DownloadBundle { bundle_id: String },
+    ApplyModelAutoPreset { model_id: String },
+    UndoAutoPreset,
+    CleanupUnusedModels,
     SaveBenchmarkCase { diag_id: u64, expected_text: String },
     DeleteBenchmarkCase { id: String },
     RunBenchmarkSuite,
@@ -208,6 +225,23 @@ pub enum BackendEvent {
     CatalogInventory {
         hardware: HardwareProfile,
         items: Vec<ModelCatalogItemDto>,
+        bundles: Vec<RecommendedBundleDto>,
+        auto_apply_preset_on_download: bool,
+        can_undo_preset: bool,
+        manifest_url: String,
+    },
+    ModelUrlHealthUpdated {
+        results: Vec<ModelUrlHealthDto>,
+    },
+    OnlineCatalogSynced {
+        updated_urls: usize,
+        added_models: usize,
+        summary: String,
+    },
+    PresetAutoApplied {
+        model_id: String,
+        summary: String,
+        can_undo: bool,
     },
     StatsUpdated {
         summary: StatsSummaryDto,

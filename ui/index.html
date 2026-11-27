@@ -1192,7 +1192,7 @@
 
           <div class="card">
             <div class="row space-between">
-              <h3>ハードウェア診断ウィザード &amp; 統合モデルカタログ（個別削除対応）</h3>
+              <h3>おまかせ推奨セットアップ &amp; 統合モデル管理（URL診断・自動プリセット・個別削除）</h3>
               <div class="row gap-sm">
                 <span class="pill" id="qwen3StatusBadge">Qwen3-ASR: 未導入</span>
                 <button type="button" class="btn-secondary btn-sm" id="btnRefreshCatalog">カタログ更新</button>
@@ -1210,6 +1210,40 @@
                 </div>
               </div>
               <div id="calibrationResultBox" class="ab-result" style="margin-top: 8px"></div>
+            </div>
+
+            <div id="autoPresetUndoBanner" class="preset-undo-banner" style="display: none">
+              <span class="small-label" id="autoPresetUndoText" style="color: #d6ffe6"></span>
+              <button type="button" class="btn-secondary btn-sm" id="btnUndoAutoPresetBanner">元の設定に戻す</button>
+            </div>
+
+            <div id="recommendedBundlesGrid" class="bundle-grid"></div>
+
+            <div class="catalog-toolbar">
+              <div class="row space-between" style="flex-wrap: wrap; gap: 8px">
+                <label class="checkbox-row small-check">
+                  <input type="checkbox" id="chkAutoApplyPreset" />
+                  <span>ダウンロード完了時に推奨プリセットを自動適用して切り替える（Undo可）</span>
+                </label>
+                <div class="row gap-sm" style="flex-wrap: wrap">
+                  <button type="button" class="btn-secondary btn-sm" id="btnCheckAllUrls">全モデルURL疎通診断</button>
+                  <button type="button" class="btn-secondary btn-sm" id="btnSyncCatalog">カタログを最新に更新</button>
+                  <button type="button" class="btn-danger btn-sm" id="btnCleanupModels">未使用モデルを整理</button>
+                  <button type="button" class="btn-secondary btn-sm" id="btnUndoAutoPresetToolbar" style="display: none">元の設定に戻す</button>
+                </div>
+              </div>
+              <div class="row space-between" style="flex-wrap: wrap; gap: 8px">
+                <div id="catalogCategoryTabs" class="cat-filter-tabs">
+                  <button type="button" class="cat-tab-btn active" data-cat="all">すべて</button>
+                  <button type="button" class="cat-tab-btn" data-cat="stt">音声認識 (STT)</button>
+                  <button type="button" class="cat-tab-btn" data-cat="noise_suppression">ノイズ抑制</button>
+                  <button type="button" class="cat-tab-btn" data-cat="llm_correction">滑舌補正 (LLM)</button>
+                </div>
+                <label class="small-label grow" style="max-width: 440px">
+                  オンラインカタログURL (HTTPS):
+                  <input type="text" id="catalogManifestUrl" class="input" placeholder="https://raw.githubusercontent.com/hhurt21/voxdrop/main/models_catalog.json" />
+                </label>
+              </div>
             </div>
 
             <div id="modelCatalogContainer"></div>
