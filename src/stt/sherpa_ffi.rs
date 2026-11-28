@@ -289,6 +289,28 @@ struct SherpaOnnxDenoisedAudio {
     sample_rate: i32,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct SherpaOnnxSpeakerEmbeddingExtractorConfig {
+    model: *const c_char,
+    num_threads: i32,
+    debug: i32,
+    provider: *const c_char,
+}
+
+type FnCreateSpeakerExtractor =
+    unsafe extern "C" fn(*const SherpaOnnxSpeakerEmbeddingExtractorConfig) -> *const c_void;
+type FnDestroySpeakerExtractor = unsafe extern "C" fn(*const c_void);
+type FnSpeakerExtractorDim = unsafe extern "C" fn(*const c_void) -> i32;
+type FnSpeakerExtractorCreateStream = unsafe extern "C" fn(*const c_void) -> *const c_void;
+type FnSpeakerExtractorIsReady = unsafe extern "C" fn(*const c_void, *const c_void) -> i32;
+type FnSpeakerExtractorComputeEmbedding =
+    unsafe extern "C" fn(*const c_void, *const c_void) -> *const f32;
+type FnSpeakerExtractorDestroyEmbedding = unsafe extern "C" fn(*const f32);
+type FnOnlineStreamAcceptWaveform = unsafe extern "C" fn(*const c_void, i32, *const f32, i32);
+type FnOnlineStreamInputFinished = unsafe extern "C" fn(*const c_void);
+type FnDestroyOnlineStream = unsafe extern "C" fn(*const c_void);
+
 type FnCreateOfflineRecognizer =
     unsafe extern "C" fn(*const SherpaOnnxOfflineRecognizerConfig) -> *const c_void;
 type FnDestroyOfflineRecognizer = unsafe extern "C" fn(*const c_void);
@@ -319,6 +341,16 @@ struct SherpaDllFns {
     destroy_denoiser: Option<FnDestroyOfflineSpeechDenoiser>,
     run_denoiser: Option<FnOfflineSpeechDenoiserRun>,
     destroy_denoised_audio: Option<FnDestroyDenoisedAudio>,
+    create_spk_ext: Option<FnCreateSpeakerExtractor>,
+    destroy_spk_ext: Option<FnDestroySpeakerExtractor>,
+    spk_ext_dim: Option<FnSpeakerExtractorDim>,
+    spk_ext_create_stream: Option<FnSpeakerExtractorCreateStream>,
+    spk_ext_is_ready: Option<FnSpeakerExtractorIsReady>,
+    spk_ext_compute_emb: Option<FnSpeakerExtractorComputeEmbedding>,
+    spk_ext_destroy_emb: Option<FnSpeakerExtractorDestroyEmbedding>,
+    online_accept_waveform: Option<FnOnlineStreamAcceptWaveform>,
+    online_input_finished: Option<FnOnlineStreamInputFinished>,
+    destroy_online_stream: Option<FnDestroyOnlineStream>,
 }
 
 struct ResidentInner {
@@ -768,6 +800,49 @@ fn load_dll_fns(dll_path: &Path) -> Result<SherpaDllFns, String> {
                     b"SherpaOnnxDestroyDenoisedAudio\0",
                 )
                 .ok(),
+                create_spk_ext: load_symbol(
+                    hmodule,
+                    b"SherpaOnnxCreateSpeakerEmbeddingExtractor\0",
+                )
+                .ok(),
+                destroy_spk_ext: load_symbol(
+                    hmodule,
+                    b"SherpaOnnxDestroySpeakerEmbeddingExtractor\0",
+                )
+                .ok(),
+                spk_ext_dim: load_symbol(hmodule, b"SherpaOnnxSpeakerEmbeddingExtractorDim\0").ok(),
+                spk_ext_create_stream: load_symbol(
+                    hmodule,
+                    b"SherpaOnnxSpeakerEmbeddingExtractorCreateStream\0",
+                )
+                .ok(),
+                spk_ext_is_ready: load_symbol(
+                    hmodule,
+                    b"SherpaOnnxSpeakerEmbeddingExtractorIsReady\0",
+                )
+                .ok(),
+                spk_ext_compute_emb: load_symbol(
+                    hmodule,
+                    b"SherpaOnnxSpeakerEmbeddingExtractorComputeEmbedding\0",
+                )
+                .ok(),
+                spk_ext_destroy_emb: load_symbol(
+                    hmodule,
+                    b"SherpaOnnxSpeakerEmbeddingExtractorDestroyEmbedding\0",
+                )
+                .ok(),
+                online_accept_waveform: load_symbol(
+                    hmodule,
+                    b"SherpaOnnxOnlineStreamAcceptWaveform\0",
+                )
+                .ok(),
+                online_input_finished: load_symbol(
+                    hmodule,
+                    b"SherpaOnnxOnlineStreamInputFinished\0",
+                )
+                .ok(),
+                destroy_online_stream: load_symbol(hmodule, b"SherpaOnnxDestroyOnlineStream\0")
+                    .ok(),
             })
         })();
 
@@ -911,6 +986,169 @@ impl ResidentSherpaDenoiser {
 
 pub(crate) fn normalize_dpdfnet_db(db: f32) -> f32 {
     db.abs().clamp(0.0, 60.0)
+}
+
+/// Resident speaker embedding extractor (`sherpa-onnx-c-api.dll`, DirectML / CPU, zero CUDA) (#8).
+pub struct ResidentSpeakerExtractor {
+    fns: SherpaDllFns,
+    extractor: Mutex<*const c_void>,
+    dim: usize,
+    model_name: String,
+    #[allow(dead_code)]
+    device_label: String,
+}
+
+unsafe impl Send for ResidentSpeakerExtractor {}
+unsafe impl Sync for ResidentSpeakerExtractor {}
+
+impl Drop for ResidentSpeakerExtractor {
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.extractor.lock() {
+            if !(*g).is_null() {
+                if let Some(d_fn) = self.fns.destroy_spk_ext {
+                    unsafe { d_fn(*g) };
+                }
+                *g = ptr::null();
+            }
+        }
+    }
+}
+
+impl ResidentSpeakerExtractor {
+    pub fn load(dll_path: &Path, model_path: &Path, threads: u32) -> Result<Self, String> {
+        let fns = load_dll_fns(dll_path)?;
+        let create_fn = fns.create_spk_ext.ok_or_else(|| {
+            "sherpa-onnx-c-api.dll に SpeakerEmbeddingExtractor API がありません".to_string()
+        })?;
+        let dim_fn = fns.spk_ext_dim.ok_or_else(|| {
+            "sherpa-onnx-c-api.dll に SpeakerEmbeddingExtractorDim がありません".to_string()
+        })?;
+        let model_c = CString::new(model_path.to_string_lossy().as_ref())
+            .map_err(|_| "話者照合モデルパスが不正です".to_string())?;
+
+        let mut picked: *const c_void = ptr::null();
+        let mut dev = String::from("CPU");
+        for prov in ["directml", "cpu"] {
+            let Ok(prov_c) = CString::new(prov) else {
+                continue;
+            };
+            let cfg = SherpaOnnxSpeakerEmbeddingExtractorConfig {
+                model: model_c.as_ptr(),
+                num_threads: threads.clamp(1, 4) as i32,
+                debug: 0,
+                provider: prov_c.as_ptr(),
+            };
+            let ptr_ext = unsafe { create_fn(&cfg) };
+            if !ptr_ext.is_null() {
+                picked = ptr_ext;
+                dev = if prov == "directml" {
+                    "DirectML (GPU)".into()
+                } else {
+                    "CPU".into()
+                };
+                break;
+            }
+        }
+        if picked.is_null() {
+            return Err(format!(
+                "話者照合モデルの読み込みに失敗しました: {}",
+                model_path.display()
+            ));
+        }
+
+        let dim = unsafe { dim_fn(picked) }.max(0) as usize;
+        if dim == 0 {
+            if let Some(d_fn) = fns.destroy_spk_ext {
+                unsafe { d_fn(picked) };
+            }
+            return Err("話者埋め込み次元数が 0 です".into());
+        }
+
+        let model_name = model_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("speaker-embedding.onnx")
+            .to_string();
+
+        Ok(Self {
+            fns,
+            extractor: Mutex::new(picked),
+            dim,
+            model_name,
+            device_label: dev,
+        })
+    }
+
+    pub fn model_name(&self) -> &str {
+        &self.model_name
+    }
+
+    pub fn compute_embedding(&self, samples_16k: &[f32]) -> Result<Vec<f32>, String> {
+        if samples_16k.len() < 1600 {
+            return Err("音声が短すぎて声紋を抽出できません".into());
+        }
+        let create_stream = self
+            .fns
+            .spk_ext_create_stream
+            .ok_or_else(|| "Speaker CreateStream API が見つかりません".to_string())?;
+        let accept = self
+            .fns
+            .online_accept_waveform
+            .ok_or_else(|| "OnlineStreamAcceptWaveform API が見つかりません".to_string())?;
+        let finish = self
+            .fns
+            .online_input_finished
+            .ok_or_else(|| "OnlineStreamInputFinished API が見つかりません".to_string())?;
+        let is_ready = self
+            .fns
+            .spk_ext_is_ready
+            .ok_or_else(|| "Speaker IsReady API が見つかりません".to_string())?;
+        let compute = self
+            .fns
+            .spk_ext_compute_emb
+            .ok_or_else(|| "Speaker ComputeEmbedding API が見つかりません".to_string())?;
+        let destroy_emb = self
+            .fns
+            .spk_ext_destroy_emb
+            .ok_or_else(|| "Speaker DestroyEmbedding API が見つかりません".to_string())?;
+        let destroy_stream = self
+            .fns
+            .destroy_online_stream
+            .ok_or_else(|| "DestroyOnlineStream API が見つかりません".to_string())?;
+
+        let guard = self
+            .extractor
+            .lock()
+            .map_err(|_| "話者照合ロックの取得に失敗しました".to_string())?;
+        let ext_ptr = *guard;
+        if ext_ptr.is_null() {
+            return Err("話者照合エンジンが解放済みです".into());
+        }
+
+        unsafe {
+            let stream = create_stream(ext_ptr);
+            if stream.is_null() {
+                return Err("話者照合ストリームの作成に失敗しました".into());
+            }
+            accept(stream, 16_000, samples_16k.as_ptr(), samples_16k.len() as i32);
+            finish(stream);
+
+            let out = if is_ready(ext_ptr, stream) != 0 {
+                let emb_ptr = compute(ext_ptr, stream);
+                if emb_ptr.is_null() {
+                    Err("声紋ベクトルの計算に失敗しました".into())
+                } else {
+                    let vec_out = std::slice::from_raw_parts(emb_ptr, self.dim).to_vec();
+                    destroy_emb(emb_ptr);
+                    Ok(vec_out)
+                }
+            } else {
+                Err("音声が短すぎるため声紋を判定できません".into())
+            };
+            destroy_stream(stream);
+            out
+        }
+    }
 }
 
 #[cfg(test)]

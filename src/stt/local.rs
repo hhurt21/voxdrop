@@ -334,6 +334,36 @@ pub fn discover_stt_denoiser(
     .map(Arc::new)
 }
 
+/// Discovers a resident speaker embedding ONNX model + `sherpa-onnx-c-api.dll` for voiceprint filtering (#8).
+pub fn discover_speaker_extractor(
+    cfg: &SttConfig,
+    runtime_dir: Option<&Path>,
+    preferred_file: &str,
+) -> Option<Arc<crate::stt::sherpa_ffi::ResidentSpeakerExtractor>> {
+    let dll = find_file_in_search_dirs("", &["sherpa-onnx-c-api.dll"], runtime_dir)?;
+    let search_dirs = resolve_model_search_dirs(&cfg.model_dir, runtime_dir);
+    let mut candidates: Vec<&str> = Vec::new();
+    let pref = preferred_file.trim();
+    if !pref.is_empty() {
+        candidates.push(pref);
+    }
+    candidates.extend_from_slice(&[
+        "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx",
+        "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx",
+        "wespeaker_en_voxceleb_CAM++.onnx",
+    ]);
+    let model_path = search_dirs
+        .iter()
+        .find_map(|d| candidates.iter().map(|n| d.join(n)).find(|p| p.is_file()))?;
+    crate::stt::sherpa_ffi::ResidentSpeakerExtractor::load(
+        &dll,
+        &model_path,
+        cfg.threads.clamp(1, 4),
+    )
+    .ok()
+    .map(Arc::new)
+}
+
 /// Lists available GGML Whisper `.bin` model filenames ordered by quality priority.
 pub fn list_available_ggml_models(cfg: &SttConfig, runtime_dir: Option<&Path>) -> Vec<String> {
     let mut candidates = Vec::new();
@@ -543,13 +573,24 @@ impl SttEngine for WhisperResidentEngine {
         samples_16k: &[f32],
         ctx: &TranscribeContext,
     ) -> Result<String, String> {
+        self.transcribe_with_confidence(samples_16k, ctx)
+            .map(|r| r.text)
+    }
+
+    fn transcribe_with_confidence(
+        &self,
+        samples_16k: &[f32],
+        ctx: &TranscribeContext,
+    ) -> Result<crate::stt::TranscriptWithConfidence, String> {
         if let Some(ref prompt) = ctx.hotwords_prompt {
             self.recognizer.set_prompt_hints(prompt);
         }
-        self.recognizer.transcribe_with_options(
+        self.recognizer.transcribe_with_options_and_confidence(
             samples_16k,
             ctx.radio_clarity,
             ctx.eq_strength,
+            ctx.room_debox_strength,
+            ctx.dereverb_enabled,
             ctx.head_pad_ms,
             ctx.tail_pad_ms,
             ctx.beam_size,

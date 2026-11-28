@@ -1,7 +1,9 @@
-use crate::config::{ActivationMode, AppConfig, InputMode};
+use crate::config::{ActivationMode, AppConfig, DictionaryEntry, InputMode};
 use crate::gpu_diag::HardwareProfile;
+use crate::processor::phonetic::ImeParsedEntry;
 use crate::stats::{
     AutoTunerProposal, BenchmarkCase, BenchmarkCaseResult, StatsSummaryDto,
+    ThreeStageBenchmarkReport,
 };
 use crate::stt::catalog::{ModelCatalogItemDto, ModelUrlHealthDto, RecommendedBundleDto};
 use serde::{Deserialize, Serialize};
@@ -18,6 +20,8 @@ pub struct UtteranceDiagnosticDto {
     pub engine_label: String,
     pub raw_text: String,
     pub final_text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_similarity: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +93,7 @@ pub enum ClientCommand {
     SaveBenchmarkCase { diag_id: u64, expected_text: String },
     DeleteBenchmarkCase { id: String },
     RunBenchmarkSuite,
+    RunThreeStageBenchmark,
     RunAutoTuner,
     ApplyAutoTuner {
         eq_strength: f32,
@@ -96,7 +101,20 @@ pub enum ClientCommand {
         beam_size: i32,
         #[serde(default)]
         dpdfnet_db: Option<f32>,
+        #[serde(default)]
+        room_debox_strength: Option<f32>,
     },
+    PreviewImeDictionary {
+        raw_text_b64: String,
+    },
+    ImportImeEntries {
+        entries: Vec<DictionaryEntry>,
+    },
+    GetNgramStatus,
+    ClearPersonalNgram,
+    StartSpeakerEnroll,
+    ClearSpeakerProfile,
+    GetSpeakerProfileStatus,
     StartCalibrationWizard,
     ApplyCalibrationResult {
         vad_threshold: f32,
@@ -263,6 +281,28 @@ pub enum BackendEvent {
     BenchmarkSuiteResult {
         results: Vec<BenchmarkCaseResult>,
         avg_similarity: f32,
+    },
+    ThreeStageBenchmarkResult {
+        report: ThreeStageBenchmarkReport,
+    },
+    ImeDictionaryPreview {
+        ok: bool,
+        encoding: String,
+        entries: Vec<ImeParsedEntry>,
+        duplicate_count: usize,
+        message: String,
+    },
+    PersonalNgramStatus {
+        entry_count: usize,
+        total_tokens: u64,
+    },
+    SpeakerProfileStatus {
+        enrolled: bool,
+        model_installed: bool,
+        enrolling: bool,
+        sample_seconds: f32,
+        created_at: String,
+        message: String,
     },
     AutoTunerResult {
         proposal: AutoTunerProposal,

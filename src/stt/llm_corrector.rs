@@ -24,6 +24,7 @@ static OWNED_LLM_CHILD: Mutex<Option<Child>> = Mutex::new(None);
 
 pub struct LlmCorrectionRequest<'a> {
     pub primary_text: &'a str,
+    pub annotated_primary_text: Option<&'a str>,
     pub secondary_text: Option<&'a str>,
     pub recent_messages: &'a [String],
     pub target_label: &'a str,
@@ -35,16 +36,16 @@ pub struct LlmCorrectionRequest<'a> {
 fn build_system_prompt(style: SpeechStyle) -> &'static str {
     match style {
         SpeechStyle::Normal => {
-            "あなたは日本語音声入力の最小限誤字補正器です。音韻（読み）と直前文脈・辞書から空耳や同音異義語だけを最小限で直し、意味や語尾は変えず補正後テキストのみを出力してください。説明や引用符は出力しないでください。"
+            "あなたは日本語音声入力の最小限誤字補正器です。音韻（読み）と直前文脈・辞書から空耳や同音異義語だけを最小限で直し、意味や語尾は変えず補正後テキストのみを出力してください。入力に [?語句] がある場合、マーカー外の正しい語句は原則変更せず、[?] 箇所を優先して修復し、出力に [? や ] は絶対に含めないでください。説明や引用符は出力しないでください。"
         }
         SpeechStyle::Casual => {
-            "あなたは日本語チャット補正器です。音韻と文脈から誤認識を最小限で直し、親しい友人向けの自然なタメ口・チャット調に整えてテキストのみを出力してください。"
+            "あなたは日本語チャット補正器です。音韻と文脈から誤認識（[?語句] は低確信度箇所）を最小限で直し、親しい友人向けの自然なタメ口・チャット調に整えてテキストのみを出力してください（[? や ] は出力に含めないこと）。"
         }
         SpeechStyle::Polite => {
-            "あなたは日本語チャット補正器です。誤認識を最小限で直し、丁寧語（です・ます調）に整えてテキストのみを出力してください。"
+            "あなたは日本語チャット補正器です。誤認識（[?語句] は低確信度箇所）を最小限で直し、丁寧語（です・ます調）に整えてテキストのみを出力してください（[? や ] は出力に含めないこと）。"
         }
         SpeechStyle::GameShort => {
-            "あなたはFPS・チームゲーム通話テキスト補正器です。誤認識を直し、簡潔で読みやすい短いゲーム報告テキストのみを出力してください。"
+            "あなたはFPS・チームゲーム通話テキスト補正器です。誤認識（[?語句] は低確信度箇所）を直し、簡潔で読みやすい短いゲーム報告テキストのみを出力してください（[? や ] は出力に含めないこと）。"
         }
     }
 }
@@ -52,7 +53,12 @@ fn build_system_prompt(style: SpeechStyle) -> &'static str {
 pub fn build_user_prompt(req: &LlmCorrectionRequest<'_>) -> String {
     let mut parts = Vec::new();
     let kana_hint = to_normalized_mora(req.primary_text);
-    parts.push(format!("第一認識(STT1): {}", req.primary_text.trim()));
+    let display_primary = req
+        .annotated_primary_text
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(req.primary_text)
+        .trim();
+    parts.push(format!("第一認識(STT1): {}", display_primary));
     if let Some(sec) = req.secondary_text {
         if !sec.trim().is_empty() && sec.trim() != req.primary_text.trim() {
             parts.push(format!("第二認識(STT2合議用): {}", sec.trim()));
@@ -104,6 +110,8 @@ pub fn parse_chat_completion_response(body: &[u8]) -> Result<String, String> {
         .trim_matches('"')
         .trim_matches('「')
         .trim_matches('」')
+        .replace("[?", "")
+        .replace(']', "")
         .trim()
         .to_string();
     Ok(text)
@@ -460,6 +468,7 @@ mod tests {
         let recent = vec!["次どうする？".into()];
         let req = LlmCorrectionRequest {
             primary_text: "ばんだるかう",
+            annotated_primary_text: Some("[?ばんだる]かう"),
             secondary_text: Some("ヴァンダル買う"),
             recent_messages: &recent,
             target_label: "雑談 (#general)",
@@ -469,6 +478,7 @@ mod tests {
         };
         let p = build_user_prompt(&req);
         assert!(p.contains("STT1"));
+        assert!(p.contains("[?ばんだる]"));
         assert!(p.contains("STT2"));
         assert!(p.contains("VALORANT"));
         assert!(p.contains("ばんだる->ヴァンダル"));

@@ -19,6 +19,7 @@ pub enum ModelCategory {
     Stt,
     NoiseSuppression,
     LlmCorrection,
+    SpeakerRecognition,
     Vad,
 }
 
@@ -1318,6 +1319,16 @@ pub fn apply_preset_with_snapshot(
                 changes.push(format!("ローカルLLM補正を有効化 ({})", e.display_name));
             }
         }
+        ModelCategory::SpeakerRecognition => {
+            if let Some(matched) = find_matched_path(models_dir, e) {
+                if let Some(fname) = matched.file_name().and_then(|s| s.to_str()) {
+                    cfg.stt.accuracy.speaker_model_file = fname.to_string();
+                }
+            } else if !e.local_rel_path.is_empty() {
+                cfg.stt.accuracy.speaker_model_file = e.local_rel_path.clone();
+            }
+            changes.push(format!("声紋モデルを設定 ({})", e.display_name));
+        }
         ModelCategory::Vad => {}
     }
 
@@ -1611,11 +1622,14 @@ pub fn build_catalog_inventory_in_dirs(
                 }
                 let sz = dir_size_bytes(&p);
                 let in_use = cfg.stt.model_file.eq_ignore_ascii_case(&name)
-                    || cfg.stt.accuracy.llm.model_file.eq_ignore_ascii_case(&name);
+                    || cfg.stt.accuracy.llm.model_file.eq_ignore_ascii_case(&name)
+                    || cfg.stt.accuracy.speaker_model_file.eq_ignore_ascii_case(&name);
                 let cat = if lower.ends_with(".gguf") && !lower.contains("asr") {
                     ModelCategory::LlmCorrection
                 } else if lower.contains("gtcrn") || lower.contains("dpdf") || lower.contains("deepfilter") {
                     ModelCategory::NoiseSuppression
+                } else if lower.contains("3dspeaker") || lower.contains("voxceleb") || lower.contains("eres2net") || lower.contains("campplus") {
+                    ModelCategory::SpeakerRecognition
                 } else {
                     ModelCategory::Stt
                 };
@@ -1782,11 +1796,14 @@ pub fn build_catalog_inventory_ex(
             }
             let sz = dir_size_bytes(&p);
             let in_use = cfg.stt.model_file.eq_ignore_ascii_case(&name)
-                || cfg.stt.accuracy.llm.model_file.eq_ignore_ascii_case(&name);
+                || cfg.stt.accuracy.llm.model_file.eq_ignore_ascii_case(&name)
+                || cfg.stt.accuracy.speaker_model_file.eq_ignore_ascii_case(&name);
             let cat = if lower.ends_with(".gguf") && !lower.contains("asr") {
                 ModelCategory::LlmCorrection
             } else if lower.contains("gtcrn") || lower.contains("dpdf") || lower.contains("deepfilter") {
                 ModelCategory::NoiseSuppression
+            } else if lower.contains("3dspeaker") || lower.contains("voxceleb") || lower.contains("eres2net") || lower.contains("campplus") {
+                ModelCategory::SpeakerRecognition
             } else {
                 ModelCategory::Stt
             };

@@ -17,6 +17,8 @@ rodio = { version = "0.20", default-features = false, features = ["wav"] }
 nnnoiseless = "0.5"
 flate2 = "1"
 windows-core = "0.61"
+lindera = { version = "7", default-features = false, features = ["embed-ipadic"] }
+encoding_rs = "0.8"
 
 [dependencies.windows]
 version = "0.61"

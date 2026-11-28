@@ -11,6 +11,8 @@ use crate::audio::vad::TARGET_SAMPLE_RATE;
 pub struct EnhanceOptions {
     pub clarity_boost: bool,
     pub eq_strength: f32,
+    pub room_debox_strength: f32,
+    pub dereverb_enabled: bool,
     pub highpass_enabled: bool,
     pub agc_enabled: bool,
     pub head_pad_ms: u64,
@@ -22,6 +24,8 @@ impl Default for EnhanceOptions {
         Self {
             clarity_boost: true,
             eq_strength: 0.55,
+            room_debox_strength: 0.35,
+            dereverb_enabled: false,
             highpass_enabled: true,
             agc_enabled: true,
             head_pad_ms: 200,
@@ -78,6 +82,45 @@ impl Biquad {
             z2 = self.b2 * inp - self.a2 * y;
             *x = y;
         }
+    }
+}
+
+/// Attenuates indoor 250-450Hz room-boxiness resonance (-0.0 .. -4.0 dB at 340Hz) (#9).
+pub fn apply_room_debox_16k(buf: &mut [f32], strength: f32) {
+    let st = strength.clamp(0.0, 1.0);
+    if buf.is_empty() || st <= 0.02 {
+        return;
+    }
+    let cut = Biquad::peaking(TARGET_SAMPLE_RATE as f32, 340.0, 1.0, -4.0 * st);
+    cut.process_in_place(buf);
+}
+
+/// Lightweight exponential-tail late-reverberation suppressor in pure Rust (#9).
+/// Gently attenuates lingering wall-reflection tails in quiet frames right after loud speech.
+pub fn apply_lightweight_dereverb_16k(buf: &mut [f32]) {
+    const FRAME: usize = 160; // 10ms @ 16kHz
+    if buf.len() < FRAME * 2 {
+        return;
+    }
+    let mut reverb_tail = 0.0f32;
+    let mut prev_gain = 1.0f32;
+    for chunk in buf.chunks_mut(FRAME) {
+        let rms = (chunk.iter().map(|&x| x * x).sum::<f32>() / chunk.len() as f32).sqrt();
+        // Track exponential decay of preceding speech energy (RT60 ~ 180-250ms)
+        let tail_est = reverb_tail * 0.86;
+        let target_gain = if rms > 1e-4 && tail_est > rms * 0.25 {
+            ((rms - 0.38 * tail_est).max(0.28 * rms) / rms).clamp(0.28, 1.0)
+        } else {
+            1.0
+        };
+        let n = chunk.len() as f32;
+        for (idx, s) in chunk.iter_mut().enumerate() {
+            let t = (idx + 1) as f32 / n;
+            let g = prev_gain + (target_gain - prev_gain) * t;
+            *s *= g;
+        }
+        prev_gain = target_gain;
+        reverb_tail = reverb_tail.max(rms) * 0.86 + rms * 0.14;
     }
 }
 
@@ -224,11 +267,13 @@ pub fn enhance_utterance_16k(
             tail_pad_ms: 350,
             highpass_enabled: false,
             eq_strength: if clarity_boost { 0.55 } else { 0.0 },
+            room_debox_strength: 0.0,
+            dereverb_enabled: false,
         },
     )
 }
 
-/// Full Layer-1 utterance speech conditioning (#2, #36).
+/// Full Layer-1 utterance speech conditioning (#2, #9, #36).
 pub fn enhance_utterance_16k_with_options(samples: &[f32], opts: &EnhanceOptions) -> Vec<f32> {
     if samples.is_empty() {
         return Vec::new();
@@ -238,7 +283,15 @@ pub fn enhance_utterance_16k_with_options(samples: &[f32], opts: &EnhanceOptions
     let mean = samples.iter().copied().sum::<f32>() / samples.len() as f32;
     let mut buf: Vec<f32> = samples.iter().map(|&x| x - mean).collect();
 
-    // 2. Consonant-clarity 85Hz HPF + 3.6kHz presence EQ (or legacy gentle lift when EQ=0)
+    // 2. Room debox (250-450Hz indoor mud cut) + lightweight dereverb (#9)
+    if opts.room_debox_strength > 0.02 {
+        apply_room_debox_16k(&mut buf, opts.room_debox_strength);
+    }
+    if opts.dereverb_enabled {
+        apply_lightweight_dereverb_16k(&mut buf);
+    }
+
+    // 3. Consonant-clarity 85Hz HPF + 3.6kHz presence EQ (or legacy gentle lift when EQ=0)
     if opts.highpass_enabled || (opts.clarity_boost && opts.eq_strength > 0.02) {
         apply_presence_eq_16k(&mut buf, opts.highpass_enabled, if opts.clarity_boost { opts.eq_strength } else { 0.0 });
     } else if opts.clarity_boost {
@@ -363,5 +416,23 @@ mod tests {
             "expected preserved pitch ~220Hz, got {:.1}Hz",
             est_hz
         );
+    }
+
+    #[test]
+    fn room_debox_attenuates_340hz_and_dereverb_suppresses_tails() {
+        let boxy: Vec<f32> = (0..4000)
+            .map(|i| (2.0 * std::f32::consts::PI * 340.0 * (i as f32 / 16_000.0)).sin() * 0.25)
+            .collect();
+        let in_rms = (boxy.iter().map(|x| x * x).sum::<f32>() / boxy.len() as f32).sqrt();
+        let mut deboxed = boxy.clone();
+        apply_room_debox_16k(&mut deboxed, 1.0);
+        let out_rms = (deboxed.iter().map(|x| x * x).sum::<f32>() / deboxed.len() as f32).sqrt();
+        assert!(out_rms < in_rms * 0.85, "expected 340Hz cut ({:.4} < {:.4})", out_rms, in_rms);
+
+        let mut sig = vec![0.3f32; 1600]; // 100ms loud impulse
+        sig.extend(vec![0.09f32; 1600]); // 100ms room tail
+        apply_lightweight_dereverb_16k(&mut sig);
+        let tail_rms = (sig[1800..].iter().map(|x| x * x).sum::<f32>() / 1400.0).sqrt();
+        assert!(tail_rms < 0.08, "expected dereverb tail attenuation, got {:.4}", tail_rms);
     }
 }

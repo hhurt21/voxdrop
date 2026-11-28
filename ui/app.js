@@ -733,6 +733,18 @@
     const eqVal = nc.presence_eq_strength != null ? nc.presence_eq_strength : 0.55;
     $("ncPresenceEq").value = eqVal;
     $("ncPresenceEqVal").textContent = Math.round(eqVal * 100) + "%";
+    const deboxVal = nc.room_debox_strength != null ? nc.room_debox_strength : 0.35;
+    if ($("ncRoomDebox")) {
+      $("ncRoomDebox").value = deboxVal;
+      $("ncRoomDeboxVal").textContent = Math.round(deboxVal * 100) + "%";
+    }
+    const aecStr = nc.aec_strength != null ? nc.aec_strength : 0.75;
+    if ($("aecStrength")) {
+      $("aecStrength").value = aecStr;
+      $("aecStrengthVal").textContent = Math.round(aecStr * 100) + "%";
+    }
+    if ($("chkNcDereverb")) $("chkNcDereverb").checked = !!nc.dereverb_enabled;
+    if ($("chkAecEnabled")) $("chkAecEnabled").checked = !!nc.aec_enabled;
 
     const dt = cfg.discord_targets || {};
     setPhraseList("peTargetPrefixes", dt.switch_prefixes);
@@ -796,6 +808,14 @@
     $("chkContextPrompt").checked = acc.context_prompt_injection !== false;
     $("chkStreamingPreview").checked = acc.streaming_preview_enabled !== false;
     $("streamingIntervalMs").value = acc.streaming_interval_ms != null ? acc.streaming_interval_ms : 1700;
+    if ($("chkPhoneticDict")) $("chkPhoneticDict").checked = acc.phonetic_dict_enabled !== false;
+    if ($("chkPersonalNgram")) $("chkPersonalNgram").checked = acc.personal_ngram_enabled !== false;
+    if ($("chkSpeakerVerify")) $("chkSpeakerVerify").checked = !!acc.speaker_verify_enabled;
+    if ($("speakerThreshold")) {
+      const spkTh = acc.speaker_verify_threshold != null ? acc.speaker_verify_threshold : 0.55;
+      $("speakerThreshold").value = spkTh;
+      $("speakerThresholdVal").textContent = Number(spkTh).toFixed(2);
+    }
 
     const llm = acc.llm || {};
     $("chkLlmEnabled").checked = !!llm.enabled;
@@ -1040,6 +1060,10 @@
         stt_engine: $("ncSttEngine").value || "dpdfnet-16k",
         dpdfnet_attenuation_limit_db: Math.abs(parseFloat($("ncDpdfLimit").value) || 12),
         presence_eq_strength: parseFloat($("ncPresenceEq").value) || 0.55,
+        room_debox_strength: $("ncRoomDebox") ? parseFloat($("ncRoomDebox").value) : 0.35,
+        dereverb_enabled: $("chkNcDereverb") ? $("chkNcDereverb").checked : false,
+        aec_enabled: $("chkAecEnabled") ? $("chkAecEnabled").checked : false,
+        aec_strength: $("aecStrength") ? parseFloat($("aecStrength").value) || 0.75 : 0.75,
       },
       audio_device_fallbacks: splitCsv($("audioFallbacksInput").value),
       snippets: collectPairList("snippetRows", "trigger", "expansion").map((s, i) => ({
@@ -1169,6 +1193,11 @@
           phonetic_fuzzy_matching: $("chkPhoneticFuzzy").checked,
           stutter_cleanup: $("chkStutterCleanup").checked,
           auto_learn_respeak: $("chkAutoLearnRespeak").checked,
+          phonetic_dict_enabled: $("chkPhoneticDict") ? $("chkPhoneticDict").checked : true,
+          personal_ngram_enabled: $("chkPersonalNgram") ? $("chkPersonalNgram").checked : true,
+          speaker_verify_enabled: $("chkSpeakerVerify") ? $("chkSpeakerVerify").checked : false,
+          speaker_verify_threshold: $("speakerThreshold") ? parseFloat($("speakerThreshold").value) || 0.55 : 0.55,
+          speaker_model_file: (currentConfig.stt && currentConfig.stt.accuracy && currentConfig.stt.accuracy.speaker_model_file) || "",
           llm: {
             enabled: $("chkLlmEnabled").checked,
             base_url: $("llmBaseUrl").value.trim() || "http://127.0.0.1:8081",
@@ -1359,7 +1388,7 @@
 
       const stats = document.createElement("div");
       stats.className = "diag-stats";
-      [
+      const statPills = [
         item.timestamp,
         `長さ: ${Number(item.duration_sec || 0).toFixed(2)}s`,
         `ピーク: ${Number(item.peak_dbfs || 0).toFixed(1)} dBFS`,
@@ -1367,7 +1396,11 @@
         `RTF: ${Number(item.rtf || 0).toFixed(2)}`,
         `デバイス: ${item.device_name || "-"}`,
         `エンジン: ${item.engine_label || "-"}`,
-      ].forEach((txt) => {
+      ];
+      if (item.speaker_similarity != null) {
+        statPills.push(`話者類似度: ${Number(item.speaker_similarity).toFixed(2)}`);
+      }
+      statPills.forEach((txt) => {
         const sp = document.createElement("span");
         sp.className = "pill";
         sp.textContent = txt;
@@ -1894,6 +1927,60 @@
     $("ncStrengthVal").textContent = Math.round(parseFloat(e.target.value) * 100) + "%";
   });
   $("ncStrength").addEventListener("change", saveNow);
+  if ($("ncRoomDebox")) {
+    $("ncRoomDebox").addEventListener("input", (e) => {
+      $("ncRoomDeboxVal").textContent = Math.round(parseFloat(e.target.value) * 100) + "%";
+    });
+    $("ncRoomDebox").addEventListener("change", saveNow);
+  }
+  if ($("aecStrength")) {
+    $("aecStrength").addEventListener("input", (e) => {
+      $("aecStrengthVal").textContent = Math.round(parseFloat(e.target.value) * 100) + "%";
+    });
+    $("aecStrength").addEventListener("change", saveNow);
+  }
+  if ($("chkNcDereverb")) $("chkNcDereverb").addEventListener("change", saveNow);
+  if ($("chkAecEnabled")) $("chkAecEnabled").addEventListener("change", saveNow);
+  if ($("chkPhoneticDict")) $("chkPhoneticDict").addEventListener("change", saveNow);
+  if ($("chkPersonalNgram")) $("chkPersonalNgram").addEventListener("change", saveNow);
+  if ($("chkSpeakerVerify")) $("chkSpeakerVerify").addEventListener("change", saveNow);
+  if ($("speakerThreshold")) {
+    $("speakerThreshold").addEventListener("input", (e) => {
+      $("speakerThresholdVal").textContent = Number(e.target.value).toFixed(2);
+    });
+    $("speakerThreshold").addEventListener("change", saveNow);
+  }
+  if ($("btnClearNgram")) {
+    $("btnClearNgram").addEventListener("click", () => send({ type: "ClearPersonalNgram" }));
+  }
+  if ($("btnEnrollSpeaker")) {
+    $("btnEnrollSpeaker").addEventListener("click", () => send({ type: "StartSpeakerEnroll" }));
+  }
+  if ($("btnClearSpeaker")) {
+    $("btnClearSpeaker").addEventListener("click", () => {
+      if (window.confirm("登録済みの本人声紋を削除しますか？")) {
+        send({ type: "ClearSpeakerProfile" });
+      }
+    });
+  }
+  if ($("btnImportIme") && $("imeFileInput")) {
+    $("btnImportIme").addEventListener("click", () => $("imeFileInput").click());
+    $("imeFileInput").addEventListener("change", (e) => {
+      const file = e.target.files && e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        const bytes = new Uint8Array(reader.result);
+        let bin = "";
+        for (let i = 0; i < bytes.length; i += 0x8000) {
+          bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+        }
+        send({ type: "PreviewImeDictionary", raw_text_b64: btoa(bin) });
+      };
+      reader.readAsArrayBuffer(file);
+      e.target.value = "";
+    });
+  }
 
   $("audioDeviceSelect").addEventListener("change", saveNow);
   $("btnRefreshDevices").addEventListener("click", () => send({ type: "ListAudioDevices" }));
@@ -2099,6 +2186,16 @@
     $("benchResultBox").textContent = "ベンチマーク一括テストを実行中...";
     send({ type: "RunBenchmarkSuite" });
   });
+  if ($("btnRunThreeStageBench")) {
+    $("btnRunThreeStageBench").addEventListener("click", () => {
+      const box = $("threeStageBenchBox");
+      if (box) {
+        box.style.display = "block";
+        box.textContent = "Stage 1 (生STT) → Stage 2 (非LLM) → Stage 3 (ローカルLLM) を計測中...";
+      }
+      send({ type: "RunThreeStageBenchmark" });
+    });
+  }
   $("btnRunAutoTuner").addEventListener("click", () => {
     $("autoTunerProposalBox").className = "ab-result show";
     $("autoTunerProposalBox").textContent = "最適パラメータを探索中...";
@@ -2379,6 +2476,7 @@
       ["stt", "音声認識 (STT) モデル"],
       ["noise_suppression", "AIノイズ抑制モデル"],
       ["llm_correction", "文脈誤字補正 (ローカルLLM)"],
+      ["speaker_recognition", "話者照合 (声紋認証 ONNX)"],
       ["vad", "発話区間検出 (VAD)"],
     ];
     const items = (payload.items || []).filter(
@@ -2392,11 +2490,21 @@
       h.textContent = catTitle;
       container.appendChild(h);
 
+      if (catKey === "llm_correction") {
+        const note = document.createElement("div");
+        note.className = "catalog-category-note";
+        note.textContent =
+          "⚠ ローカルLLM補正を動かすには ①「llama-server ランタイム（サーバー本体）」と ②「Qwen3 などの .gguf モデル（1つ以上）」の両方の導入が必要です（片方だけでは動作しません／Ollama・LM Studio を使用する場合は不要）。";
+        container.appendChild(note);
+      }
+
       const grid = document.createElement("div");
       grid.className = "catalog-grid";
       group.forEach((m) => {
         const card = document.createElement("div");
-        card.className = "model-card" + (m.in_use ? " in-use" : "");
+        card.className =
+          "model-card" +
+          (m.in_use ? " in-use" : m.installed ? " installed" : "");
 
         const top = document.createElement("div");
         top.className = "row space-between";
@@ -2407,8 +2515,13 @@
         if (m.in_use) {
           const b = document.createElement("span");
           b.className = "pill ok";
-          b.textContent = "使用中";
+          b.textContent = "✓ 使用中 (導入済み)";
           badgeWrap.appendChild(b);
+        } else if (m.installed) {
+          const instB = document.createElement("span");
+          instB.className = "pill ok";
+          instB.textContent = "✓ 導入済み";
+          badgeWrap.appendChild(instB);
         }
         if (m.has_override) {
           const ovb = document.createElement("span");
@@ -2942,16 +3055,68 @@
           });
           llmSel.value = llmPrev;
         }
+        const llmModels = ev.llm_models || [];
+        const hasServer = !!ev.llama_server_path;
+        const hasModels = llmModels.length > 0;
         const rtBadge = $("llmRuntimeBadge");
         if (rtBadge) {
-          rtBadge.textContent = ev.llama_server_path ? "llama-server: 検出済み" : "llama-server: 未導入";
-          rtBadge.className = "pill " + (ev.llama_server_path ? "ok" : "warn");
+          rtBadge.textContent = hasServer ? "① llama-server: 導入済み ✓" : "① llama-server: 未導入";
+          rtBadge.className = "pill " + (hasServer ? "ok" : "warn");
         }
         const cntBadge = $("llmModelCountBadge");
         if (cntBadge) {
-          const cnt = (ev.llm_models || []).length;
-          cntBadge.textContent = `GGUFモデル: ${cnt}件`;
-          cntBadge.className = "pill " + (cnt > 0 ? "ok" : "");
+          cntBadge.textContent = hasModels ? `② GGUFモデル: 導入済み (${llmModels.length}件)` : "② GGUFモデル: 0件 (未導入)";
+          cntBadge.className = "pill " + (hasModels ? "ok" : "warn");
+        }
+        if ($("llmStep1Badge")) {
+          $("llmStep1Badge").textContent = hasServer ? "① 導入済み ✓" : "① 未導入";
+          $("llmStep1Badge").className = "pill " + (hasServer ? "ok" : "warn");
+        }
+        if ($("llmStep1Box")) $("llmStep1Box").classList.toggle("done", hasServer);
+        if ($("llmStep2Badge")) {
+          $("llmStep2Badge").textContent = hasModels ? `② 導入済み ✓ (${llmModels.length}件)` : "② 未導入";
+          $("llmStep2Badge").className = "pill " + (hasModels ? "ok" : "warn");
+        }
+        if ($("llmStep2Box")) $("llmStep2Box").classList.toggle("done", hasModels);
+        if ($("llmPrereqBox")) $("llmPrereqBox").classList.toggle("ready", hasServer && hasModels);
+        if ($("llmPrereqSummary")) {
+          if (hasServer && hasModels) {
+            $("llmPrereqSummary").textContent =
+              `✅ サーバー (llama-server) と モデル (${llmModels.join(", ")}) の両方が揃っています！下の「文脈補正する」にチェックを入れるか「LLMサーバーを起動」で即使えます。`;
+            $("llmPrereqSummary").style.color = "#a7f3c8";
+          } else if (hasServer && !hasModels) {
+            $("llmPrereqSummary").textContent =
+              "⚠ ① llama-server は導入済みです。次は下のボタンから ② GGUFモデル (Qwen3-1.7B 等) を1つ取得してください（モデルなしでは動作しません）。";
+            $("llmPrereqSummary").style.color = "#f6c453";
+          } else if (!hasServer && hasModels) {
+            $("llmPrereqSummary").textContent =
+              `⚠ ② GGUFモデル (${llmModels.length}件) は導入済みです。動かすには ① llama-server (推論サーバー) も導入してください（または Ollama / LM Studio を使用）。`;
+            $("llmPrereqSummary").style.color = "#f6c453";
+          } else {
+            $("llmPrereqSummary").textContent =
+              "※ ① llama-server と ② GGUFモデルの両方を順に導入してください（外部の Ollama / LM Studio を使う場合は右のプリセットから切替可）。";
+            $("llmPrereqSummary").style.color = "#f6c453";
+          }
+        }
+        if ($("btnDownloadLlamaServer")) {
+          $("btnDownloadLlamaServer").textContent = hasServer
+            ? "✓ ① llama-server 導入済み (再取得)"
+            : "① llama-server (Vulkan/CPU) を導入 (~38MB)";
+          $("btnDownloadLlamaServer").className = hasServer ? "btn-success btn-sm" : "btn-primary btn-sm";
+        }
+        const has17b = llmModels.some((n) => n.toLowerCase().includes("1.7b"));
+        if ($("btnDownloadLlm17b")) {
+          $("btnDownloadLlm17b").textContent = has17b
+            ? "✓ ② Qwen3-1.7B 導入済み (再取得)"
+            : "② Qwen3-1.7B 軽量モデルを取得 (~1.1GB)";
+          $("btnDownloadLlm17b").className = has17b ? "btn-success btn-sm" : "btn-secondary btn-sm";
+        }
+        const has4b = llmModels.some((n) => n.toLowerCase().includes("4b"));
+        if ($("btnDownloadLlm4b")) {
+          $("btnDownloadLlm4b").textContent = has4b
+            ? "✓ ② Qwen3-4B 導入済み (再取得)"
+            : "② Qwen3-4B 高精度モデルを取得 (~2.4GB)";
+          $("btnDownloadLlm4b").className = has4b ? "btn-success btn-sm" : "btn-secondary btn-sm";
         }
         break;
       }
@@ -3131,13 +3296,156 @@
         }
         break;
       }
+      case "ThreeStageBenchmarkResult": {
+        const box = $("threeStageBenchBox");
+        if (!box) break;
+        const r = ev.report || {};
+        box.style.display = "block";
+        box.innerHTML = "";
+        const sumDiv = document.createElement("div");
+        sumDiv.innerHTML = `<strong>3段階効果測定レポート</strong> <span class="pill ${r.llm_available ? "ok" : "warn"}">${r.llm_available ? "ローカルLLM計測済" : "LLM未起動(バイパス)"}</span>`;
+        box.appendChild(sumDiv);
+
+        const adv = document.createElement("p");
+        adv.className = "hint";
+        adv.style.margin = "6px 0";
+        adv.textContent = r.advice || "";
+        box.appendChild(adv);
+
+        const tbl = document.createElement("table");
+        tbl.className = "bench3-table";
+        tbl.innerHTML = `<thead><tr><th>段階</th><th>平均CER (低いほど正確)</th><th>完全一致率</th><th>平均処理時間</th><th>改善 / 維持 / 改悪</th></tr></thead><tbody>
+          <tr><td>1. 生STT出力</td><td>${Number(r.avg_raw_cer || 0).toFixed(1)}%</td><td>${Number(r.raw_exact_pct || 0).toFixed(0)}%</td><td>${r.avg_raw_ms || 0} ms</td><td>ベースライン</td></tr>
+          <tr><td>2. 非LLM補正後</td><td>${Number(r.avg_non_llm_cer || 0).toFixed(1)}%</td><td>${Number(r.non_llm_exact_pct || 0).toFixed(0)}%</td><td>${r.avg_non_llm_ms || 0} ms</td><td>+${r.non_llm_improved || 0} / =${r.non_llm_unchanged || 0} / -${r.non_llm_regressed || 0}</td></tr>
+          <tr><td>3. ローカルLLM補正後</td><td>${Number(r.avg_llm_cer || 0).toFixed(1)}%</td><td>${Number(r.llm_exact_pct || 0).toFixed(0)}%</td><td>${r.avg_llm_ms || 0} ms</td><td>+${r.llm_improved || 0} / =${r.llm_unchanged || 0} / -${r.llm_regressed || 0}</td></tr>
+        </tbody>`;
+        box.appendChild(tbl);
+
+        if (Array.isArray(r.cases) && r.cases.length) {
+          const dtbl = document.createElement("table");
+          dtbl.className = "bench3-table";
+          const thead = document.createElement("thead");
+          thead.innerHTML = "<tr><th>ケース / 正解</th><th>1. 生STT</th><th>2. 非LLM</th><th>3. LLM</th></tr>";
+          dtbl.appendChild(thead);
+          const tb = document.createElement("tbody");
+          r.cases.forEach((c) => {
+            const tr = document.createElement("tr");
+            const td0 = document.createElement("td");
+            td0.textContent = `${c.label}: ${c.expected_text}`;
+            const td1 = document.createElement("td");
+            td1.textContent = `${c.raw_text} (CER ${Number(c.raw_cer || 0).toFixed(1)}%)`;
+            const td2 = document.createElement("td");
+            td2.className = c.non_llm_delta === "improved" ? "diff-improved" : c.non_llm_delta === "regressed" ? "diff-regressed" : "";
+            td2.textContent = `${c.non_llm_text} (CER ${Number(c.non_llm_cer || 0).toFixed(1)}%)`;
+            const td3 = document.createElement("td");
+            td3.className = c.llm_delta === "improved" ? "diff-improved" : c.llm_delta === "regressed" ? "diff-regressed" : "";
+            td3.textContent = `${c.llm_text} (CER ${Number(c.llm_cer || 0).toFixed(1)}%)`;
+            tr.appendChild(td0);
+            tr.appendChild(td1);
+            tr.appendChild(td2);
+            tr.appendChild(td3);
+            tb.appendChild(tr);
+          });
+          dtbl.appendChild(tb);
+          box.appendChild(dtbl);
+        }
+        break;
+      }
+      case "ImeDictionaryPreview": {
+        const box = $("imePreviewBox");
+        if (!box) break;
+        box.style.display = "block";
+        box.innerHTML = "";
+        const hdr = document.createElement("div");
+        hdr.className = "row space-between";
+        const msg = document.createElement("strong");
+        msg.textContent = ev.message || "";
+        const closeBtn = document.createElement("button");
+        closeBtn.type = "button";
+        closeBtn.className = "btn-secondary btn-sm";
+        closeBtn.textContent = "閉じる";
+        closeBtn.addEventListener("click", () => {
+          box.style.display = "none";
+        });
+        hdr.appendChild(msg);
+        hdr.appendChild(closeBtn);
+        box.appendChild(hdr);
+
+        if (!ev.ok || !Array.isArray(ev.entries) || !ev.entries.length) {
+          if (!ev.ok) showToast(ev.message || "IME辞書解析失敗", "error");
+          break;
+        }
+        const list = document.createElement("div");
+        list.className = "ime-preview-list";
+        const checks = [];
+        ev.entries.forEach((ent) => {
+          const lbl = document.createElement("label");
+          lbl.className = "checkbox-row small-check";
+          const chk = document.createElement("input");
+          chk.type = "checkbox";
+          chk.checked = !ent.is_duplicate;
+          checks.push({ chk, entry: { from: ent.reading, to: ent.word } });
+          const sp = document.createElement("span");
+          sp.textContent = `${ent.reading} → ${ent.word} (${ent.pos || "名詞"})${ent.is_duplicate ? " [既存重複]" : ""}`;
+          lbl.appendChild(chk);
+          lbl.appendChild(sp);
+          list.appendChild(lbl);
+        });
+        box.appendChild(list);
+
+        const act = document.createElement("div");
+        act.className = "row gap-sm";
+        const impBtn = document.createElement("button");
+        impBtn.type = "button";
+        impBtn.className = "btn-primary btn-sm";
+        impBtn.textContent = "選択した語句を辞書へ一括取り込み";
+        impBtn.addEventListener("click", () => {
+          const picked = checks.filter((c) => c.chk.checked).map((c) => c.entry);
+          if (!picked.length) {
+            showToast("取り込む項目が選択されていません", "info");
+            return;
+          }
+          send({ type: "ImportImeEntries", entries: picked });
+          box.style.display = "none";
+        });
+        act.appendChild(impBtn);
+        box.appendChild(act);
+        break;
+      }
+      case "PersonalNgramStatus": {
+        if ($("ngramStatusLabel")) {
+          $("ngramStatusLabel").textContent = `N-gram: ${ev.entry_count || 0}語 (${ev.total_tokens || 0}件観測)`;
+        }
+        break;
+      }
+      case "SpeakerProfileStatus": {
+        const b = $("speakerStatusBadge");
+        if (b) {
+          if (ev.enrolling) {
+            b.textContent = "声紋: 録音中...";
+            b.className = "pill active";
+          } else if (ev.enrolled) {
+            b.textContent = `声紋: 登録済 (${Number(ev.sample_seconds || 0).toFixed(1)}s)`;
+            b.className = "pill ok";
+          } else if (ev.model_installed) {
+            b.textContent = "声紋: 未登録 (モデル有)";
+            b.className = "pill warn";
+          } else {
+            b.textContent = "声紋: モデル未導入";
+            b.className = "pill";
+          }
+          b.title = ev.message || "";
+        }
+        break;
+      }
       case "AutoTunerResult": {
         const p = ev.proposal || {};
         const box = $("autoTunerProposalBox");
         if (box) {
           box.className = "ab-result show";
           const dpdfDb = Number(p.best_dpdfnet_db != null ? p.best_dpdfnet_db : 12);
-          box.innerHTML = `提案 (${p.tested_cases || 0}件評価 / 一致 ${(Number(p.avg_similarity || 0) * 100).toFixed(1)}%): EQ=${Number(p.best_eq_strength || 0).toFixed(2)}, WSOLA=${Number(p.best_wsola_rate || 1).toFixed(2)}x, Beam=${p.best_beam_size || 3}, DPDFNet=${dpdfDb}dB <button type="button" class="btn-primary btn-sm" id="btnApplyTuner">この設定を適用</button>`;
+          const debox = Number(p.best_room_debox_strength != null ? p.best_room_debox_strength : 0.35);
+          box.innerHTML = `提案 (${p.tested_cases || 0}件評価 / 一致 ${(Number(p.avg_similarity || 0) * 100).toFixed(1)}%): EQ=${Number(p.best_eq_strength || 0).toFixed(2)}, Debox=${debox.toFixed(2)}, WSOLA=${Number(p.best_wsola_rate || 1).toFixed(2)}x, Beam=${p.best_beam_size || 3}, DPDFNet=${dpdfDb}dB <button type="button" class="btn-primary btn-sm" id="btnApplyTuner">この設定を適用</button>`;
           const b = $("btnApplyTuner");
           if (b) {
             b.addEventListener("click", () => {
@@ -3147,6 +3455,7 @@
                 wsola_rate: p.best_wsola_rate,
                 beam_size: p.best_beam_size,
                 dpdfnet_db: dpdfDb,
+                room_debox_strength: debox,
               });
             });
           }
@@ -3228,5 +3537,7 @@
   send({ type: "ListSttModels" });
   send({ type: "GetCatalogInventory" });
   send({ type: "GetStats" });
+  send({ type: "GetNgramStatus" });
+  send({ type: "GetSpeakerProfileStatus" });
   send({ type: "CheckAppUpdate" });
 })();

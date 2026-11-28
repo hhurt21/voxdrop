@@ -16,7 +16,7 @@ use windows::Win32::Networking::WinHttp::{
     WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_FLAG_SECURE,
 };
 
-pub const CURRENT_APP_TAG: &str = "v1.7.6";
+pub const CURRENT_APP_TAG: &str = "v1.8.0";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -166,6 +166,154 @@ pub struct BenchmarkCaseResult {
     pub infer_ms: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreeStageBenchCaseResult {
+    pub id: String,
+    pub label: String,
+    pub expected_text: String,
+    pub raw_text: String,
+    pub raw_cer: f32,
+    pub raw_ms: u64,
+    pub non_llm_text: String,
+    pub non_llm_cer: f32,
+    pub non_llm_ms: u64,
+    pub non_llm_delta: String,
+    pub llm_text: String,
+    pub llm_cer: f32,
+    pub llm_ms: u64,
+    pub llm_delta: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreeStageBenchmarkReport {
+    pub cases: Vec<ThreeStageBenchCaseResult>,
+    pub avg_raw_cer: f32,
+    pub avg_non_llm_cer: f32,
+    pub avg_llm_cer: f32,
+    pub raw_exact_pct: f32,
+    pub non_llm_exact_pct: f32,
+    pub llm_exact_pct: f32,
+    pub avg_raw_ms: u64,
+    pub avg_non_llm_ms: u64,
+    pub avg_llm_ms: u64,
+    pub non_llm_improved: usize,
+    pub non_llm_unchanged: usize,
+    pub non_llm_regressed: usize,
+    pub llm_improved: usize,
+    pub llm_unchanged: usize,
+    pub llm_regressed: usize,
+    pub llm_available: bool,
+    pub advice: String,
+}
+
+/// Computes Japanese Character Error Rate (CER %) ignoring whitespace differences (#6).
+pub fn char_error_rate(hypothesis: &str, reference: &str) -> f32 {
+    let h: String = hypothesis.chars().filter(|c| !c.is_whitespace()).collect();
+    let r: String = reference.chars().filter(|c| !c.is_whitespace()).collect();
+    let r_len = r.chars().count();
+    if r_len == 0 {
+        return if h.is_empty() { 0.0 } else { 100.0 };
+    }
+    let dist = crate::processor::phonetic::levenshtein_chars(&h, &r);
+    (dist as f32 / r_len as f32) * 100.0
+}
+
+pub fn stage_delta_label(base_cer: f32, next_cer: f32) -> String {
+    if next_cer + 0.01 < base_cer {
+        "improved".into()
+    } else if next_cer > base_cer + 0.01 {
+        "regressed".into()
+    } else {
+        "unchanged".into()
+    }
+}
+
+pub fn compute_three_stage_report(
+    cases: Vec<ThreeStageBenchCaseResult>,
+    llm_available: bool,
+) -> ThreeStageBenchmarkReport {
+    let n = cases.len().max(1) as f32;
+    let avg_raw_cer = cases.iter().map(|c| c.raw_cer).sum::<f32>() / n;
+    let avg_non_llm_cer = cases.iter().map(|c| c.non_llm_cer).sum::<f32>() / n;
+    let avg_llm_cer = cases.iter().map(|c| c.llm_cer).sum::<f32>() / n;
+
+    let exact_cnt = |f: fn(&ThreeStageBenchCaseResult) -> f32| -> f32 {
+        (cases.iter().filter(|c| f(c) < 0.01).count() as f32 / n) * 100.0
+    };
+    let raw_exact_pct = if cases.is_empty() { 0.0 } else { exact_cnt(|c| c.raw_cer) };
+    let non_llm_exact_pct = if cases.is_empty() { 0.0 } else { exact_cnt(|c| c.non_llm_cer) };
+    let llm_exact_pct = if cases.is_empty() { 0.0 } else { exact_cnt(|c| c.llm_cer) };
+
+    let avg_raw_ms = (cases.iter().map(|c| c.raw_ms).sum::<u64>() as f32 / n).round() as u64;
+    let avg_non_llm_ms = (cases.iter().map(|c| c.non_llm_ms).sum::<u64>() as f32 / n).round() as u64;
+    let avg_llm_ms = (cases.iter().map(|c| c.llm_ms).sum::<u64>() as f32 / n).round() as u64;
+
+    let non_llm_improved = cases.iter().filter(|c| c.non_llm_delta == "improved").count();
+    let non_llm_unchanged = cases.iter().filter(|c| c.non_llm_delta == "unchanged").count();
+    let non_llm_regressed = cases.iter().filter(|c| c.non_llm_delta == "regressed").count();
+
+    let llm_improved = cases.iter().filter(|c| c.llm_delta == "improved").count();
+    let llm_unchanged = cases.iter().filter(|c| c.llm_delta == "unchanged").count();
+    let llm_regressed = cases.iter().filter(|c| c.llm_delta == "regressed").count();
+
+    let advice = if cases.is_empty() {
+        "保存されたベンチマークWAVがありません。音声診断タブから「ベンチ保存」を行ってください。".into()
+    } else if !llm_available {
+        format!(
+            "非LLM補正のみで CER が {:.1}% → {:.1}%（改善 {}件 / 改悪 {}件, 追加遅延 +{}ms）。ローカルLLMサーバー未起動のため Stage 3 はバイパスされました。",
+            avg_raw_cer,
+            avg_non_llm_cer,
+            non_llm_improved,
+            non_llm_regressed,
+            avg_non_llm_ms.saturating_sub(avg_raw_ms)
+        )
+    } else if avg_llm_cer + 0.3 < avg_non_llm_cer {
+        format!(
+            "非LLM補正で CER {:.1}% → {:.1}% に改善。ローカルLLMはさらに {:.1}% まで改善しました（改善 {}件 / 改悪 {}件, LLM追加遅延 +{}ms）。",
+            avg_raw_cer,
+            avg_non_llm_cer,
+            avg_llm_cer,
+            llm_improved,
+            llm_regressed,
+            avg_llm_ms.saturating_sub(avg_non_llm_ms)
+        )
+    } else if avg_llm_cer > avg_non_llm_cer + 0.5 {
+        format!(
+            "非LLM補正のみで CER {:.1}% → {:.1}% に改善！現在の設定ではローカルLLMが過補正傾向（CER {:.1}% / 改悪 {}件）のため、オフまたは辞書強化を推奨します。",
+            avg_raw_cer, avg_non_llm_cer, avg_llm_cer, llm_regressed
+        )
+    } else {
+        format!(
+            "非LLM補正のみで CER {:.1}% → {:.1}% まで十分改善（ローカルLLM時 {:.1}%, +{}ms）。通常は非LLM運用で超低遅延と高精度を両立できます。",
+            avg_raw_cer,
+            avg_non_llm_cer,
+            avg_llm_cer,
+            avg_llm_ms.saturating_sub(avg_non_llm_ms)
+        )
+    };
+
+    ThreeStageBenchmarkReport {
+        cases,
+        avg_raw_cer: if avg_raw_cer.is_nan() { 0.0 } else { avg_raw_cer },
+        avg_non_llm_cer: if avg_non_llm_cer.is_nan() { 0.0 } else { avg_non_llm_cer },
+        avg_llm_cer: if avg_llm_cer.is_nan() { 0.0 } else { avg_llm_cer },
+        raw_exact_pct,
+        non_llm_exact_pct,
+        llm_exact_pct,
+        avg_raw_ms,
+        avg_non_llm_ms,
+        avg_llm_ms,
+        non_llm_improved,
+        non_llm_unchanged,
+        non_llm_regressed,
+        llm_improved,
+        llm_unchanged,
+        llm_regressed,
+        llm_available,
+        advice,
+    }
+}
+
 pub fn bench_dir() -> PathBuf {
     AppConfig::app_data_dir().join("bench_wavs")
 }
@@ -217,6 +365,7 @@ pub fn read_f32_wav_16k(path: &Path) -> Result<Vec<f32>, String> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutoTunerProposal {
     pub best_eq_strength: f32,
+    pub best_room_debox_strength: f32,
     pub best_wsola_rate: f32,
     pub best_beam_size: i32,
     pub best_dpdfnet_db: f32,
@@ -224,7 +373,7 @@ pub struct AutoTunerProposal {
     pub tested_cases: usize,
 }
 
-/// Grid-searches optimal `(eq_strength, wsola_rate, beam_size, dpdfnet_db)` against saved hard WAV cases (#38).
+/// Grid-searches optimal `(eq_strength, room_debox_strength, wsola_rate, beam_size, dpdfnet_db)` against saved hard WAV cases (#9 + #38).
 pub fn run_auto_parameter_tuner(
     cases: &[BenchmarkCase],
     engine: &dyn SttEngine,
@@ -246,18 +395,19 @@ pub fn run_auto_parameter_tuner(
         return Err("有効なベンチマークWAVファイルを読み込めませんでした".into());
     }
 
-    let candidates: &[(f32, f32, i32, f32)] = &[
-        (0.35, 1.00, 3, 12.0),
-        (0.55, 0.90, 5, 12.0),
-        (0.75, 0.85, 5, 16.0),
-        (0.20, 0.85, 5, 18.0),
+    let candidates: &[(f32, f32, f32, i32, f32)] = &[
+        (0.35, 0.20, 1.00, 3, 12.0),
+        (0.55, 0.40, 0.90, 5, 12.0),
+        (0.75, 0.60, 0.85, 5, 16.0),
+        (0.20, 0.00, 0.85, 5, 18.0),
     ];
 
     let mut best: Option<AutoTunerProposal> = None;
-    for &(eq, wsola_r, beam, dpdf_db) in candidates {
+    for &(eq, debox, wsola_r, beam, dpdf_db) in candidates {
         let mut sum_sim = 0.0f32;
         let mut ctx = base_ctx.clone();
         ctx.eq_strength = eq;
+        ctx.room_debox_strength = debox;
         ctx.beam_size = beam;
         for (c, samples) in &loaded {
             let base_in = if dpdf_db <= 14.0 {
@@ -281,6 +431,7 @@ pub fn run_auto_parameter_tuner(
         if best.as_ref().map(|b| avg > b.avg_similarity).unwrap_or(true) {
             best = Some(AutoTunerProposal {
                 best_eq_strength: eq,
+                best_room_debox_strength: debox,
                 best_wsola_rate: wsola_r,
                 best_beam_size: beam,
                 best_dpdfnet_db: dpdf_db,
@@ -417,5 +568,51 @@ mod tests {
         let (cfg_back, st_back) = import_backup_json(&json).unwrap();
         assert_eq!(cfg, cfg_back);
         assert_eq!(st_back.unwrap().total_utterances, 1);
+    }
+
+    #[test]
+    fn computes_cer_and_three_stage_benchmark_improvements() {
+        assert!((char_error_rate("輝晶獣", "輝晶獣") - 0.0).abs() < 0.01);
+        assert!((char_error_rate("気象獣", "輝晶獣") - 66.666).abs() < 0.5);
+
+        let c1 = ThreeStageBenchCaseResult {
+            id: "1".into(),
+            label: "case1".into(),
+            expected_text: "輝晶獣".into(),
+            raw_text: "気象獣".into(),
+            raw_cer: char_error_rate("気象獣", "輝晶獣"),
+            raw_ms: 150,
+            non_llm_text: "輝晶獣".into(),
+            non_llm_cer: char_error_rate("輝晶獣", "輝晶獣"),
+            non_llm_ms: 152,
+            non_llm_delta: stage_delta_label(66.6, 0.0),
+            llm_text: "輝晶獣".into(),
+            llm_cer: 0.0,
+            llm_ms: 350,
+            llm_delta: stage_delta_label(66.6, 0.0),
+        };
+        let c2 = ThreeStageBenchCaseResult {
+            id: "2".into(),
+            label: "case2".into(),
+            expected_text: "了解".into(),
+            raw_text: "了解".into(),
+            raw_cer: 0.0,
+            raw_ms: 120,
+            non_llm_text: "了解".into(),
+            non_llm_cer: 0.0,
+            non_llm_ms: 121,
+            non_llm_delta: stage_delta_label(0.0, 0.0),
+            llm_text: "了解しました".into(),
+            llm_cer: char_error_rate("了解しました", "了解"),
+            llm_ms: 300,
+            llm_delta: stage_delta_label(0.0, 200.0),
+        };
+        let rep = compute_three_stage_report(vec![c1, c2], true);
+        assert_eq!(rep.non_llm_improved, 1);
+        assert_eq!(rep.non_llm_unchanged, 1);
+        assert_eq!(rep.non_llm_regressed, 0);
+        assert_eq!(rep.llm_improved, 1);
+        assert_eq!(rep.llm_regressed, 1);
+        assert!(rep.avg_non_llm_cer < rep.avg_raw_cer);
     }
 }

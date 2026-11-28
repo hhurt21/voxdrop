@@ -1,3 +1,4 @@
+use crate::audio::aec::{start_loopback_reference_stream, LoopbackRefBuffer, NlmsEchoCanceller};
 use crate::audio::denoise::{AudioDenoiser, RNNOISE_SAMPLE_RATE};
 use crate::audio::silero_vad::SileroVadDetector;
 use crate::audio::vad::{VadEvent, VadSegmenter};
@@ -264,6 +265,8 @@ impl AudioController {
             let mut runtime_dir: Option<PathBuf> = None;
             let mut silero_model_path = initial_vad.silero_model_path.clone();
             let vad_shared = Arc::new(Mutex::new(VadSegmenter::new(initial_vad)));
+            let aec_enabled_flag = Arc::new(AtomicBool::new(initial_nc.aec_enabled));
+            let aec_strength_val = initial_nc.aec_strength;
             let denoiser_shared = Arc::new(Mutex::new(AudioDenoiser::new(initial_nc)));
             let silero_shared = Arc::new(Mutex::new(SileroVadDetector::discover(
                 &silero_model_path,
@@ -272,6 +275,10 @@ impl AudioController {
             let listening_flag = Arc::new(AtomicBool::new(false));
             let preview_interval_ms = Arc::new(std::sync::atomic::AtomicU64::new(1700));
             let mut active_stream: Option<Stream> = None;
+            let mut loopback_stream: Option<Stream> = None;
+            let aec_ref_buf = Arc::new(Mutex::new(LoopbackRefBuffer::default()));
+            let aec_vad = Arc::new(Mutex::new(NlmsEchoCanceller::new(aec_strength_val)));
+            let aec_stt = Arc::new(Mutex::new(NlmsEchoCanceller::new(aec_strength_val)));
             let self_tx = thread_tx.clone();
 
             let open_with_fallback = |pref: Option<&str>, fbs: &[String]| -> Result<(Stream, String), String> {
@@ -282,6 +289,10 @@ impl AudioController {
                     silero_shared.clone(),
                     listening_flag.clone(),
                     preview_interval_ms.clone(),
+                    aec_enabled_flag.clone(),
+                    aec_ref_buf.clone(),
+                    aec_vad.clone(),
+                    aec_stt.clone(),
                     callback.clone(),
                     self_tx.clone(),
                 ) {
@@ -298,6 +309,10 @@ impl AudioController {
                                 silero_shared.clone(),
                                 listening_flag.clone(),
                                 preview_interval_ms.clone(),
+                                aec_enabled_flag.clone(),
+                                aec_ref_buf.clone(),
+                                aec_vad.clone(),
+                                aec_stt.clone(),
                                 callback.clone(),
                                 self_tx.clone(),
                             ) {
@@ -316,6 +331,10 @@ impl AudioController {
                                 silero_shared.clone(),
                                 listening_flag.clone(),
                                 preview_interval_ms.clone(),
+                                aec_enabled_flag.clone(),
+                                aec_ref_buf.clone(),
+                                aec_vad.clone(),
+                                aec_stt.clone(),
                                 callback.clone(),
                                 self_tx.clone(),
                             ) {
@@ -360,6 +379,12 @@ impl AudioController {
                             match open_with_fallback(device_name.as_deref(), &fallbacks) {
                                 Ok((s, _actual)) => {
                                     drop(active_stream.replace(s));
+                                    if aec_enabled_flag.load(Ordering::Relaxed)
+                                        && loopback_stream.is_none()
+                                    {
+                                        loopback_stream =
+                                            start_loopback_reference_stream(aec_ref_buf.clone());
+                                    }
                                 }
                                 Err(err) => {
                                     active = false;
@@ -378,6 +403,10 @@ impl AudioController {
                                 if let Some(ref mut det) = *s {
                                     det.reset();
                                 }
+                            }
+                            drop(loopback_stream.take());
+                            if let Ok(mut rb) = aec_ref_buf.lock() {
+                                rb.clear();
                             }
                             drop(active_stream.take());
                             let rn_enabled = denoiser_shared
@@ -468,6 +497,27 @@ impl AudioController {
                         }
                     }
                     ControlMsg::UpdateNoiseCancel(cfg) => {
+                        aec_enabled_flag.store(cfg.aec_enabled, Ordering::Relaxed);
+                        if let Ok(mut a) = aec_vad.lock() {
+                            a.set_strength(cfg.aec_strength);
+                            if !cfg.aec_enabled {
+                                a.reset();
+                            }
+                        }
+                        if let Ok(mut a) = aec_stt.lock() {
+                            a.set_strength(cfg.aec_strength);
+                            if !cfg.aec_enabled {
+                                a.reset();
+                            }
+                        }
+                        if cfg.aec_enabled && active && loopback_stream.is_none() {
+                            loopback_stream = start_loopback_reference_stream(aec_ref_buf.clone());
+                        } else if !cfg.aec_enabled {
+                            drop(loopback_stream.take());
+                            if let Ok(mut rb) = aec_ref_buf.lock() {
+                                rb.clear();
+                            }
+                        }
                         if let Ok(mut d) = denoiser_shared.lock() {
                             d.update_config(cfg);
                         }
@@ -486,6 +536,7 @@ impl AudioController {
                     }
                     ControlMsg::Shutdown => {
                         listening_flag.store(false, Ordering::SeqCst);
+                        drop(loopback_stream.take());
                         drop(active_stream.take());
                         break;
                     }
@@ -552,6 +603,7 @@ fn find_input_device(preferred_name: Option<&str>) -> Result<Device, String> {
         .ok_or_else(|| "利用可能なマイク入力デバイスが見つかりません".to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_stream<F>(
     preferred_device: Option<&str>,
     vad_shared: Arc<Mutex<VadSegmenter>>,
@@ -559,6 +611,10 @@ fn start_stream<F>(
     silero_shared: Arc<Mutex<Option<SileroVadDetector>>>,
     listening_flag: Arc<AtomicBool>,
     preview_interval_ms: Arc<std::sync::atomic::AtomicU64>,
+    aec_enabled_flag: Arc<AtomicBool>,
+    aec_ref_buf: Arc<Mutex<LoopbackRefBuffer>>,
+    aec_vad: Arc<Mutex<NlmsEchoCanceller>>,
+    aec_stt: Arc<Mutex<NlmsEchoCanceller>>,
     callback: Arc<F>,
     ctrl_tx: mpsc::Sender<ControlMsg>,
 ) -> Result<(Stream, String), String>
@@ -597,6 +653,10 @@ where
         let to_16k_stt = to_16k_stt.clone();
         let last_meter = last_meter.clone();
         let tts_echo_muted = tts_echo_muted.clone();
+        let aec_enabled_flag = aec_enabled_flag.clone();
+        let aec_ref_buf = aec_ref_buf.clone();
+        let aec_vad = aec_vad.clone();
+        let aec_stt = aec_stt.clone();
         move |interleaved: &[f32]| {
             if !listening_flag.load(Ordering::Relaxed) {
                 return;
@@ -659,16 +719,32 @@ where
                 return;
             }
 
-            let vad_16k = match to_16k_vad.lock() {
+            let mut vad_16k = match to_16k_vad.lock() {
                 Ok(mut r) => r.process(&vad_48k),
                 Err(_) => return,
             };
-            let stt_16k = match to_16k_stt.lock() {
+            let mut stt_16k = match to_16k_stt.lock() {
                 Ok(mut r) => r.process(&stt_48k),
                 Err(_) => return,
             };
             if vad_16k.is_empty() {
                 return;
+            }
+
+            if aec_enabled_flag.load(Ordering::Relaxed) {
+                let ref_tail = aec_ref_buf
+                    .lock()
+                    .ok()
+                    .map(|mut b| b.take_tail_aligned(vad_16k.len()))
+                    .unwrap_or_default();
+                if !ref_tail.is_empty() {
+                    if let Ok(mut a) = aec_vad.lock() {
+                        a.process_in_place(&mut vad_16k, &ref_tail);
+                    }
+                    if let Ok(mut a) = aec_stt.lock() {
+                        a.process_in_place(&mut stt_16k, &ref_tail);
+                    }
+                }
             }
 
             let silero_speech = match silero_shared.lock() {

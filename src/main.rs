@@ -99,8 +99,13 @@ enum UserEvent {
         rtf: f32,
         engine_label: String,
         device_name: String,
+        low_conf_spans: Vec<(usize, usize)>,
+        speaker_similarity: Option<f32>,
+        speaker_rejected: bool,
         result: Result<String, String>,
     },
+    ThreeStageBenchDone(stats::ThreeStageBenchmarkReport),
+    SpeakerEnrollDone(Result<audio::speaker_id::SpeakerProfile, String>),
     AbCompareDone {
         id: u64,
         engine_label: String,
@@ -182,6 +187,8 @@ enum SttWorkerMsg {
         game_name: Option<String>,
         dict: Vec<DictionaryEntry>,
         speech_style: SpeechStyle,
+        speaker_profile: Option<audio::speaker_id::SpeakerProfile>,
+        personal_ngram: Option<processor::ngram::PersonalNgramModel>,
     },
     TranscribePreview {
         samples: Vec<f32>,
@@ -340,9 +347,13 @@ fn build_stt_prompt_hints_with_ctx(
             push_term(p);
         }
     }
-    if cfg.stt.accuracy.context_prompt_injection {
-        for msg in recent_msgs.iter().rev().take(2) {
-            let short: String = msg.chars().take(22).collect();
+    if cfg.stt.accuracy.context_prompt_injection && !recent_msgs.is_empty() {
+        let joined: String = recent_msgs.iter().rev().take(3).cloned().collect::<Vec<_>>().join(" ");
+        for kw in processor::phonetic::extract_keywords_for_prompt(&joined, 8) {
+            push_term(&kw);
+        }
+        for msg in recent_msgs.iter().rev().take(1) {
+            let short: String = msg.chars().take(18).collect();
             push_term(&short);
         }
     }
@@ -439,6 +450,7 @@ struct UtteranceDiagnostic {
     engine_label: String,
     raw_text: String,
     final_text: String,
+    speaker_similarity: Option<f32>,
 }
 
 impl UtteranceDiagnostic {
@@ -454,6 +466,7 @@ impl UtteranceDiagnostic {
             engine_label: self.engine_label.clone(),
             raw_text: self.raw_text.clone(),
             final_text: self.final_text.clone(),
+            speaker_similarity: self.speaker_similarity,
         }
     }
 }
@@ -509,6 +522,13 @@ struct AppState {
     win_poll_ticks: u32,
     model_health_map: std::collections::BTreeMap<String, stt::catalog::ModelUrlHealthDto>,
     last_preset_snapshot: Option<stt::catalog::PresetRollbackSnapshot>,
+    personal_ngram: processor::ngram::PersonalNgramModel,
+    ngram_path: PathBuf,
+    speaker_profile: Option<audio::speaker_id::SpeakerProfile>,
+    speaker_profile_path: PathBuf,
+    speaker_enroll_active: bool,
+    speaker_enroll_buf: Vec<f32>,
+    pending_low_conf_spans: Vec<(usize, usize)>,
 }
 
 impl AppState {
@@ -526,6 +546,10 @@ impl AppState {
         let stats_path = stats::StatsStore::default_path();
         let stats = stats::StatsStore::load_from(&stats_path);
         let bench_cases = stats::load_benchmark_cases(&stats::bench_dir());
+        let ngram_path = processor::ngram::PersonalNgramModel::default_path();
+        let personal_ngram = processor::ngram::PersonalNgramModel::load_from(&ngram_path);
+        let speaker_profile_path = audio::speaker_id::SpeakerProfile::default_path();
+        let speaker_profile = audio::speaker_id::SpeakerProfile::load_from(&speaker_profile_path);
         Self {
             config,
             config_path,
@@ -569,6 +593,13 @@ impl AppState {
             win_poll_ticks: 0,
             model_health_map: std::collections::BTreeMap::new(),
             last_preset_snapshot: None,
+            personal_ngram,
+            ngram_path,
+            speaker_profile,
+            speaker_profile_path,
+            speaker_enroll_active: false,
+            speaker_enroll_buf: Vec::new(),
+            pending_low_conf_spans: Vec::new(),
         }
     }
 
@@ -598,6 +629,10 @@ impl AppState {
             self.recent_sent_texts.pop_front();
         }
         self.recent_sent_texts.push_back((t.to_string(), Instant::now()));
+        if self.config.stt.accuracy.personal_ngram_enabled {
+            self.personal_ngram.observe_text(t);
+            self.personal_ngram.save_to(&self.ngram_path);
+        }
     }
 
     fn active_profile(&self) -> Option<&GameProfile> {
@@ -660,6 +695,7 @@ impl AppState {
         engine_label: String,
         raw_text: String,
         final_text: String,
+        speaker_similarity: Option<f32>,
     ) {
         let id = self.next_diag_id;
         self.next_diag_id += 1;
@@ -678,11 +714,31 @@ impl AppState {
             engine_label,
             raw_text,
             final_text,
+            speaker_similarity,
         });
     }
 
     fn diagnostic_dtos(&self) -> Vec<UtteranceDiagnosticDto> {
         self.recent_utterances.iter().map(|d| d.to_dto()).collect()
+    }
+
+    fn speaker_profile_status(&self, model_installed: bool, message: String) -> BackendEvent {
+        BackendEvent::SpeakerProfileStatus {
+            enrolled: self.speaker_profile.is_some(),
+            model_installed,
+            enrolling: self.speaker_enroll_active,
+            sample_seconds: self
+                .speaker_profile
+                .as_ref()
+                .map(|p| p.sample_seconds)
+                .unwrap_or(0.0),
+            created_at: self
+                .speaker_profile
+                .as_ref()
+                .map(|p| p.created_at.clone())
+                .unwrap_or_default(),
+            message,
+        }
     }
 
     fn active_discord_target(&self) -> Option<DiscordTarget> {
@@ -824,6 +880,8 @@ fn spawn_stt_worker(
         let mut engine = initial_engine;
         let mut denoiser_cache: Option<(String, Option<Arc<stt::sherpa_ffi::ResidentSherpaDenoiser>>)> =
             None;
+        let mut speaker_cache: Option<(String, Option<Arc<stt::sherpa_ffi::ResidentSpeakerExtractor>>)> =
+            None;
         let mut secondary_cache: Option<(String, Arc<dyn SttEngine>)> = None;
 
         while let Ok(msg) = rx.recv() {
@@ -841,6 +899,8 @@ fn spawn_stt_worker(
                     game_name,
                     dict,
                     speech_style,
+                    speaker_profile,
+                    personal_ngram,
                 } => {
                     let duration_sec = samples.len() as f32 / 16_000.0;
                     let peak_dbfs = compute_peak_dbfs(&samples);
@@ -878,6 +938,62 @@ fn spawn_stt_worker(
                         samples.clone()
                     };
 
+                    // Layer 1.5 (#8): Own Voiceprint Speaker Verification Filter (optional)
+                    let mut speaker_similarity: Option<f32> = None;
+                    if accuracy.speaker_verify_enabled {
+                        if let Some(ref prof) = speaker_profile {
+                            let s_key = format!("{}|{}", stt_cfg.model_dir, accuracy.speaker_model_file);
+                            let spk_opt = match speaker_cache {
+                                Some((ref k, ref e)) if k == &s_key => e.clone(),
+                                _ => {
+                                    let loaded = stt::local::discover_speaker_extractor(
+                                        &stt_cfg,
+                                        runtime_dir.as_deref(),
+                                        &accuracy.speaker_model_file,
+                                    );
+                                    speaker_cache = Some((s_key, loaded.clone()));
+                                    loaded
+                                }
+                            };
+                            if let Some(ref spk) = spk_opt {
+                                if let Ok(sim) = audio::speaker_id::verify_speaker_similarity(
+                                    spk.as_ref(),
+                                    prof,
+                                    &denoised_samples,
+                                ) {
+                                    speaker_similarity = Some(sim);
+                                    if sim < accuracy.speaker_verify_threshold {
+                                        let infer_ms = t0.elapsed().as_millis() as u64;
+                                        let rtf = if duration_sec > 0.01 {
+                                            (infer_ms as f32 / 1000.0) / duration_sec
+                                        } else {
+                                            0.0
+                                        };
+                                        if proxy
+                                            .send_event(UserEvent::TranscriptReady {
+                                                samples_16k: samples,
+                                                duration_sec,
+                                                peak_dbfs,
+                                                infer_ms,
+                                                rtf,
+                                                engine_label: engine.name(),
+                                                device_name: engine.device_name(),
+                                                low_conf_spans: Vec::new(),
+                                                speaker_similarity: Some(sim),
+                                                speaker_rejected: true,
+                                                result: Ok(String::new()),
+                                            })
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Layer 2 (#1): WSOLA pitch-preserving slow stretch when speech is fast
                     let tempo = crate::audio::enhance::estimate_speech_tempo_score(&denoised_samples);
                     let use_wsola = accuracy.wsola_enabled
@@ -889,9 +1005,9 @@ fn spawn_stt_worker(
                         denoised_samples.clone()
                     };
 
-                    // Layer 2+4 (#35 + #38): Overlap chunking + Beam Search + Temperature Fallback
+                    // Layer 2+4 (#35 + #38 + #2): Overlap chunking + Beam Search + Per-token Probabilities
                     let primary_res = if accuracy.overlap_chunking_enabled {
-                        stt::ensemble::transcribe_with_overlap(
+                        stt::ensemble::transcribe_with_overlap_confidence(
                             engine.as_ref(),
                             &wsola_input,
                             &ctx,
@@ -899,16 +1015,30 @@ fn spawn_stt_worker(
                             accuracy.overlap_sec,
                         )
                     } else {
-                        engine.transcribe_with_context(&wsola_input, &ctx)
+                        engine.transcribe_with_confidence(&wsola_input, &ctx)
                     };
 
-                    let mut final_res = primary_res;
+                    let mut final_text_res: Result<String, String> =
+                        primary_res.as_ref().map(|r| r.text.clone()).map_err(|e| e.clone());
+                    let mut low_conf_spans: Vec<(usize, usize)> = Vec::new();
+                    let mut annotated_for_llm: Option<String> = None;
                     let mut secondary_text: Option<String> = None;
 
-                    // Layer 4 (#6, #34): 2-pass low-confidence rescue or Ultimate Dual-Engine Ensemble
-                    if let Ok(ref p_txt) = final_res {
-                        let needs_rescue =
-                            accuracy.two_pass_rescue && stt::ensemble::looks_low_confidence(p_txt, duration_sec);
+                    // Layer 4 (#6, #34, #2, #3): Token confidence + Morpheme ROVER Consensus
+                    if let Ok(ref p_conf) = primary_res {
+                        let (ann, spans) = stt::whisper_ffi::annotate_low_confidence_tokens(
+                            &p_conf.text,
+                            &p_conf.tokens,
+                            0.65,
+                        );
+                        low_conf_spans = spans;
+                        if ann != p_conf.text {
+                            annotated_for_llm = Some(ann);
+                        }
+
+                        let needs_rescue = accuracy.two_pass_rescue
+                            && (p_conf.avg_prob < 0.55
+                                || stt::ensemble::looks_low_confidence(&p_conf.text, duration_sec));
                         if accuracy.ultimate_ensemble || needs_rescue {
                             let _ = proxy.send_event(UserEvent::PhaseUpdate("rescuing".into()));
                             let sec_eng_id = accuracy.secondary_engine.trim();
@@ -941,12 +1071,14 @@ fn spawn_stt_worker(
                                 if let Ok(s_txt) = sec_eng.transcribe_with_context(&wsola_input, &ctx) {
                                     secondary_text = Some(s_txt.clone());
                                     if !accuracy.llm.enabled {
-                                        let picked = stt::ensemble::reconcile_dual_candidates(
-                                            p_txt,
+                                        let picked = stt::ensemble::reconcile_dual_candidates_word_level(
+                                            p_conf,
                                             &s_txt,
+                                            &dict,
+                                            personal_ngram.as_ref(),
                                             duration_sec,
                                         );
-                                        final_res = Ok(picked);
+                                        final_text_res = Ok(picked);
                                     }
                                 }
                             } else if needs_rescue {
@@ -954,24 +1086,27 @@ fn spawn_stt_worker(
                                 let slow_rescue =
                                     crate::audio::enhance::wsola_time_stretch(&denoised_samples, 0.85);
                                 if let Ok(alt) = engine.transcribe_with_context(&slow_rescue, &ctx) {
-                                    let picked = stt::ensemble::reconcile_dual_candidates(
-                                        p_txt,
+                                    let picked = stt::ensemble::reconcile_dual_candidates_word_level(
+                                        p_conf,
                                         &alt,
+                                        &dict,
+                                        personal_ngram.as_ref(),
                                         duration_sec,
                                     );
-                                    final_res = Ok(picked);
+                                    final_text_res = Ok(picked);
                                 }
                             }
                         }
                     }
 
-                    // Layer 5 (#3, #11): Local LLM Phonetic & Contextual Post-Correction
+                    // Layer 5 (#3, #11, #2): Local LLM Phonetic & Contextual Post-Correction with [?語句] hints
                     if accuracy.llm.enabled {
-                        if let Ok(ref cur_txt) = final_res {
+                        if let Ok(ref cur_txt) = final_text_res {
                             if !cur_txt.trim().is_empty() {
                                 let _ = proxy.send_event(UserEvent::PhaseUpdate("rescuing".into()));
                                 let req = stt::llm_corrector::LlmCorrectionRequest {
                                     primary_text: cur_txt,
+                                    annotated_primary_text: annotated_for_llm.as_deref(),
                                     secondary_text: secondary_text.as_deref(),
                                     recent_messages: &recent_msgs,
                                     target_label: &target_label,
@@ -982,7 +1117,7 @@ fn spawn_stt_worker(
                                 if let Ok(llm_out) =
                                     stt::llm_corrector::correct_transcript_with_llm(&accuracy.llm, &req)
                                 {
-                                    final_res = Ok(llm_out);
+                                    final_text_res = Ok(llm_out);
                                 }
                             }
                         }
@@ -1005,7 +1140,10 @@ fn spawn_stt_worker(
                             rtf,
                             engine_label,
                             device_name,
-                            result: final_res,
+                            low_conf_spans,
+                            speaker_similarity,
+                            speaker_rejected: false,
+                            result: final_text_res,
                         })
                         .is_err()
                     {
@@ -1030,11 +1168,13 @@ fn spawn_stt_worker(
                 }
                 SttWorkerMsg::ClearCaches => {
                     denoiser_cache = None;
+                    speaker_cache = None;
                     secondary_cache = None;
                 }
                 SttWorkerMsg::UnloadAll => {
                     engine = Arc::new(BootLoadingEngine);
                     denoiser_cache = None;
+                    speaker_cache = None;
                     secondary_cache = None;
                 }
                 SttWorkerMsg::Shutdown => break,
@@ -1618,6 +1758,9 @@ fn activate_registered_target(
     sound: &SoundPlayer,
     proxy: &EventLoopProxy<UserEvent>,
 ) {
+    if state.config.discord_targets.active_target_id.as_deref() != Some(target.id.as_str()) {
+        state.recent_sent_texts.clear();
+    }
     state.config.discord_targets.active_target_id = Some(target.id.clone());
     let _ = state.config.save_to(&state.config_path);
     let label = discord::target_display_label(Some(&target));
@@ -2450,6 +2593,7 @@ fn execute_text_and_command(
                     );
                     let paste_text = format!("{}{}", joiner, text);
                     state.last_direct_utterance = text.clone();
+                    state.record_sent_text(&text);
                     state.direct_history_lengths.push(paste_text.chars().count());
                     emit_all(
                         main_wv,
@@ -2631,7 +2775,7 @@ fn handle_transcript(
     } else {
         state.config.discord_targets.clone()
     };
-    let processed = processor::process_transcript_full(
+    let processed = processor::process_transcript_full_v18(
         raw,
         &eff_filter,
         &state.config.commands,
@@ -2640,6 +2784,13 @@ fn handle_transcript(
         &state.config.emoji_aliases,
         state.config.stt.accuracy.stutter_cleanup,
         state.config.stt.accuracy.phonetic_fuzzy_matching,
+        state.config.stt.accuracy.phonetic_dict_enabled,
+        &state.pending_low_conf_spans,
+        if state.config.stt.accuracy.personal_ngram_enabled {
+            Some(&state.personal_ngram)
+        } else {
+            None
+        },
     );
     let final_text = processed.text.clone();
 
@@ -2701,6 +2852,7 @@ fn handle_transcript(
             TargetSwitchAction::Reset => {
                 state.config.discord_targets.active_target_id = None;
                 state.last_direct_utterance.clear();
+                state.recent_sent_texts.clear();
                 let _ = state.config.save_to(&state.config_path);
                 sound.play(SoundKind::ToggleOff, &state.config.sound);
                 emit_all(main_wv, overlay_wv, &state.status_event());
@@ -3160,6 +3312,8 @@ fn main() -> wry::Result<()> {
                             preset: state.config.stt.preset,
                             radio_clarity: state.config.noise_cancel.radio_clarity_mode,
                             eq_strength: state.config.noise_cancel.presence_eq_strength,
+                            room_debox_strength: state.config.noise_cancel.room_debox_strength,
+                            dereverb_enabled: state.config.noise_cancel.dereverb_enabled,
                             head_pad_ms: state.config.stt.accuracy.head_silence_pad_ms,
                             tail_pad_ms: state.config.stt.accuracy.tail_silence_pad_ms,
                             beam_size: 2,
@@ -3171,6 +3325,58 @@ fn main() -> wry::Result<()> {
                 AudioEvent::Utterance(samples) => {
                     if state.panic_mode {
                         state.recognizing = false;
+                        return;
+                    }
+                    if state.speaker_enroll_active {
+                        state.speaker_enroll_buf.extend_from_slice(&samples);
+                        let sec = state.speaker_enroll_buf.len() as f32 / 16_000.0;
+                        if sec < 4.2 {
+                            state.recognizing = false;
+                            let status_ev = state.speaker_profile_status(
+                                stt::local::discover_speaker_extractor(
+                                    &state.config.stt,
+                                    state.runtime_dir.as_deref(),
+                                    &state.config.stt.accuracy.speaker_model_file,
+                                )
+                                .is_some(),
+                                format!(
+                                    "声紋録音中: {:.1}秒 / 4.5秒（あと {:.1}秒 普段通り話してください）",
+                                    sec,
+                                    (4.5 - sec).max(0.5)
+                                ),
+                            );
+                            emit(&webview, &status_ev);
+                            return;
+                        }
+                        let enroll_samples = std::mem::take(&mut state.speaker_enroll_buf);
+                        state.speaker_enroll_active = false;
+                        state.recognizing = false;
+                        let stt_cfg = state.config.stt.clone();
+                        let rt = state.runtime_dir.clone();
+                        let model_file = state.config.stt.accuracy.speaker_model_file.clone();
+                        let created_at = format!("{} {}", current_local_ymd_hour().0, current_local_hms());
+                        let p = proxy.clone();
+                        thread::spawn(move || {
+                            let res = match stt::local::discover_speaker_extractor(
+                                &stt_cfg,
+                                rt.as_deref(),
+                                &model_file,
+                            ) {
+                                Some(ext) => ext.compute_embedding(&enroll_samples).map(|emb| {
+                                    audio::speaker_id::SpeakerProfile {
+                                        embedding: emb,
+                                        model_name: ext.model_name().to_string(),
+                                        sample_seconds: enroll_samples.len() as f32 / 16_000.0,
+                                        created_at,
+                                    }
+                                }),
+                                None => Err(
+                                    "話者照合モデル (3D-Speaker ONNX) が見つかりません。詳細設定のモデルカタログから導入してください。"
+                                        .into(),
+                                ),
+                            };
+                            let _ = p.send_event(UserEvent::SpeakerEnrollDone(res));
+                        });
                         return;
                     }
                     let recent_msgs = state.recent_sent_strings();
@@ -3203,6 +3409,8 @@ fn main() -> wry::Result<()> {
                         preset: eff_preset,
                         radio_clarity: state.config.noise_cancel.radio_clarity_mode,
                         eq_strength: eff_eq,
+                        room_debox_strength: state.config.noise_cancel.room_debox_strength,
+                        dereverb_enabled: state.config.noise_cancel.dereverb_enabled,
                         head_pad_ms: state.config.stt.accuracy.head_silence_pad_ms,
                         tail_pad_ms: state.config.stt.accuracy.tail_silence_pad_ms,
                         beam_size: eff_beam,
@@ -3214,6 +3422,11 @@ fn main() -> wry::Result<()> {
                         .active_profile()
                         .and_then(|p| p.speech_style)
                         .unwrap_or(state.config.stt.accuracy.llm.style);
+                    let personal_ngram = if state.config.stt.accuracy.personal_ngram_enabled {
+                        Some(state.personal_ngram.clone())
+                    } else {
+                        None
+                    };
                     let _ = stt_tx.send(SttWorkerMsg::Transcribe {
                         samples,
                         ctx,
@@ -3227,6 +3440,8 @@ fn main() -> wry::Result<()> {
                         game_name,
                         dict: eff_filter.dictionary,
                         speech_style: style,
+                        speaker_profile: state.speaker_profile.clone(),
+                        personal_ngram,
                     });
                 }
                 AudioEvent::DeviceSwitched { from, to } => {
@@ -3328,10 +3543,52 @@ fn main() -> wry::Result<()> {
                 rtf,
                 engine_label,
                 device_name,
+                low_conf_spans,
+                speaker_similarity,
+                speaker_rejected,
                 result,
             }) => {
                 state.recognizing = false;
                 state.phase = "idle".into();
+                if speaker_rejected {
+                    if let Some(ref t) = tray {
+                        t.update_state(state.tray_state(), state.overlay_visible);
+                    }
+                    emit_all(&webview, &overlay_webview, &state.status_event());
+                    let sim_val = speaker_similarity.unwrap_or(0.0);
+                    state.push_diagnostic(
+                        samples_16k,
+                        duration_sec,
+                        peak_dbfs,
+                        infer_ms,
+                        rtf,
+                        device_name,
+                        engine_label,
+                        format!(
+                            "[声紋不一致: 類似度 {:.2} < {:.2} / スキップ]",
+                            sim_val, state.config.stt.accuracy.speaker_verify_threshold
+                        ),
+                        String::new(),
+                        speaker_similarity,
+                    );
+                    emit(
+                        &webview,
+                        &BackendEvent::DiagnosticsUpdated {
+                            items: state.diagnostic_dtos(),
+                        },
+                    );
+                    emit(
+                        &webview,
+                        &BackendEvent::Toast {
+                            level: "info".into(),
+                            message: format!(
+                                "本人以外の声としてスキップしました（話者類似度 {:.2}）",
+                                sim_val
+                            ),
+                        },
+                    );
+                    return;
+                }
                 state.last_infer_ms = infer_ms;
                 state.last_rtf = rtf;
                 if !device_name.is_empty() {
@@ -3385,7 +3642,8 @@ fn main() -> wry::Result<()> {
                             return;
                         }
                         let final_text = if !trimmed.is_empty() {
-                            handle_transcript(
+                            state.pending_low_conf_spans = low_conf_spans;
+                            let out = handle_transcript(
                                 &trimmed,
                                 &mut state,
                                 &webview,
@@ -3393,7 +3651,9 @@ fn main() -> wry::Result<()> {
                                 &tray,
                                 &sound_player,
                                 &proxy,
-                            )
+                            );
+                            state.pending_low_conf_spans.clear();
+                            out
                         } else {
                             String::new()
                         };
@@ -3407,6 +3667,7 @@ fn main() -> wry::Result<()> {
                             engine_label,
                             trimmed,
                             final_text,
+                            speaker_similarity,
                         );
                         emit(
                             &webview,
@@ -3426,6 +3687,7 @@ fn main() -> wry::Result<()> {
                             engine_label,
                             format!("[エラー] {}", err),
                             String::new(),
+                            speaker_similarity,
                         );
                         emit(
                             &webview,
@@ -3441,6 +3703,47 @@ fn main() -> wry::Result<()> {
                             },
                         );
                     }
+                }
+            }
+            Event::UserEvent(UserEvent::ThreeStageBenchDone(report)) => {
+                emit(&webview, &BackendEvent::ThreeStageBenchmarkResult { report });
+            }
+            Event::UserEvent(UserEvent::SpeakerEnrollDone(res)) => match res {
+                Ok(prof) => {
+                    let _ = prof.save_to(&state.speaker_profile_path);
+                    let msg = format!(
+                        "本人の声紋を登録しました（{:.1}秒 / {}）",
+                        prof.sample_seconds, prof.model_name
+                    );
+                    state.speaker_profile = Some(prof);
+                    let status_ev = state.speaker_profile_status(true, msg.clone());
+                    emit(&webview, &status_ev);
+                    emit(
+                        &webview,
+                        &BackendEvent::Toast {
+                            level: "ok".into(),
+                            message: msg,
+                        },
+                    );
+                }
+                Err(err) => {
+                    let status_ev = state.speaker_profile_status(
+                        stt::local::discover_speaker_extractor(
+                            &state.config.stt,
+                            state.runtime_dir.as_deref(),
+                            &state.config.stt.accuracy.speaker_model_file,
+                        )
+                        .is_some(),
+                        err.clone(),
+                    );
+                    emit(&webview, &status_ev);
+                    emit(
+                        &webview,
+                        &BackendEvent::Toast {
+                            level: "error".into(),
+                            message: err,
+                        },
+                    );
                 }
             }
             Event::UserEvent(UserEvent::AbCompareDone {
@@ -4582,6 +4885,7 @@ fn main() -> wry::Result<()> {
                         }
                         _ => {
                             state.config.discord_targets.active_target_id = None;
+                            state.recent_sent_texts.clear();
                             let _ = state.config.save_to(&state.config_path);
                             sound_player.play(SoundKind::ToggleOff, &state.config.sound);
                             emit_all(&webview, &overlay_webview, &state.status_event());
@@ -4754,6 +5058,7 @@ fn main() -> wry::Result<()> {
                             );
                         } else {
                             state.draft_segments.clear();
+                            state.record_sent_text(&text);
                             emit_all(
                                 &webview,
                                 &overlay_webview,
@@ -5202,6 +5507,7 @@ fn main() -> wry::Result<()> {
                             let t0 = Instant::now();
                             let req = stt::llm_corrector::LlmCorrectionRequest {
                                 primary_text: &text,
+                                annotated_primary_text: None,
                                 secondary_text: None,
                                 recent_messages: &recent,
                                 target_label: &tgt_label,
@@ -5745,6 +6051,8 @@ fn main() -> wry::Result<()> {
                             preset: stt_cfg.preset,
                             radio_clarity: state.config.noise_cancel.radio_clarity_mode,
                             eq_strength: state.config.noise_cancel.presence_eq_strength,
+                            room_debox_strength: state.config.noise_cancel.room_debox_strength,
+                            dereverb_enabled: state.config.noise_cancel.dereverb_enabled,
                             head_pad_ms: stt_cfg.accuracy.head_silence_pad_ms,
                             tail_pad_ms: stt_cfg.accuracy.tail_silence_pad_ms,
                             beam_size: stt_cfg.accuracy.beam_size,
@@ -5779,6 +6087,145 @@ fn main() -> wry::Result<()> {
                             },
                         );
                     }
+                    ClientCommand::RunThreeStageBenchmark => {
+                        let cases = state.bench_cases.clone();
+                        let stt_cfg = state.config.stt.clone();
+                        let nc_cfg = state.config.noise_cancel.clone();
+                        let rt = state.runtime_dir.clone();
+                        let eff_filter = state.effective_filter();
+                        let cmds = state.config.commands.clone();
+                        let tgts = state.config.discord_targets.clone();
+                        let snips = state.config.snippets.clone();
+                        let emojis = state.config.emoji_aliases.clone();
+                        let ngram = if stt_cfg.accuracy.personal_ngram_enabled {
+                            Some(state.personal_ngram.clone())
+                        } else {
+                            None
+                        };
+                        let tgt_label =
+                            discord::target_display_label(state.config.discord_targets.active_target());
+                        let game_name = state.active_profile().map(|p| p.name.clone());
+                        let style = state
+                            .active_profile()
+                            .and_then(|p| p.speech_style)
+                            .unwrap_or(stt_cfg.accuracy.llm.style);
+                        let recent = state.recent_sent_strings();
+                        let p = proxy.clone();
+                        thread::spawn(move || {
+                            let eng = stt::create_engine(&stt_cfg, rt.as_deref());
+                            let mut llm_cfg = stt_cfg.accuracy.llm.clone();
+                            llm_cfg.enabled = true;
+                            let llm_available =
+                                stt::llm_corrector::check_llm_health(&llm_cfg.base_url).is_ok();
+                            let ctx = TranscribeContext {
+                                language: stt_cfg.language.clone(),
+                                hotwords_prompt: None,
+                                preset: stt_cfg.preset,
+                                radio_clarity: nc_cfg.radio_clarity_mode,
+                                eq_strength: nc_cfg.presence_eq_strength,
+                                room_debox_strength: nc_cfg.room_debox_strength,
+                                dereverb_enabled: nc_cfg.dereverb_enabled,
+                                head_pad_ms: stt_cfg.accuracy.head_silence_pad_ms,
+                                tail_pad_ms: stt_cfg.accuracy.tail_silence_pad_ms,
+                                beam_size: stt_cfg.accuracy.beam_size,
+                                temperature_fallback: stt_cfg.accuracy.temperature_fallback,
+                            };
+                            let mut out_cases = Vec::new();
+                            for c in &cases {
+                                if let Ok(samples) =
+                                    stats::read_f32_wav_16k(std::path::Path::new(&c.wav_path))
+                                {
+                                    let t1 = Instant::now();
+                                    let p_conf = eng
+                                        .transcribe_with_confidence(&samples, &ctx)
+                                        .unwrap_or_else(|_| stt::TranscriptWithConfidence {
+                                            text: String::new(),
+                                            tokens: Vec::new(),
+                                            avg_prob: 1.0,
+                                        });
+                                    let raw_ms = t1.elapsed().as_millis() as u64;
+                                    let raw_text = p_conf.text.trim().to_string();
+                                    let raw_cer = stats::char_error_rate(&raw_text, &c.expected_text);
+
+                                    let t2 = Instant::now();
+                                    let (ann, spans) = stt::whisper_ffi::annotate_low_confidence_tokens(
+                                        &p_conf.text,
+                                        &p_conf.tokens,
+                                        0.65,
+                                    );
+                                    let processed = processor::process_transcript_full_v18(
+                                        &raw_text,
+                                        &eff_filter,
+                                        &cmds,
+                                        &tgts,
+                                        &snips,
+                                        &emojis,
+                                        stt_cfg.accuracy.stutter_cleanup,
+                                        stt_cfg.accuracy.phonetic_fuzzy_matching,
+                                        true,
+                                        &spans,
+                                        ngram.as_ref(),
+                                    );
+                                    let non_llm_text = processed.text;
+                                    let non_llm_ms = raw_ms + t2.elapsed().as_millis() as u64;
+                                    let non_llm_cer =
+                                        stats::char_error_rate(&non_llm_text, &c.expected_text);
+                                    let non_llm_delta =
+                                        stats::stage_delta_label(raw_cer, non_llm_cer);
+
+                                    let (llm_text, llm_ms) = if llm_available
+                                        && !non_llm_text.trim().is_empty()
+                                    {
+                                        let t3 = Instant::now();
+                                        let req = stt::llm_corrector::LlmCorrectionRequest {
+                                            primary_text: &non_llm_text,
+                                            annotated_primary_text: if ann != p_conf.text {
+                                                Some(ann.as_str())
+                                            } else {
+                                                None
+                                            },
+                                            secondary_text: None,
+                                            recent_messages: &recent,
+                                            target_label: &tgt_label,
+                                            game_name: game_name.as_deref(),
+                                            dictionary: &eff_filter.dictionary,
+                                            style,
+                                        };
+                                        let out = stt::llm_corrector::correct_transcript_with_llm(
+                                            &llm_cfg, &req,
+                                        )
+                                        .unwrap_or_else(|_| non_llm_text.clone());
+                                        (out, non_llm_ms + t3.elapsed().as_millis() as u64)
+                                    } else {
+                                        (non_llm_text.clone(), non_llm_ms)
+                                    };
+                                    let llm_cer =
+                                        stats::char_error_rate(&llm_text, &c.expected_text);
+                                    let llm_delta = stats::stage_delta_label(non_llm_cer, llm_cer);
+
+                                    out_cases.push(stats::ThreeStageBenchCaseResult {
+                                        id: c.id.clone(),
+                                        label: c.label.clone(),
+                                        expected_text: c.expected_text.clone(),
+                                        raw_text,
+                                        raw_cer,
+                                        raw_ms,
+                                        non_llm_text,
+                                        non_llm_cer,
+                                        non_llm_ms,
+                                        non_llm_delta,
+                                        llm_text,
+                                        llm_cer,
+                                        llm_ms,
+                                        llm_delta,
+                                    });
+                                }
+                            }
+                            let report =
+                                stats::compute_three_stage_report(out_cases, llm_available);
+                            let _ = p.send_event(UserEvent::ThreeStageBenchDone(report));
+                        });
+                    }
                     ClientCommand::RunAutoTuner => {
                         let eng = stt::create_engine(&state.config.stt, state.runtime_dir.as_deref());
                         let ctx = TranscribeContext {
@@ -5787,6 +6234,8 @@ fn main() -> wry::Result<()> {
                             preset: state.config.stt.preset,
                             radio_clarity: state.config.noise_cancel.radio_clarity_mode,
                             eq_strength: state.config.noise_cancel.presence_eq_strength,
+                            room_debox_strength: state.config.noise_cancel.room_debox_strength,
+                            dereverb_enabled: state.config.noise_cancel.dereverb_enabled,
                             head_pad_ms: state.config.stt.accuracy.head_silence_pad_ms,
                             tail_pad_ms: state.config.stt.accuracy.tail_silence_pad_ms,
                             beam_size: state.config.stt.accuracy.beam_size,
@@ -5823,6 +6272,7 @@ fn main() -> wry::Result<()> {
                         wsola_rate,
                         beam_size,
                         dpdfnet_db,
+                        room_debox_strength,
                     } => {
                         state.config.noise_cancel.presence_eq_strength = eq_strength.clamp(0.0, 1.0);
                         state.config.stt.accuracy.wsola_rate = wsola_rate.clamp(0.75, 1.0);
@@ -5830,6 +6280,9 @@ fn main() -> wry::Result<()> {
                         if let Some(db) = dpdfnet_db {
                             state.config.noise_cancel.dpdfnet_attenuation_limit_db =
                                 db.abs().clamp(0.0, 60.0);
+                        }
+                        if let Some(debox) = room_debox_strength {
+                            state.config.noise_cancel.room_debox_strength = debox.clamp(0.0, 1.0);
                         }
                         let _ = state.config.save_to(&state.config_path);
                         emit(
@@ -5846,6 +6299,190 @@ fn main() -> wry::Result<()> {
                                 message: "自動探索パラメータを適用しました".into(),
                             },
                         );
+                    }
+                    ClientCommand::PreviewImeDictionary { raw_text_b64 } => {
+                        let ev = match processor::phonetic::decode_base64_bytes(&raw_text_b64)
+                            .and_then(|bytes| processor::phonetic::decode_ime_text_bytes(&bytes))
+                        {
+                            Ok((text, enc)) => {
+                                let (entries, dup_count) =
+                                    processor::phonetic::parse_ime_dictionary_text(
+                                        &text,
+                                        &state.config.filter.dictionary,
+                                    );
+                                BackendEvent::ImeDictionaryPreview {
+                                    ok: true,
+                                    encoding: enc.to_string(),
+                                    duplicate_count: dup_count,
+                                    message: format!(
+                                        "{} を解析: {}件検出（既存と重複 {}件）",
+                                        enc,
+                                        entries.len(),
+                                        dup_count
+                                    ),
+                                    entries,
+                                }
+                            }
+                            Err(err) => BackendEvent::ImeDictionaryPreview {
+                                ok: false,
+                                encoding: String::new(),
+                                entries: Vec::new(),
+                                duplicate_count: 0,
+                                message: err,
+                            },
+                        };
+                        emit(&webview, &ev);
+                    }
+                    ClientCommand::ImportImeEntries { entries } => {
+                        let mut added = 0usize;
+                        for entry in entries {
+                            let from = entry.from.trim().to_string();
+                            let to = entry.to.trim().to_string();
+                            if from.is_empty() || to.is_empty() {
+                                continue;
+                            }
+                            if !state
+                                .config
+                                .filter
+                                .dictionary
+                                .iter()
+                                .any(|d| d.from.trim() == from && d.to.trim() == to)
+                            {
+                                state.config.filter.dictionary.push(DictionaryEntry { from, to });
+                                added += 1;
+                            }
+                        }
+                        let _ = state.config.save_to(&state.config_path);
+                        let hints = build_stt_prompt_hints(&state.config, state.active_profile());
+                        let _ = stt_tx.send(SttWorkerMsg::UpdatePromptHints(hints));
+                        emit(
+                            &webview,
+                            &BackendEvent::ConfigLoaded {
+                                config: state.config.clone(),
+                                config_path: state.config_path.display().to_string(),
+                            },
+                        );
+                        emit(
+                            &webview,
+                            &BackendEvent::Toast {
+                                level: "ok".into(),
+                                message: format!("IME辞書から {}件 を追加しました", added),
+                            },
+                        );
+                    }
+                    ClientCommand::GetNgramStatus => {
+                        emit(
+                            &webview,
+                            &BackendEvent::PersonalNgramStatus {
+                                entry_count: state.personal_ngram.entry_count(),
+                                total_tokens: state.personal_ngram.total_tokens,
+                            },
+                        );
+                    }
+                    ClientCommand::ClearPersonalNgram => {
+                        state.personal_ngram.clear();
+                        state.personal_ngram.save_to(&state.ngram_path);
+                        emit(
+                            &webview,
+                            &BackendEvent::PersonalNgramStatus {
+                                entry_count: 0,
+                                total_tokens: 0,
+                            },
+                        );
+                        emit(
+                            &webview,
+                            &BackendEvent::Toast {
+                                level: "info".into(),
+                                message: "個人N-gram単語頻度キャッシュを消去しました".into(),
+                            },
+                        );
+                    }
+                    ClientCommand::StartSpeakerEnroll => {
+                        let model_ok = stt::local::discover_speaker_extractor(
+                            &state.config.stt,
+                            state.runtime_dir.as_deref(),
+                            &state.config.stt.accuracy.speaker_model_file,
+                        )
+                        .is_some();
+                        if !model_ok {
+                            let ev = state.speaker_profile_status(
+                                false,
+                                "先に話者照合モデル (3D-Speaker ONNX) をダウンロードしてください".into(),
+                            );
+                            emit(&webview, &ev);
+                            emit(
+                                &webview,
+                                &BackendEvent::Toast {
+                                    level: "error".into(),
+                                    message: "話者照合モデルが見つかりません。モデル管理から導入してください。".into(),
+                                },
+                            );
+                        } else {
+                            state.speaker_enroll_buf.clear();
+                            state.speaker_enroll_active = true;
+                            if !state.listening {
+                                set_listening_state(
+                                    true,
+                                    true,
+                                    &mut state,
+                                    &audio_ctrl,
+                                    &sound_player,
+                                    &webview,
+                                    &overlay_webview,
+                                    &tray,
+                                );
+                            }
+                            let ev = state.speaker_profile_status(
+                                true,
+                                "声紋登録開始: 普段の声で5秒ほど話してください…".into(),
+                            );
+                            emit(&webview, &ev);
+                            emit(
+                                &webview,
+                                &BackendEvent::Toast {
+                                    level: "info".into(),
+                                    message: "声紋登録開始：普段の話し方で約5秒話してください".into(),
+                                },
+                            );
+                        }
+                    }
+                    ClientCommand::ClearSpeakerProfile => {
+                        state.speaker_enroll_active = false;
+                        state.speaker_enroll_buf.clear();
+                        state.speaker_profile = None;
+                        audio::speaker_id::SpeakerProfile::remove_file(&state.speaker_profile_path);
+                        let model_ok = stt::local::discover_speaker_extractor(
+                            &state.config.stt,
+                            state.runtime_dir.as_deref(),
+                            &state.config.stt.accuracy.speaker_model_file,
+                        )
+                        .is_some();
+                        let ev = state.speaker_profile_status(model_ok, "登録済み声紋を削除しました".into());
+                        emit(&webview, &ev);
+                        emit(
+                            &webview,
+                            &BackendEvent::Toast {
+                                level: "info".into(),
+                                message: "登録済み声紋データを削除しました".into(),
+                            },
+                        );
+                    }
+                    ClientCommand::GetSpeakerProfileStatus => {
+                        let model_ok = stt::local::discover_speaker_extractor(
+                            &state.config.stt,
+                            state.runtime_dir.as_deref(),
+                            &state.config.stt.accuracy.speaker_model_file,
+                        )
+                        .is_some();
+                        let msg = if state.speaker_profile.is_some() {
+                            "本人声紋が登録されています".to_string()
+                        } else if model_ok {
+                            "声紋モデル導入済み（未登録）".to_string()
+                        } else {
+                            "話者照合モデル未導入（詳細設定から導入可能）".to_string()
+                        };
+                        let ev = state.speaker_profile_status(model_ok, msg);
+                        emit(&webview, &ev);
                     }
                     ClientCommand::ApplyCalibrationResult {
                         vad_threshold,

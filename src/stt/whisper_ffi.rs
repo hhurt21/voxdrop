@@ -156,6 +156,25 @@ type FnWhisperFull =
 type FnWhisperFullNSegments = unsafe extern "C" fn(*mut c_void) -> c_int;
 type FnWhisperFullGetSegmentText = unsafe extern "C" fn(*mut c_void, c_int) -> *const c_char;
 type FnWhisperFullGetSegmentNoSpeechProb = unsafe extern "C" fn(*mut c_void, c_int) -> f32;
+type FnWhisperFullNTokens = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
+type FnWhisperFullGetTokenText = unsafe extern "C" fn(*mut c_void, c_int, c_int) -> *const c_char;
+type FnWhisperFullGetTokenData =
+    unsafe extern "C" fn(*mut c_void, c_int, c_int) -> WhisperTokenData;
+
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+struct WhisperTokenData {
+    id: i32,
+    tid: i32,
+    p: f32,
+    plog: f32,
+    pt: f32,
+    ptsum: f32,
+    t0: i64,
+    t1: i64,
+    t_dtw: i64,
+    vlen: f32,
+}
 
 struct WhisperDllFns {
     hmodule: HMODULE,
@@ -170,6 +189,9 @@ struct WhisperDllFns {
     full_n_segments: FnWhisperFullNSegments,
     full_get_segment_text: FnWhisperFullGetSegmentText,
     full_get_segment_no_speech_prob: Option<FnWhisperFullGetSegmentNoSpeechProb>,
+    full_n_tokens: Option<FnWhisperFullNTokens>,
+    full_get_token_text: Option<FnWhisperFullGetTokenText>,
+    full_get_token_data: Option<FnWhisperFullGetTokenData>,
 }
 
 struct ResidentWhisperInner {
@@ -395,8 +417,35 @@ impl ResidentWhisperRecognizer {
         beam_size: i32,
         temperature_fallback: bool,
     ) -> Result<String, String> {
+        self.transcribe_with_options_and_confidence(
+            samples_16k,
+            clarity_boost,
+            eq_strength,
+            0.35,
+            false,
+            head_pad_ms,
+            tail_pad_ms,
+            beam_size,
+            temperature_fallback,
+        )
+        .map(|res| res.text)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn transcribe_with_options_and_confidence(
+        &self,
+        samples_16k: &[f32],
+        clarity_boost: bool,
+        eq_strength: f32,
+        room_debox_strength: f32,
+        dereverb_enabled: bool,
+        head_pad_ms: u64,
+        tail_pad_ms: u64,
+        beam_size: i32,
+        temperature_fallback: bool,
+    ) -> Result<crate::stt::TranscriptWithConfidence, String> {
         if samples_16k.len() < 1600 {
-            return Ok(String::new());
+            return Ok(crate::stt::TranscriptWithConfidence::from_text(String::new()));
         }
 
         let input_rms = {
@@ -404,12 +453,14 @@ impl ResidentWhisperRecognizer {
             (sq / samples_16k.len() as f32).sqrt()
         };
 
-        // Layer 1: DC removal + consonant presence EQ + uniform AGC/soft limiter + >=200/300ms silence pad
+        // Layer 1: DC removal + room debox + dereverb + presence EQ + AGC/limiter + silence pad
         let conditioned = crate::audio::enhance::enhance_utterance_16k_with_options(
             samples_16k,
             &crate::audio::enhance::EnhanceOptions {
                 clarity_boost,
                 eq_strength,
+                room_debox_strength,
+                dereverb_enabled,
                 highpass_enabled: true,
                 agc_enabled: true,
                 head_pad_ms,
@@ -425,23 +476,103 @@ impl ResidentWhisperRecognizer {
             .lock()
             .map_err(|_| "Whisper 認識ロックの取得に失敗しました".to_string())?;
 
-        // Layer 4 (#38): Beam search + Temperature Fallback ladder (0.0 -> 0.2 -> 0.4)
-        let text = run_whisper_pass(&guard, &conditioned, self.using_gpu, false, beam_size, 0.0)?;
+        // Layer 4 (#38 + #2): Beam search + Temperature Fallback ladder (0.0 -> 0.2 -> 0.4) + token probs
+        let res = run_whisper_pass_with_tokens(
+            &guard,
+            &conditioned,
+            self.using_gpu,
+            false,
+            beam_size,
+            0.0,
+        )?;
         if temperature_fallback
-            && (text.trim().is_empty() || crate::stt::ensemble::looks_low_confidence(&text, samples_16k.len() as f32 / 16_000.0))
+            && (res.text.trim().is_empty()
+                || crate::stt::ensemble::looks_low_confidence(
+                    &res.text,
+                    samples_16k.len() as f32 / 16_000.0,
+                ))
             && input_rms >= 0.010
             && samples_16k.len() >= 6400
         {
             for &temp in &[0.2f32, 0.4f32] {
-                if let Ok(alt) = run_whisper_pass(&guard, &conditioned, self.using_gpu, true, beam_size, temp) {
-                    if !alt.trim().is_empty() && !crate::stt::ensemble::looks_low_confidence(&alt, samples_16k.len() as f32 / 16_000.0) {
+                if let Ok(alt) = run_whisper_pass_with_tokens(
+                    &guard,
+                    &conditioned,
+                    self.using_gpu,
+                    true,
+                    beam_size,
+                    temp,
+                ) {
+                    if !alt.text.trim().is_empty()
+                        && !crate::stt::ensemble::looks_low_confidence(
+                            &alt.text,
+                            samples_16k.len() as f32 / 16_000.0,
+                        )
+                    {
                         return Ok(alt);
                     }
                 }
             }
         }
-        Ok(text)
+        Ok(res)
     }
+}
+
+/// Maps per-token confidence onto `text`, returning `(annotated_with_question_markers, low_conf_byte_spans)` (#2).
+pub fn annotate_low_confidence_tokens(
+    text: &str,
+    tokens: &[crate::stt::TranscribedToken],
+    prob_threshold: f32,
+) -> (String, Vec<(usize, usize)>) {
+    if text.trim().is_empty() || tokens.is_empty() {
+        return (text.to_string(), Vec::new());
+    }
+    let mut low_spans: Vec<(usize, usize)> = Vec::new();
+    let mut cursor = 0usize;
+    for tok in tokens {
+        let piece = tok.text.trim();
+        if piece.is_empty() {
+            continue;
+        }
+        if let Some(rel) = text[cursor..].find(piece) {
+            let start = cursor + rel;
+            let end = start + piece.len();
+            cursor = end;
+            let is_punct = piece.chars().all(|c| {
+                matches!(
+                    c,
+                    '。' | '、' | '！' | '？' | '!' | '?' | '.' | ',' | '…' | '「' | '」' | ' '
+                )
+            });
+            if !is_punct && tok.prob < prob_threshold {
+                if let Some(last) = low_spans.last_mut() {
+                    if start <= last.1 + 1 {
+                        last.1 = end;
+                        continue;
+                    }
+                }
+                low_spans.push((start, end));
+            }
+        }
+    }
+    if low_spans.is_empty() {
+        return (text.to_string(), low_spans);
+    }
+    let mut annotated = String::with_capacity(text.len() + low_spans.len() * 4);
+    let mut pos = 0usize;
+    for &(s, e) in &low_spans {
+        if s > pos {
+            annotated.push_str(&text[pos..s]);
+        }
+        annotated.push_str("[?");
+        annotated.push_str(&text[s..e]);
+        annotated.push(']');
+        pos = e;
+    }
+    if pos < text.len() {
+        annotated.push_str(&text[pos..]);
+    }
+    (annotated, low_spans)
 }
 
 fn build_whisper_initial_prompt(base: &str, hints: &str) -> String {
@@ -456,14 +587,14 @@ fn build_whisper_initial_prompt(base: &str, hints: &str) -> String {
     combined
 }
 
-fn run_whisper_pass(
+fn run_whisper_pass_with_tokens(
     guard: &ResidentWhisperInner,
     conditioned: &[f32],
     using_gpu: bool,
     safety_fallback: bool,
     beam_size: i32,
     temperature: f32,
-) -> Result<String, String> {
+) -> Result<crate::stt::TranscriptWithConfidence, String> {
     unsafe {
         // Use beam_search on GPU for high Japanese accuracy; greedy on CPU
         let strategy = if using_gpu { 1 } else { 0 };
@@ -510,7 +641,6 @@ fn run_whisper_pass(
             wparams.no_speech_thold = 0.99;
         } else {
             wparams.temperature_inc = 0.2;
-            // Generous thresholds so fast/casual Japanese stays in deterministic beam search without garbled temp fallback
             wparams.entropy_thold = 3.4;
             wparams.logprob_thold = -2.0;
             wparams.no_speech_thold = 0.85;
@@ -535,6 +665,7 @@ fn run_whisper_pass(
 
         let n_seg = (guard.fns.full_n_segments)(guard.ctx);
         let mut out = String::new();
+        let mut tokens_out: Vec<crate::stt::TranscribedToken> = Vec::new();
         for i in 0..n_seg {
             let ptr_txt = (guard.fns.full_get_segment_text)(guard.ctx, i);
             if ptr_txt.is_null() {
@@ -569,9 +700,59 @@ fn run_whisper_pass(
                 }
             }
             out.push_str(seg_trimmed);
+
+            // Extract token-level probabilities cleanly, buffering BPE partial UTF-8 bytes (#2)
+            if let (Some(n_tok_fn), Some(tok_txt_fn), Some(tok_data_fn)) = (
+                guard.fns.full_n_tokens,
+                guard.fns.full_get_token_text,
+                guard.fns.full_get_token_data,
+            ) {
+                let n_tok = n_tok_fn(guard.ctx, i);
+                let mut pending_bytes: Vec<u8> = Vec::new();
+                let mut pending_probs: Vec<f32> = Vec::new();
+                for t in 0..n_tok {
+                    let t_ptr = tok_txt_fn(guard.ctx, i, t);
+                    if t_ptr.is_null() {
+                        continue;
+                    }
+                    let bytes = CStr::from_ptr(t_ptr).to_bytes();
+                    if bytes.is_empty()
+                        || (bytes.starts_with(b"<|") && bytes.ends_with(b"|>"))
+                        || (bytes.starts_with(b"[_") && bytes.ends_with(b"]"))
+                    {
+                        continue;
+                    }
+                    let data = tok_data_fn(guard.ctx, i, t);
+                    let prob = data.p.clamp(0.0, 1.0);
+                    pending_bytes.extend_from_slice(bytes);
+                    pending_probs.push(prob);
+                    if let Ok(valid_str) = std::str::from_utf8(&pending_bytes) {
+                        if !valid_str.is_empty() && !pending_probs.is_empty() {
+                            let avg =
+                                pending_probs.iter().sum::<f32>() / pending_probs.len() as f32;
+                            tokens_out.push(crate::stt::TranscribedToken {
+                                text: valid_str.to_string(),
+                                prob: avg,
+                            });
+                        }
+                        pending_bytes.clear();
+                        pending_probs.clear();
+                    }
+                }
+            }
         }
 
-        Ok(filter_whisper_hallucinations(out.trim()))
+        let cleaned = filter_whisper_hallucinations(out.trim());
+        let avg_prob = if tokens_out.is_empty() {
+            1.0
+        } else {
+            tokens_out.iter().map(|t| t.prob).sum::<f32>() / tokens_out.len() as f32
+        };
+        Ok(crate::stt::TranscriptWithConfidence {
+            text: cleaned,
+            tokens: tokens_out,
+            avg_prob,
+        })
     }
 }
 
@@ -843,6 +1024,9 @@ fn load_whisper_dll(dll_path: &Path) -> Result<(WhisperDllFns, bool, Option<Stri
                     b"whisper_full_get_segment_no_speech_prob\0",
                 )
                 .ok(),
+                full_n_tokens: load_sym(hmodule, b"whisper_full_n_tokens\0").ok(),
+                full_get_token_text: load_sym(hmodule, b"whisper_full_get_token_text\0").ok(),
+                full_get_token_data: load_sym(hmodule, b"whisper_full_get_token_data\0").ok(),
             })
         })();
 

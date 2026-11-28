@@ -11,6 +11,29 @@ use crate::config::{ConversationPreset, SttConfig};
 use std::path::Path;
 use std::sync::Arc;
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct TranscribedToken {
+    pub text: String,
+    pub prob: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TranscriptWithConfidence {
+    pub text: String,
+    pub tokens: Vec<TranscribedToken>,
+    pub avg_prob: f32,
+}
+
+impl TranscriptWithConfidence {
+    pub fn from_text(text: String) -> Self {
+        Self {
+            text,
+            tokens: Vec::new(),
+            avg_prob: 1.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TranscribeContext {
     pub language: String,
@@ -19,6 +42,8 @@ pub struct TranscribeContext {
     pub preset: ConversationPreset,
     pub radio_clarity: bool,
     pub eq_strength: f32,
+    pub room_debox_strength: f32,
+    pub dereverb_enabled: bool,
     pub head_pad_ms: u64,
     pub tail_pad_ms: u64,
     pub beam_size: i32,
@@ -33,6 +58,8 @@ impl Default for TranscribeContext {
             preset: ConversationPreset::Normal,
             radio_clarity: true,
             eq_strength: 0.55,
+            room_debox_strength: 0.35,
+            dereverb_enabled: false,
             head_pad_ms: 200,
             tail_pad_ms: 300,
             beam_size: 5,
@@ -79,6 +106,16 @@ pub trait SttEngine: Send + Sync {
         ctx: &TranscribeContext,
     ) -> Result<String, String> {
         self.transcribe_enhanced(samples_16k, ctx.radio_clarity)
+    }
+
+    /// Context-aware transcription returning per-token probabilities when supported (#2).
+    fn transcribe_with_confidence(
+        &self,
+        samples_16k: &[f32],
+        ctx: &TranscribeContext,
+    ) -> Result<TranscriptWithConfidence, String> {
+        let text = self.transcribe_with_context(samples_16k, ctx)?;
+        Ok(TranscriptWithConfidence::from_text(text))
     }
 
     /// Updates dynamic prompt hints (voice commands, custom dictionary, friend/channel names).

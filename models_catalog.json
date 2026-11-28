@@ -421,6 +421,45 @@
         "conversation_preset": null,
         "recommended_vad_padding_ms": null
       }
+    },
+    {
+      "id": "3dspeaker-eres2net-base",
+      "category": "speaker_recognition",
+      "display_name": "自分の声紋フィルタ (3D-Speaker ERes2Net Base・約38MB)",
+      "runtime": "sherpa-onnx (DirectML / CPU)",
+      "version_tag": "3dspeaker-16k",
+      "primary_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx",
+      "mirror_urls": [],
+      "local_rel_path": "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx",
+      "local_match": [
+        "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx",
+        "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx",
+        "wespeaker_en_voxceleb_CAM++.onnx"
+      ],
+      "archive_type": "raw_file",
+      "expected_size_bytes": 39593762,
+      "sha256": null,
+      "min_vram_gb": 0.0,
+      "download_size_mb": 38,
+      "scores": { "accuracy": 5, "noise_resilience": 5, "speed": 5, "lightness": 5 },
+      "bundled_default": false,
+      "benefits": [
+        "自分の声を 5 秒登録するだけで、スピーカーのゲーム声優・動画・家族の声を自動除外",
+        "約 38 MB と超軽量で GPU VRAM や CPU をほぼ消費しない",
+        "同梱済みの sherpa-onnx-c-api.dll のみで動作し追加ランタイム不要"
+      ],
+      "best_for": "スピーカー環境でゲームキャラ・動画・家族の声による誤認識・誤送信を防ぎたい環境",
+      "caution": "風邪などで声質が大きく変わった場合はしきい値を一時的に下げるか OFF にできます",
+      "recommended_preset": {
+        "backend": "directml_with_cpu_fallback",
+        "language": null,
+        "beam_size": null,
+        "temperature_fallback": null,
+        "no_speech_thold": null,
+        "attenuation_limit_db": null,
+        "conversation_preset": null,
+        "recommended_vad_padding_ms": null
+      }
     }
   ]
 }

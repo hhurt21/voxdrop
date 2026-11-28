@@ -316,6 +316,14 @@ pub struct NoiseCancelConfig {
     pub dpdfnet_attenuation_limit_db: f32,
     /// 子音強調プレゼンスEQ 強度 (0.0 ..= 1.0)
     pub presence_eq_strength: f32,
+    /// WASAPI Loopback 参照付きアコースティック・エコーキャンセリング (AEC) (#7)
+    pub aec_enabled: bool,
+    /// AEC 抑制強度 (0.2 ..= 1.0)
+    pub aec_strength: f32,
+    /// 部屋鳴り (250〜450Hz) のこもり低減強度 (0.0 ..= 1.0) (#9)
+    pub room_debox_strength: f32,
+    /// 軽量デリーバーブ（壁反響・残響テール抑制） (#9)
+    pub dereverb_enabled: bool,
 }
 
 impl NoiseCancelConfig {
@@ -340,6 +348,10 @@ impl Default for NoiseCancelConfig {
             stt_engine: NoiseEngineKind::OffHpf,
             dpdfnet_attenuation_limit_db: 12.0,
             presence_eq_strength: 0.55,
+            aec_enabled: false,
+            aec_strength: 0.75,
+            room_debox_strength: 0.35,
+            dereverb_enabled: false,
         }
     }
 }
@@ -707,6 +719,16 @@ pub struct AccuracyPipelineConfig {
     pub phonetic_fuzzy_matching: bool,
     pub stutter_cleanup: bool,
     pub auto_learn_respeak: bool,
+    /// 形態素解析(lindera)による全漢字→読み完全音韻辞書置換 (非LLM #1)
+    pub phonetic_dict_enabled: bool,
+    /// 過去送信ログの個人N-gramリランキング (非LLM #4)
+    pub personal_ngram_enabled: bool,
+    /// 自分の声紋(話者照合)フィルタで他者・ゲーム音声を除外 (#8)
+    pub speaker_verify_enabled: bool,
+    /// 話者照合コサイン類似度しきい値 (0.30 ..= 0.85)
+    pub speaker_verify_threshold: f32,
+    /// 話者照合 ONNX モデルファイル名（空欄で自動検出）
+    pub speaker_model_file: String,
     pub llm: LlmCorrectionConfig,
 }
 
@@ -732,6 +754,11 @@ impl Default for AccuracyPipelineConfig {
             phonetic_fuzzy_matching: true,
             stutter_cleanup: true,
             auto_learn_respeak: true,
+            phonetic_dict_enabled: true,
+            personal_ngram_enabled: true,
+            speaker_verify_enabled: false,
+            speaker_verify_threshold: 0.55,
+            speaker_model_file: String::new(),
             llm: LlmCorrectionConfig::default(),
         }
     }

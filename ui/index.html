@@ -237,6 +237,12 @@
                   <label class="small-label">子音Presence EQ (3.6kHz): <strong id="ncPresenceEqVal">55%</strong>
                     <input type="range" id="ncPresenceEq" min="0" max="1" step="0.05" value="0.55" />
                   </label>
+                  <label class="small-label">箱鳴り低減 (340Hz Debox): <strong id="ncRoomDeboxVal">35%</strong>
+                    <input type="range" id="ncRoomDebox" min="0" max="1" step="0.05" value="0.35" />
+                  </label>
+                  <label class="small-label">AEC エコー消去強度: <strong id="aecStrengthVal">75%</strong>
+                    <input type="range" id="aecStrength" min="0.2" max="1" step="0.05" value="0.75" />
+                  </label>
                 </div>
                 <div class="row gap-sm" style="margin-top: 6px; flex-wrap: wrap">
                   <label class="checkbox-row small-check">
@@ -250,6 +256,14 @@
                   <label class="checkbox-row small-check">
                     <input type="checkbox" id="chkNcGate" />
                     <span>AIノイズゲート（通常OFF推奨）</span>
+                  </label>
+                  <label class="checkbox-row small-check">
+                    <input type="checkbox" id="chkNcDereverb" />
+                    <span>部屋残響抑制 (Dereverb)</span>
+                  </label>
+                  <label class="checkbox-row small-check">
+                    <input type="checkbox" id="chkAecEnabled" />
+                    <span>通話エコーキャンセル (WASAPI Loopback AEC)</span>
                   </label>
                 </div>
               </div>
@@ -647,10 +661,32 @@
             <p class="hint">
               認識結果をそのまま出力する前に、直前会話・辞書・ゲーム名・読み（モーラ）を踏まえてローカル LLM が自然な日本語へ補正します（クラウド送信ゼロ・CUDA不要・Radeon/GeForce/Intel/CPU対応）。
             </p>
+            <div class="llm-prereq-box" id="llmPrereqBox">
+              <div class="llm-prereq-title">⚠ ローカルLLM補正を使うには「① 推論サーバー」と「② GGUFモデル」の両方が必要です</div>
+              <div class="llm-prereq-steps">
+                <div class="llm-prereq-step" id="llmStep1Box">
+                  <span class="pill warn" id="llmStep1Badge">① 未導入</span>
+                  <div>
+                    <strong>① 推論サーバー (`llama-server`)</strong>
+                    <div class="small-label">モデルを動かすエンジン本体です（サーバー単体では文字補正できません）</div>
+                  </div>
+                </div>
+                <div class="llm-prereq-step" id="llmStep2Box">
+                  <span class="pill warn" id="llmStep2Badge">② 未導入</span>
+                  <div>
+                    <strong>② AI言語モデル (`.gguf` ファイル)</strong>
+                    <div class="small-label">Qwen3-1.7B / 4B などの知識モデル（モデル単体では動かず ① が必須です）</div>
+                  </div>
+                </div>
+              </div>
+              <div class="small-label" id="llmPrereqSummary" style="margin-top: 6px; color: #f6c453">
+                ※ 外部の Ollama / LM Studio を使う場合は ①② の自動導入は不要です（右のプリセットから切替可）。
+              </div>
+            </div>
             <div class="row gap-sm" style="margin-top: 10px; flex-wrap: wrap">
-              <button type="button" class="btn-primary btn-sm" id="btnDownloadLlamaServer">llama-server (Vulkan/CPU) を自動導入 (~38MB)</button>
-              <button type="button" class="btn-secondary btn-sm" id="btnDownloadLlm17b">Qwen3-1.7B 軽量版を取得 (~1.1GB)</button>
-              <button type="button" class="btn-secondary btn-sm" id="btnDownloadLlm4b">Qwen3-4B 高精度版を取得 (~2.4GB)</button>
+              <button type="button" class="btn-primary btn-sm" id="btnDownloadLlamaServer">① llama-server (Vulkan/CPU) を導入 (~38MB)</button>
+              <button type="button" class="btn-secondary btn-sm" id="btnDownloadLlm17b">② Qwen3-1.7B 軽量モデルを取得 (~1.1GB)</button>
+              <button type="button" class="btn-secondary btn-sm" id="btnDownloadLlm4b">② Qwen3-4B 高精度モデルを取得 (~2.4GB)</button>
               <button type="button" class="btn-secondary btn-sm" id="btnDiscoverLlmModels">最新LLM・llama-serverを自動探索</button>
             </div>
             <div id="llmSetupProgressWrap" style="display: none; margin-top: 10px">
@@ -855,10 +891,16 @@
           </div>
 
           <div class="card">
-            <div class="row space-between">
+            <div class="row space-between" style="flex-wrap: wrap; gap: 8px">
               <h3>カスタム置換辞書</h3>
-              <button class="btn-primary btn-sm" id="btnAddDict">+ 追加</button>
+              <div class="row gap-sm">
+                <input type="file" id="imeFileInput" accept=".txt" style="display: none" />
+                <button class="btn-secondary btn-sm" id="btnImportIme">IME ユーザー辞書を取り込む (.txt)</button>
+                <button class="btn-primary btn-sm" id="btnAddDict">+ 追加</button>
+              </div>
             </div>
+            <p class="hint">MS-IME / Google 日本語入力のエクスポート辞書 (.txt / UTF-16・Shift-JIS・UTF-8 自動判定) を一括取込できます。3モーラ以上の固有名詞は形態素解析で非LLM自動置換も働きます。</p>
+            <div id="imePreviewBox" class="ime-preview-box" style="display: none"></div>
             <div id="dictRows" class="dict-rows"></div>
           </div>
 
@@ -1205,6 +1247,33 @@
                 <input type="checkbox" id="chkStreamingPreview" />
                 <span>発話中ストリーミング暫定プレビュー表示</span>
               </label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkPhoneticDict" />
+                <span>非LLM音韻辞書自動置換 (同音異字/カタカナ語・3モーラ以上)</span>
+              </label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkPersonalNgram" />
+                <span>個人会話 N-gram LM リランキング (直近語彙学習)</span>
+              </label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="chkSpeakerVerify" />
+                <span>本人声紋フィルタ (ゲームキャラ/他人の声を除外)</span>
+              </label>
+            </div>
+            <div class="nc-box" style="margin-top: 10px">
+              <div class="row space-between" style="flex-wrap: wrap; gap: 8px">
+                <div class="row gap-sm">
+                  <span class="pill" id="speakerStatusBadge">声紋: 未確認</span>
+                  <span class="small-label">照合しきい値: <strong id="speakerThresholdVal">0.55</strong></span>
+                </div>
+                <div class="row gap-sm">
+                  <button type="button" class="btn-primary btn-sm" id="btnEnrollSpeaker">約5秒の声紋を登録</button>
+                  <button type="button" class="btn-danger btn-sm" id="btnClearSpeaker">声紋削除</button>
+                  <span class="small-label" id="ngramStatusLabel">N-gram: 0件</span>
+                  <button type="button" class="btn-secondary btn-sm" id="btnClearNgram">学習語彙消去</button>
+                </div>
+              </div>
+              <input type="range" id="speakerThreshold" min="0.30" max="0.85" step="0.02" value="0.55" style="margin-top: 6px" />
             </div>
             <div class="form-grid" style="margin-top: 10px">
               <label>WSOLA 減速倍率 (0.65〜1.00): <strong id="wsolaRateVal">0.84x</strong>
@@ -1243,7 +1312,7 @@
             <div class="row space-between">
               <div>
                 <h3>ローカルLLM 誤認識・空耳ポストコレクタ（専用タブへ移動しました）</h3>
-                <p class="hint">llama-server 自動導入、Qwen3-1.7B/4B モデル選択、Ollama/LM Studio 接続切替、ライブ補正テストは左メニュー「ローカルLLM補正」から行えます。</p>
+                <p class="hint">使用には「① llama-server（サーバー本体）」＋「② Qwen3等の .gguf モデル」の両方（または Ollama / LM Studio）が必要です。導入・自動起動・ライブ補正テストは左メニュー「ローカルLLM補正」から行えます。</p>
               </div>
               <button type="button" class="btn-secondary btn-sm" id="btnJumpLocalLlmTab">ローカルLLM補正タブを開く →</button>
             </div>
@@ -1298,6 +1367,7 @@
                   <button type="button" class="cat-tab-btn" data-cat="stt">音声認識 (STT)</button>
                   <button type="button" class="cat-tab-btn" data-cat="noise_suppression">ノイズ抑制</button>
                   <button type="button" class="cat-tab-btn" data-cat="llm_correction">滑舌補正 (LLM)</button>
+                  <button type="button" class="cat-tab-btn" data-cat="speaker_recognition">話者照合 (声紋)</button>
                 </div>
                 <label class="small-label grow" style="max-width: 440px">
                   オンラインカタログURL (HTTPS):
@@ -1427,14 +1497,16 @@
             <div class="card">
               <div class="row space-between">
                 <h3>録音WAVベンチマーク &amp; 自動パラメータ探索</h3>
-                <div class="row gap-sm">
+                <div class="row gap-sm" style="flex-wrap: wrap">
                   <button type="button" class="btn-primary btn-sm" id="btnRunBenchmark">一括テスト実行</button>
+                  <button type="button" class="btn-success btn-sm" id="btnRunThreeStageBench">3段階 補正効果比較 (生/非LLM/LLM)</button>
                   <button type="button" class="btn-secondary btn-sm" id="btnRunAutoTuner">最適パラメータ探索</button>
                 </div>
               </div>
-              <p class="hint">発話診断カードの「ベンチ保存」で正解テキスト付きのテスト音声を保存し、EQ/WSOLA/Beamを自動評価できます。</p>
+              <p class="hint">発話診断カードの「ベンチ保存」で正解テキスト付きのテスト音声を保存し、EQ/Debox/WSOLA/Beamや「生STT vs 非LLM vs ローカルLLM」のCER%比較を自動評価できます。</p>
               <div id="autoTunerProposalBox" class="ab-result"></div>
               <div id="benchResultBox" class="ab-result"></div>
+              <div id="threeStageBenchBox" class="bench3-box" style="display: none"></div>
               <div id="benchCasesList" style="margin-top: 8px"></div>
             </div>
 

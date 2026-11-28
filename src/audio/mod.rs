@@ -1,7 +1,9 @@
+pub mod aec;
 pub mod capture;
 pub mod denoise;
 pub mod enhance;
 pub mod silero_vad;
+pub mod speaker_id;
 pub mod vad;
 
 #[derive(Debug)]

@@ -1,6 +1,7 @@
 pub mod commands;
 pub mod filter;
 pub mod japanese_fix;
+pub mod ngram;
 pub mod phonetic;
 
 use crate::config::{
@@ -31,12 +32,49 @@ pub fn process_transcript_full(
     stutter_cleanup: bool,
     phonetic_fuzzy: bool,
 ) -> ProcessedUtterance {
+    process_transcript_full_v18(
+        raw,
+        filter_cfg,
+        cmd_cfg,
+        targets_cfg,
+        snippets,
+        emojis,
+        stutter_cleanup,
+        phonetic_fuzzy,
+        true,
+        &[],
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn process_transcript_full_v18(
+    raw: &str,
+    filter_cfg: &TextFilterConfig,
+    cmd_cfg: &VoiceCommandsConfig,
+    targets_cfg: &DiscordTargetsConfig,
+    snippets: &[SnippetMacro],
+    emojis: &[EmojiAlias],
+    stutter_cleanup: bool,
+    phonetic_fuzzy: bool,
+    phonetic_dict_enabled: bool,
+    low_conf_spans: &[(usize, usize)],
+    ngram: Option<&ngram::PersonalNgramModel>,
+) -> ProcessedUtterance {
     let mut base = if stutter_cleanup {
         filter::cleanup_stutter(raw)
     } else {
         raw.trim().to_string()
     };
     base = japanese_fix::normalize_japanese_transcript(&base);
+    if phonetic_dict_enabled && !filter_cfg.dictionary.is_empty() {
+        base = phonetic::apply_phonetic_dictionary_correction(
+            &base,
+            &filter_cfg.dictionary,
+            low_conf_spans,
+            ngram,
+        );
+    }
     let normalized = filter::apply_fillers_and_dictionary(&base, filter_cfg);
 
     let (target_switch, after_target) =
